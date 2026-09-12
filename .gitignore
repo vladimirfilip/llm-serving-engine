@@ -1,0 +1,10 @@
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Local editor/agent settings
+.claude/settings.local.json
