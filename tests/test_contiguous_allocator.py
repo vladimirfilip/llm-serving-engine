@@ -3,8 +3,8 @@ max_tokens, charged once at admission and returned whole on free(). Assert behav
 and invariants, not implementation detail.
 """
 
-from llm_serving_engine.allocator import ContiguousAllocator
-from llm_serving_engine.sampling import SamplingParams
+from llm_serving_engine.model.sampling import SamplingParams
+from llm_serving_engine.scheduling.allocator import ContiguousAllocator
 from tests.test_sequence import make_sequence
 
 

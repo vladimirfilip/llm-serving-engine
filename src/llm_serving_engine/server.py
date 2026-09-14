@@ -21,17 +21,17 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from .config import EngineConfig, KVCacheConfig
-from .dispatch import DONE
 from .engine import InferenceEngine
-from .metrics_export import (
+from .model.model_runner import ModelRunner
+from .model.sampling import SamplingParams
+from .model.tokenizer import TokenizerWrapper
+from .observability.metrics_export import (
     CONTENT_TYPE_LATEST,
     KV_CACHE_UTILIZATION,
     generate_latest,
     sample_kv_utilization,
 )
-from .model_runner import ModelRunner
-from .sampling import SamplingParams
-from .tokenizer import TokenizerWrapper
+from .scheduling.dispatch import DONE
 
 
 class EngineHandle:

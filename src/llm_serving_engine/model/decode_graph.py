@@ -13,15 +13,15 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .batch_plan import BatchPlan
+from ..scheduling.batch_plan import BatchPlan
 from .paged_batch import PagedBatch
 from .sampling import sample_token
 
 if TYPE_CHECKING:
     import torch
 
+    from ..scheduling.sequence import Sequence
     from .model_runner import ModelRunner
-    from .sequence import Sequence
 
 logger = logging.getLogger(__name__)
 

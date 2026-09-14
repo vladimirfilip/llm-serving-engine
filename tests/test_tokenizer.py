@@ -10,7 +10,7 @@ MODEL = "sshleifer/tiny-gpt2"
 
 @pytest.fixture(scope="module")
 def wrapper():
-    from llm_serving_engine.tokenizer import TokenizerWrapper
+    from llm_serving_engine.model.tokenizer import TokenizerWrapper
 
     try:
         return TokenizerWrapper(MODEL)

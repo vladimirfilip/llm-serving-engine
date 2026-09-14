@@ -3,8 +3,8 @@ import threading
 
 import pytest
 
-from llm_serving_engine import dispatch
-from llm_serving_engine.dispatch import DONE, dispatch_results, new_output_channel
+from llm_serving_engine.scheduling import dispatch
+from llm_serving_engine.scheduling.dispatch import DONE, dispatch_results, new_output_channel
 
 
 @pytest.fixture(autouse=True)

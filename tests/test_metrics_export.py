@@ -1,8 +1,8 @@
 import pytest
 
-from llm_serving_engine import metrics_export
-from llm_serving_engine.metrics import RequestMetrics
-from llm_serving_engine.metrics_export import (
+from llm_serving_engine.observability import metrics_export
+from llm_serving_engine.observability.metrics import RequestMetrics
+from llm_serving_engine.observability.metrics_export import (
     REGISTRY,
     generate_latest,
     record_request,

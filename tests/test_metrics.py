@@ -1,6 +1,6 @@
 import pytest
 
-from llm_serving_engine.metrics import (
+from llm_serving_engine.observability.metrics import (
     LatencySummary,
     RequestMetrics,
     percentile,

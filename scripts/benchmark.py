@@ -44,8 +44,9 @@ from llm_serving_engine.loadgen.kv_monitor import KvUtilizationMonitor
 from llm_serving_engine.loadgen.report import SLOThresholds, build_report
 from llm_serving_engine.loadgen.results_io import write_raw, write_summary
 from llm_serving_engine.loadgen.timing import open_loop_load_gen
-from llm_serving_engine.metrics import summarize
-from llm_serving_engine.plotting import (
+from llm_serving_engine.model.sampling import SamplingParams
+from llm_serving_engine.observability.metrics import summarize
+from llm_serving_engine.observability.plotting import (
     plot_ablation_bar,
     plot_e2e_latency_by_qps,
     plot_goodput_by_qps,
@@ -58,7 +59,6 @@ from llm_serving_engine.plotting import (
     plot_tpot_by_qps,
     plot_ttft_by_qps,
 )
-from llm_serving_engine.sampling import SamplingParams
 
 
 @contextlib.contextmanager

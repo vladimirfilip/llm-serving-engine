@@ -19,12 +19,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from .batch_plan import BatchEntry, BatchPlan
-from .config import ModelConfig
+from ..config import ModelConfig
+from ..scheduling.batch_plan import BatchEntry, BatchPlan
+from ..scheduling.sequence import Sequence
 from .decode_graph import DECODE_GRAPH_BUCKETS, DecodeGraphRunner
 from .paged_batch import PagedBatch
 from .sampling import SamplingParams, sample, sample_token
-from .sequence import Sequence
 
 if TYPE_CHECKING:
     import torch
@@ -246,7 +246,7 @@ class ModelRunner:
         """One Triton launch for the whole BatchPlan's attention at this layer: writes
         this call's new K/V into the pool at PagedBatch's resolved slots, then gathers
         through each entry's block table (per-row addressing: paged_attention_2)."""
-        from .kernels.flash_attention import paged_attention_forward
+        from ..kernels.flash_attention import paged_attention_forward
 
         k_pool, v_pool = self._k_pool[layer_idx], self._v_pool[layer_idx]
         k_pool[paging.dest_block_id, paging.dest_within] = k[0].transpose(0, 1)
@@ -275,7 +275,7 @@ class ModelRunner:
         import torch
         from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
-        from .kernels.flash_attention import flash_attention_forward
+        from ..kernels.flash_attention import flash_attention_forward
 
         attn = self._layers[layer_idx].self_attn
         cfg = self.model.config

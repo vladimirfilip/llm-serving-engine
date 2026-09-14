@@ -9,8 +9,8 @@ fastapi = pytest.importorskip("fastapi")
 httpx = pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from llm_serving_engine.dispatch import DONE, output_channels  # noqa: E402
-from llm_serving_engine.sampling import SamplingParams  # noqa: E402
+from llm_serving_engine.model.sampling import SamplingParams  # noqa: E402
+from llm_serving_engine.scheduling.dispatch import DONE, output_channels  # noqa: E402
 from llm_serving_engine.server import create_app  # noqa: E402
 
 

@@ -3,12 +3,15 @@ import time
 
 import pytest
 
-from llm_serving_engine.allocator import BlockAllocator, ContiguousAllocator
 from llm_serving_engine.config import EngineConfig, KVCacheConfig, ModelConfig, ServerConfig
-from llm_serving_engine.dispatch import output_channels
 from llm_serving_engine.engine import InferenceEngine, sequence_from_ingress
-from llm_serving_engine.sampling import SamplingParams
-from llm_serving_engine.scheduler import ContinuousBatchedScheduler, StaticBatchedScheduler
+from llm_serving_engine.model.sampling import SamplingParams
+from llm_serving_engine.scheduling.allocator import BlockAllocator, ContiguousAllocator
+from llm_serving_engine.scheduling.dispatch import output_channels
+from llm_serving_engine.scheduling.scheduler import (
+    ContinuousBatchedScheduler,
+    StaticBatchedScheduler,
+)
 
 
 class FakeTokenizer:

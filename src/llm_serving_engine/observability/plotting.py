@@ -4,7 +4,7 @@ Reads raw per-request result dicts (as written by loadgen/cli.py) and generates
 plots from them. matplotlib is imported lazily inside each function so importing
 this module never forces a matplotlib install.
 
-Latency stats reuse llm_serving_engine.metrics.summarize/percentile; nothing here
+Latency stats reuse llm_serving_engine.observability.metrics.summarize/percentile; nothing here
 recomputes percentile math.
 """
 

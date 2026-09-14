@@ -2,7 +2,7 @@ import httpx
 import pytest
 
 from llm_serving_engine.loadgen.client import DEFAULT_PROMPTS, LoadGenConfig, send_request
-from llm_serving_engine.sampling import SamplingParams
+from llm_serving_engine.model.sampling import SamplingParams
 
 
 def _sse_transport(body: str, status_code: int = 200) -> httpx.MockTransport:

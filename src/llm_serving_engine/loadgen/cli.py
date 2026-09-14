@@ -11,7 +11,7 @@ import asyncio
 import time
 from pathlib import Path
 
-from ..sampling import SamplingParams
+from ..model.sampling import SamplingParams
 from .client import LoadGenConfig, send_request
 from .report import SLOThresholds, build_report
 from .results_io import write_raw, write_summary

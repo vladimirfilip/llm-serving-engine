@@ -1,7 +1,7 @@
 import random
 
-from llm_serving_engine.metrics import summarize
-from llm_serving_engine.plotting import (
+from llm_serving_engine.observability.metrics import summarize
+from llm_serving_engine.observability.plotting import (
     plot_ablation_bar,
     plot_e2e_latency_by_qps,
     plot_goodput_by_qps,

@@ -13,7 +13,7 @@ MODEL = "sshleifer/tiny-gpt2"
 @pytest.fixture(scope="module")
 def loaded_runner():
     from llm_serving_engine.config import ModelConfig
-    from llm_serving_engine.model_runner import ModelRunner
+    from llm_serving_engine.model.model_runner import ModelRunner
 
     try:
         runner = ModelRunner(
@@ -25,9 +25,9 @@ def loaded_runner():
 
 
 def _make_sequence(seq_id: int, prompt_tokens: list[int], **sampling_overrides):
-    from llm_serving_engine.metrics import RequestMetrics
-    from llm_serving_engine.sampling import SamplingParams
-    from llm_serving_engine.sequence import Sequence
+    from llm_serving_engine.model.sampling import SamplingParams
+    from llm_serving_engine.observability.metrics import RequestMetrics
+    from llm_serving_engine.scheduling.sequence import Sequence
 
     return Sequence(
         seq_id=seq_id,
@@ -49,7 +49,7 @@ def _admit(seq, n_tokens):
     is_prefill_chunk marks prefill work (vs. decode), not "partial chunk" — a one-shot
     admission that finishes the whole prompt is still prefill, per scheduler.py.
     """
-    from llm_serving_engine.batch_plan import BatchEntry
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry
 
     seq.prefill_progress += n_tokens
     seq.status = "PREFILLING" if n_tokens < len(seq.prompt_tokens) else "DECODING"
@@ -57,7 +57,7 @@ def _admit(seq, n_tokens):
 
 
 def test_forward_one_shot_prefill_returns_token_and_primes_cache(loaded_runner):
-    from llm_serving_engine.batch_plan import BatchPlan
+    from llm_serving_engine.scheduling.batch_plan import BatchPlan
 
     seq = _make_sequence(1, [1, 2, 3, 4], temperature=0.0, max_tokens=8)
     plan = BatchPlan()
@@ -73,7 +73,7 @@ def test_forward_one_shot_prefill_returns_token_and_primes_cache(loaded_runner):
 
 
 def test_forward_partial_prefill_chunk_samples_nothing(loaded_runner):
-    from llm_serving_engine.batch_plan import BatchPlan
+    from llm_serving_engine.scheduling.batch_plan import BatchPlan
 
     seq = _make_sequence(2, [1, 2, 3, 4], temperature=0.0, max_tokens=8)
     plan = BatchPlan()
@@ -86,7 +86,7 @@ def test_forward_partial_prefill_chunk_samples_nothing(loaded_runner):
 
 
 def test_forward_decode_step_advances_and_reports_shape(loaded_runner):
-    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
 
     seq = _make_sequence(3, [5, 6, 7], temperature=0.0, max_tokens=3)
     prefill_plan = BatchPlan()
@@ -106,7 +106,7 @@ def test_forward_decode_step_advances_and_reports_shape(loaded_runner):
 
 
 def test_forward_decode_step_finishes_at_max_tokens(loaded_runner):
-    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
 
     seq = _make_sequence(4, [1, 2], temperature=0.0, max_tokens=2)
     prefill_plan = BatchPlan()
@@ -124,7 +124,7 @@ def test_forward_decode_step_finishes_at_max_tokens(loaded_runner):
 def test_forward_decode_step_finishes_on_any_listed_eos_token(loaded_runner, monkeypatch):
     # Instruct models (Llama-3: <|eot_id|> alongside <|end_of_text|>) list multiple stop
     # tokens; finishing must check all of them, not just the first.
-    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
 
     monkeypatch.setattr(loaded_runner.model.generation_config, "eos_token_id", [999, 111])
     seq = _make_sequence(5, [1, 2], temperature=0.0, max_tokens=50)
@@ -143,7 +143,7 @@ def test_forward_decode_step_finishes_on_any_listed_eos_token(loaded_runner, mon
 
 
 def test_free_drops_kv_cache(loaded_runner):
-    from llm_serving_engine.batch_plan import BatchPlan
+    from llm_serving_engine.scheduling.batch_plan import BatchPlan
 
     seq = _make_sequence(6, [1, 2], temperature=0.0, max_tokens=4)
     plan = BatchPlan()
@@ -155,7 +155,7 @@ def test_free_drops_kv_cache(loaded_runner):
 
 def test_quantize_int8_is_not_implemented():
     from llm_serving_engine.config import ModelConfig
-    from llm_serving_engine.model_runner import ModelRunner
+    from llm_serving_engine.model.model_runner import ModelRunner
 
     with pytest.raises(NotImplementedError):
         ModelRunner(ModelConfig(model_name_or_path=MODEL, device="cpu", quantize="int8"))
@@ -172,7 +172,7 @@ def test_wire_custom_kernels_rejects_a_non_llama_family_model():
     from transformers import GPT2Config, GPT2LMHeadModel
 
     from llm_serving_engine.config import ModelConfig
-    from llm_serving_engine.model_runner import ModelRunner
+    from llm_serving_engine.model.model_runner import ModelRunner
 
     runner = ModelRunner.__new__(ModelRunner)
     runner.config = ModelConfig(model_name_or_path="unused", device="cuda", use_custom_kernels=True)
@@ -189,7 +189,7 @@ def test_wire_custom_kernels_rejects_fp16_with_a_head_dim_under_16():
     from transformers import LlamaConfig, LlamaForCausalLM
 
     from llm_serving_engine.config import ModelConfig
-    from llm_serving_engine.model_runner import ModelRunner
+    from llm_serving_engine.model.model_runner import ModelRunner
 
     # head_dim = hidden_size / num_attention_heads = 16 / 4 = 4: the fp16 tensor-core
     # dot product the Triton kernel issues for Q@K^T needs a contraction dim >= 16.
@@ -207,7 +207,7 @@ def test_wire_custom_kernels_rejects_fp16_with_a_head_dim_under_16():
 
 
 def test_flatten_plan_offsets_and_positions(loaded_runner):
-    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
 
     prefilling = _make_sequence(20, [1, 2, 3, 4], temperature=0.0, max_tokens=8)
     prefilling.prefill_progress = 3
@@ -235,7 +235,7 @@ def _build_tiny_llama_runner():
     from transformers import LlamaConfig, LlamaForCausalLM
 
     from llm_serving_engine.config import ModelConfig
-    from llm_serving_engine.model_runner import ModelRunner
+    from llm_serving_engine.model.model_runner import ModelRunner
 
     hf_config = LlamaConfig(
         vocab_size=64,
@@ -256,7 +256,7 @@ def _build_tiny_llama_runner():
     runner._block_size = None
     runner._scratch_block_id = None
     runner.model = LlamaForCausalLM(hf_config).to("cuda").eval()
-    from llm_serving_engine.decode_graph import DecodeGraphRunner
+    from llm_serving_engine.model.decode_graph import DecodeGraphRunner
 
     runner._decode_graphs = DecodeGraphRunner(runner)
     return runner
@@ -321,7 +321,7 @@ def _normed_layer0(runner, plan, seqs):
 
 
 def test_attention_forward_full_prefill_matches_hf_reference(tiny_llama_runner):
-    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
 
     seq = _make_sequence(30, [1, 2, 3, 4, 5], temperature=0.0, max_tokens=8)
     seq.prefill_progress = 5
@@ -363,7 +363,7 @@ def test_attention_forward_decode_step_matches_hf_reference(tiny_llama_runner):
     """query_offset lets a decode step's single new token (Q_len=1) attend to its whole
     cache (K_len=6) — the shape the unmodified upstream kernel can't express at all.
     """
-    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
 
     seq = _make_sequence(31, [3, 1, 4, 1, 5], temperature=0.0, max_tokens=8)
     seq.prefill_progress = 5
@@ -394,7 +394,7 @@ def test_attention_forward_chunked_prefill_continuation_matches_hf_reference(tin
     """A prefill chunk after the first also has query_offset > 0 (3 tokens already cached,
     3 new ones) — same causal-mask fix as decode, exercised with n_tokens > 1.
     """
-    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
 
     seq = _make_sequence(32, [1, 2, 3, 4, 5, 6], temperature=0.0, max_tokens=8)
     seq.prefill_progress = 3
@@ -426,7 +426,7 @@ def test_attention_forward_disjoint_caches_stay_independent(tiny_llama_runner):
     """Two sequences interleaved through the same layer must not see each other's tokens —
     the whole point of a disjoint per-sequence cache instead of one shared buffer.
     """
-    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
 
     seq_a = _make_sequence(33, [1, 1], temperature=0.0, max_tokens=8)
     seq_a.prefill_progress = 2
@@ -459,7 +459,7 @@ def test_forward_fused_prefill_then_decode_matches_hf_reference(tiny_llama_runne
     final norm, lm head, sampling) against a plain non-incremental HF call on the same
     tokens — the two must agree since they compute the same function.
     """
-    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
 
     prompt = [3, 1, 4, 1, 5]
     seq = _make_sequence(40, prompt, temperature=0.0, max_tokens=8)
@@ -491,8 +491,8 @@ def test_forward_fused_paged_prefill_then_decode_matches_hf_reference(paged_llam
     """Same contract as test_forward_fused_prefill_then_decode_matches_hf_reference, but
     routed through allocate_kv_pool's shared block-addressed pool (one Triton launch per
     layer covering the whole plan) instead of one disjoint buffer and launch per entry."""
-    from llm_serving_engine.allocator import BlockAllocator
-    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+    from llm_serving_engine.scheduling.allocator import BlockAllocator
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
 
     allocator = BlockAllocator(num_blocks=64, block_size=4)
     prompt = [3, 1, 4, 1, 5]
@@ -533,8 +533,8 @@ def test_forward_fused_paged_disjoint_sequences_match_hf_reference(paged_llama_r
     block ids, so a gather-addressing bug would show up as a wrong token, not just a
     suspicious-looking block table.
     """
-    from llm_serving_engine.allocator import BlockAllocator
-    from llm_serving_engine.batch_plan import BatchPlan
+    from llm_serving_engine.scheduling.allocator import BlockAllocator
+    from llm_serving_engine.scheduling.batch_plan import BatchPlan
 
     allocator = BlockAllocator(num_blocks=64, block_size=4)
     prompt_a, prompt_b = [1, 1, 3], [2, 2, 2, 2, 2]
@@ -567,8 +567,8 @@ def test_forward_fused_paged_mixed_decode_and_prefill_in_one_plan(paged_llama_ru
     empty cache) in the same BatchPlan and the same grid launch -- the shape every real
     continuous-batching iteration takes once more than one sequence is in flight.
     """
-    from llm_serving_engine.allocator import BlockAllocator
-    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+    from llm_serving_engine.scheduling.allocator import BlockAllocator
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
 
     allocator = BlockAllocator(num_blocks=64, block_size=4)
     prompt_a = [4, 4, 4]
@@ -619,7 +619,7 @@ def _prefill_to_decoding(runner, allocator, seq):
     a decode step: generated_tokens has its first token, and the block table already has
     capacity reserved for the next one -- exactly the state scheduler_step would leave a
     freshly-admitted sequence in by the time it first appears in a decode-only plan."""
-    from llm_serving_engine.batch_plan import BatchPlan
+    from llm_serving_engine.scheduling.batch_plan import BatchPlan
 
     prefill_plan = BatchPlan()
     prefill_plan.entries.append(_admit(seq, len(seq.prompt_tokens)))
@@ -632,8 +632,8 @@ def test_forward_graphed_matches_eager_no_padding(graphed_llama_runner):
     """Decode batch size exactly equal to a bucket (no padding rows at all)."""
     import copy
 
-    from llm_serving_engine.allocator import BlockAllocator
-    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+    from llm_serving_engine.scheduling.allocator import BlockAllocator
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
 
     allocator = BlockAllocator(num_blocks=64, block_size=4)
     seqs = {}
@@ -659,8 +659,8 @@ def test_forward_graphed_matches_eager_with_padding(graphed_llama_runner):
     """3 real decode entries rounded up to bucket=4 -- exercises one padding row."""
     import copy
 
-    from llm_serving_engine.allocator import BlockAllocator
-    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+    from llm_serving_engine.scheduling.allocator import BlockAllocator
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
 
     allocator = BlockAllocator(num_blocks=64, block_size=4)
     seqs = {}
@@ -688,8 +688,8 @@ def test_forward_graphed_padding_does_not_touch_other_pool_blocks(graphed_llama_
     padding scheme exists to prevent: an unconditional pool write landing on a block a
     live, unrelated sequence owns.
     """
-    from llm_serving_engine.allocator import BlockAllocator
-    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+    from llm_serving_engine.scheduling.allocator import BlockAllocator
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
 
     allocator = BlockAllocator(num_blocks=64, block_size=4)
     seq = _admit_seq(allocator, 420, 3)
@@ -721,8 +721,8 @@ def test_forward_graphed_row_reassignment_matches_eager(graphed_llama_runner):
     """
     import copy
 
-    from llm_serving_engine.allocator import BlockAllocator
-    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+    from llm_serving_engine.scheduling.allocator import BlockAllocator
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
 
     allocator = BlockAllocator(num_blocks=64, block_size=4)
     seqs = {}
@@ -762,8 +762,8 @@ def test_forward_graphed_replay_reflects_new_inputs(graphed_llama_runner):
     """Two different real plans at the same bucket must produce different logits --
     catches a forgotten .copy_() before replay, which would otherwise silently keep
     returning whatever was captured the first time."""
-    from llm_serving_engine.allocator import BlockAllocator
-    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+    from llm_serving_engine.scheduling.allocator import BlockAllocator
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
 
     allocator = BlockAllocator(num_blocks=64, block_size=4)
     seq_a = _admit_seq(allocator, 440, 3)
@@ -789,8 +789,8 @@ def test_forward_graphed_replay_reflects_new_inputs(graphed_llama_runner):
 
 
 def test_forward_dispatch_skips_graphs_for_mixed_prefill_and_decode(graphed_llama_runner, monkeypatch):
-    from llm_serving_engine.allocator import BlockAllocator
-    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+    from llm_serving_engine.scheduling.allocator import BlockAllocator
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
 
     allocator = BlockAllocator(num_blocks=64, block_size=4)
     decoding_seq = _admit_seq(allocator, 450, 3)
@@ -814,7 +814,7 @@ def test_forward_dispatch_skips_graphs_for_mixed_prefill_and_decode(graphed_llam
 
 
 def test_forward_dispatch_skips_graphs_above_the_largest_bucket(graphed_llama_runner, monkeypatch):
-    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+    from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
 
     largest = max(graphed_llama_runner._decode_graphs)
     plan = BatchPlan()
@@ -832,7 +832,7 @@ def test_forward_dispatch_skips_graphs_above_the_largest_bucket(graphed_llama_ru
 
 
 def test_sample_temperature_zero_is_argmax(loaded_runner):
-    from llm_serving_engine.sampling import SamplingParams
+    from llm_serving_engine.model.sampling import SamplingParams
 
     logits = torch.tensor([0.1, 5.0, -2.0, 0.3])
     token = loaded_runner._sample(logits, SamplingParams(temperature=0.0))
@@ -840,7 +840,7 @@ def test_sample_temperature_zero_is_argmax(loaded_runner):
 
 
 def test_sample_top_k_and_top_p_stay_in_range(loaded_runner):
-    from llm_serving_engine.sampling import SamplingParams
+    from llm_serving_engine.model.sampling import SamplingParams
 
     logits = torch.randn(50)
     for _ in range(20):

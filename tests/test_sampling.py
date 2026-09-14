@@ -1,6 +1,6 @@
 import pytest
 
-from llm_serving_engine.sampling import SamplingParams
+from llm_serving_engine.model.sampling import SamplingParams
 
 
 def test_defaults_are_valid():

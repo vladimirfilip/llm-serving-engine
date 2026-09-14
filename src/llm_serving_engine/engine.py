@@ -17,16 +17,16 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
-from .allocator import BlockAllocator, ContiguousAllocator
-from .batch_plan import BatchPlan
 from .config import EngineConfig
-from .dispatch import new_output_channel, output_channels
-from .metrics import RequestMetrics
-from .model_runner import ModelRunner
-from .sampling import SamplingParams
-from .scheduler import ContinuousBatchedScheduler, Scheduler, StaticBatchedScheduler
-from .sequence import Sequence
-from .tokenizer import TokenizerWrapper
+from .model.model_runner import ModelRunner
+from .model.sampling import SamplingParams
+from .model.tokenizer import TokenizerWrapper
+from .observability.metrics import RequestMetrics
+from .scheduling.allocator import BlockAllocator, ContiguousAllocator
+from .scheduling.batch_plan import BatchPlan
+from .scheduling.dispatch import new_output_channel, output_channels
+from .scheduling.scheduler import ContinuousBatchedScheduler, Scheduler, StaticBatchedScheduler
+from .scheduling.sequence import Sequence
 
 KVAllocator = BlockAllocator | ContiguousAllocator
 
@@ -85,7 +85,7 @@ class InferenceEngine:
         """IO thread: tokenize, create the output channel, hand off to the ingress queue.
 
         Returns (seq_id, output_queue). The caller streams from output_queue until the
-        DONE sentinel (llm_serving_engine.dispatch.DONE) and should pop its own entry
+        DONE sentinel (llm_serving_engine.scheduling.dispatch.DONE) and should pop its own entry
         in a finally block so a disconnected client's channel doesn't linger.
         """
         seq_id = self._next_seq_id

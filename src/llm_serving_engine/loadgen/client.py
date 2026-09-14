@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from ..sampling import SamplingParams
+from ..model.sampling import SamplingParams
 
 DEFAULT_PROMPTS: list[str] = [
     "Explain the difference between a mutex and a semaphore.",

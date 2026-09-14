@@ -1,6 +1,6 @@
-from llm_serving_engine.metrics import RequestMetrics
-from llm_serving_engine.sampling import SamplingParams
-from llm_serving_engine.sequence import BlockTable, Sequence
+from llm_serving_engine.model.sampling import SamplingParams
+from llm_serving_engine.observability.metrics import RequestMetrics
+from llm_serving_engine.scheduling.sequence import BlockTable, Sequence
 
 
 def make_sequence(**overrides) -> Sequence:

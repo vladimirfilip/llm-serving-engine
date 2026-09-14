@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from llm_serving_engine.batch_plan import BatchPlan
+from llm_serving_engine.scheduling.batch_plan import BatchPlan
 
 
 def test_empty_plan():

@@ -5,8 +5,8 @@ invariants, not the exact free-list ordering.
 
 from collections import deque
 
-from llm_serving_engine.allocator import BlockAllocator
-from llm_serving_engine.sequence import BlockTable
+from llm_serving_engine.scheduling.allocator import BlockAllocator
+from llm_serving_engine.scheduling.sequence import BlockTable
 
 
 def test_init_builds_free_list():

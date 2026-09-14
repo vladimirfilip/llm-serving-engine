@@ -10,15 +10,15 @@ from collections import deque
 
 import pytest
 
-from llm_serving_engine.allocator import BlockAllocator
-from llm_serving_engine.metrics import RequestMetrics
-from llm_serving_engine.sampling import SamplingParams
-from llm_serving_engine.scheduler import (
+from llm_serving_engine.model.sampling import SamplingParams
+from llm_serving_engine.observability.metrics import RequestMetrics
+from llm_serving_engine.scheduling.allocator import BlockAllocator
+from llm_serving_engine.scheduling.scheduler import (
     TOKEN_BUDGET,
     ContinuousBatchedScheduler,
     StaticBatchedScheduler,
 )
-from llm_serving_engine.sequence import Sequence
+from llm_serving_engine.scheduling.sequence import Sequence
 
 SCHEDULER_CLASSES = [ContinuousBatchedScheduler, StaticBatchedScheduler]
 
@@ -121,7 +121,7 @@ def test_admission_backs_off_without_skipping_the_queue_when_pool_is_short(sched
 def test_handle_iteration_results_frees_blocks_and_drops_only_finished_sequences(
     scheduler_cls, monkeypatch
 ):
-    monkeypatch.setattr("llm_serving_engine.scheduler.dispatch_results", lambda *a, **k: None)
+    monkeypatch.setattr("llm_serving_engine.scheduling.scheduler.dispatch_results", lambda *a, **k: None)
     scheduler = scheduler_cls()
     alloc = BlockAllocator(num_blocks=4, block_size=16)
     seq_a = make_sequence(seq_id=1, status="DECODING")

@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import pairwise
 
-from ..metrics import LatencySummary, summarize
+from ..observability.metrics import LatencySummary, summarize
 
 
 @dataclass(slots=True)

@@ -9,8 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-from .metrics import RequestMetrics
-from .sampling import SamplingParams
+from ..model.sampling import SamplingParams
+from ..observability.metrics import RequestMetrics
 
 SequenceStatus = Literal["WAITING", "PREFILLING", "DECODING", "FINISHED"]
 
