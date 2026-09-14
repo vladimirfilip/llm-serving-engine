@@ -57,7 +57,7 @@ Target a decode-heavy autoregressive model that fits one GPU (Llama-3.2-1B/3B, o
 
 **Day 7 — kernels + quantization on the hot path.** Wire in your Day 1–2 kernels (FA-2 for attention, fused int8 GEMM for the projection/MLP path). Add an int8 weight path. Profile end-to-end with `nsys`; find and kill the real bottleneck (likely launch overhead, H2D, or a sync point).
 
-**Day 8 — latency engineering pass (your differentiator).** The day that makes this a *Jump* project. Pin threads / isolate cores; strip remaining hot-path allocations and false sharing; build a **coordinated-omission-aware load generator** (measure true p99/p999 under a fixed offered load, not just closed-loop). Produce a **per-stage latency decomposition** — enqueue → schedule → prefill → decode-step → detokenize → response — the LLM-serving analogue of your ITCH t0→t3. Hunt the tail.
+**Day 8 — latency engineering pass (your differentiator).** The day that makes this a *Jump* project. Pin threads / isolate cores; strip remaining hot-path allocations and false sharing; build a **coordinated-omission-aware load generator** (measure true p99/p999 under a fixed, open-loop offered load). Produce a **per-stage latency decomposition** — enqueue → schedule → prefill → decode-step → detokenize → response — the LLM-serving analogue of your ITCH t0→t3. Hunt the tail.
 
 **Output:** `llm-serving-engine` repo.
 **Resume line:** *"Built a low-latency LLM inference engine (lock-free scheduling, continuous batching, paged KV-cache, int8 + custom CUDA/Triton kernels): X req/s at p99 < Y ms on one GPU, Z× over static batching; per-stage latency decomposition and coordinated-omission-aware benchmarking."*

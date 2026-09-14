@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>llm-serving-engine console</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-monospace, monospace; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.1rem; }
+  label { display: block; font-size: 0.85rem; margin-top: 0.75rem; }
+  input, textarea { width: 100%; box-sizing: border-box; font-family: inherit; font-size: 0.9rem; padding: 0.4rem; }
+  textarea { height: 6rem; resize: vertical; }
+  .params { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.75rem; }
+  .actions { margin-top: 1rem; display: flex; gap: 0.5rem; }
+  .row { display: flex; gap: 0.5rem; align-items: center; }
+  .row input { flex: 1; }
+  button { font-family: inherit; padding: 0.5rem 1rem; cursor: pointer; }
+  #output { white-space: pre-wrap; border: 1px solid #8888; border-radius: 4px; padding: 0.75rem; margin-top: 1rem; min-height: 4rem; }
+  #status, #modelStatus { font-size: 0.8rem; opacity: 0.7; margin-top: 0.5rem; }
+  #status.error, #modelStatus.error { color: #c0392b; opacity: 1; }
+</style>
+</head>
+<body>
+<h1>llm-serving-engine console</h1>
+
+<label>Server URL
+  <input id="serverUrl" value="http://localhost:8000" />
+</label>
+
+<label>Model
+  <div class="row">
+    <input id="modelName" placeholder="e.g. unsloth/Llama-3.2-3B-Instruct" />
+    <button id="loadModelBtn">Load</button>
+  </div>
+</label>
+<div id="modelStatus"></div>
+
+<label>Prompt
+  <textarea id="prompt" placeholder="Once upon a time"></textarea>
+</label>
+
+<div class="params">
+  <label>max_tokens
+    <input id="maxTokens" type="number" min="1" placeholder="default" />
+  </label>
+  <label>temperature
+    <input id="temperature" type="number" step="0.01" min="0" placeholder="default" />
+  </label>
+  <label>top_p
+    <input id="topP" type="number" step="0.01" min="0" max="1" placeholder="default" />
+  </label>
+</div>
+
+<div class="actions">
+  <button id="sendBtn">Send</button>
+  <button id="stopBtn" disabled>Stop</button>
+</div>
+
+<div id="status"></div>
+<div id="output"></div>
+
+<script>
+const sendBtn = document.getElementById("sendBtn");
+const stopBtn = document.getElementById("stopBtn");
+const output = document.getElementById("output");
+const status = document.getElementById("status");
+const modelName = document.getElementById("modelName");
+const modelStatus = document.getElementById("modelStatus");
+const loadModelBtn = document.getElementById("loadModelBtn");
+
+let abortController = null;
+
+function setStatus(text, isError = false) {
+  status.textContent = text;
+  status.classList.toggle("error", isError);
+}
+
+function setModelStatus(text, isError = false) {
+  modelStatus.textContent = text;
+  modelStatus.classList.toggle("error", isError);
+}
+
+function currentServerUrl() {
+  return document.getElementById("serverUrl").value.replace(/\/$/, "");
+}
+
+async function fetchCurrentModel() {
+  try {
+    const resp = await fetch(`${currentServerUrl()}/v1/model`);
+    if (!resp.ok) return;
+    const { model } = await resp.json();
+    modelName.value = model;
+    setModelStatus(`loaded: ${model}`);
+  } catch {
+    // Server not reachable yet (e.g. page just opened) — leave the field as typed.
+  }
+}
+
+async function loadModel() {
+  const model = modelName.value.trim();
+  if (!model) return;
+  loadModelBtn.disabled = true;
+  sendBtn.disabled = true;
+  setModelStatus(`loading ${model}… this can take a while`);
+  try {
+    const resp = await fetch(`${currentServerUrl()}/v1/model`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail ?? `HTTP ${resp.status}`);
+    setModelStatus(`loaded: ${data.model}`);
+  } catch (err) {
+    setModelStatus(`error: ${err.message}`, true);
+  } finally {
+    loadModelBtn.disabled = false;
+    sendBtn.disabled = false;
+  }
+}
+
+loadModelBtn.addEventListener("click", loadModel);
+fetchCurrentModel();
+
+function numberOrUndefined(id) {
+  const raw = document.getElementById(id).value.trim();
+  return raw === "" ? undefined : Number(raw);
+}
+
+async function send() {
+  const serverUrl = currentServerUrl();
+  const prompt = document.getElementById("prompt").value;
+  const body = {
+    prompt,
+    max_tokens: numberOrUndefined("maxTokens"),
+    temperature: numberOrUndefined("temperature"),
+    top_p: numberOrUndefined("topP"),
+  };
+
+  output.textContent = "";
+  sendBtn.disabled = true;
+  stopBtn.disabled = false;
+  abortController = new AbortController();
+  const start = performance.now();
+  let firstTokenMs = null;
+
+  try {
+    setStatus("connecting…");
+    const resp = await fetch(`${serverUrl}/v1/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: abortController.signal,
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+    setStatus("streaming…");
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const events = buffer.split("\n\n");
+      buffer = events.pop();
+      for (const event of events) {
+        const line = event.split("\n").find((l) => l.startsWith("data: "));
+        if (!line) continue;
+        const payload = JSON.parse(line.slice("data: ".length));
+        if (payload.done) {
+          const totalMs = performance.now() - start;
+          setStatus(`done — first token ${firstTokenMs?.toFixed(0)}ms, total ${totalMs.toFixed(0)}ms`);
+        } else if (payload.token !== undefined) {
+          if (firstTokenMs === null) firstTokenMs = performance.now() - start;
+          output.textContent += payload.token;
+        }
+      }
+    }
+  } catch (err) {
+    if (err.name === "AbortError") {
+      setStatus("stopped");
+    } else {
+      setStatus(`error: ${err.message}`, true);
+    }
+  } finally {
+    sendBtn.disabled = false;
+    stopBtn.disabled = true;
+    abortController = null;
+  }
+}
+
+sendBtn.addEventListener("click", send);
+stopBtn.addEventListener("click", () => abortController?.abort());
+</script>
+</body>
+</html>

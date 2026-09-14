@@ -302,7 +302,7 @@ async def _send_and_time(send_fn, intended_send_time, results):
     results.append({"latency": time.monotonic() - intended_send_time, **result})
 ```
 
-The critical line is `intended_send_time`, recorded from the fixed schedule, not from whenever the request actually went out. If the sender itself is delayed, a closed-loop generator (send, wait for response, send next) or one that times from actual-send would silently absorb that delay into a smaller sample of requests rather than reporting it, and the resulting p99 lies to you by construction. Measuring from the intended schedule is what makes a stall show up as a cluster of high latencies instead of vanishing from the sample.
+The critical line is `intended_send_time`, recorded from the fixed schedule, not from whenever the request actually went out. Timing from actual-send would silently absorb sender-side delay into a smaller sample of requests rather than reporting it, and the resulting p99 lies to you by construction. Measuring from the intended schedule is what makes a stall show up as a cluster of high latencies instead of vanishing from the sample.
 
 ---
 
@@ -315,7 +315,6 @@ Every ablation below isolates exactly one thing this spec built, so each one sho
 - Contiguous max-length reservation vs. paged KV cache, at matched memory (section 3).
 - fp16 vs. int8 weights, decode-step latency specifically (section 4).
 - With and without your fused kernels, end-to-end (section 4).
-- Closed-loop vs. open-loop load generator on the *same* engine, same load: this one should visibly disagree at the tail, and the gap is itself worth reporting (section 5).
 
 ---
 
@@ -339,7 +338,7 @@ Every ablation below isolates exactly one thing this spec built, so each one sho
 
 ## 8. Failure modes, ranked by how much time they cost
 
-**Throughput looks fine, p99 looks great, but the demo "feels" laggy under load.** Closed-loop load generator. You're not measuring what you think you're measuring; see section 5.
+**Throughput looks fine, p99 looks great, but the demo "feels" laggy under load.** The load generator is timing from actual-send instead of the fixed schedule, so stalls get absorbed instead of reported. You're not measuring what you think you're measuring; see section 5.
 
 **Batch composition never changes between iterations.** Eviction isn't running, or it's deferred past when it should fire. Check that finished sequences are freed the same iteration their EOS is detected, in the result-handling step before `scheduler_step` is called again, not on some later pass.
 

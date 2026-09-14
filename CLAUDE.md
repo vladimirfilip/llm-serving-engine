@@ -47,8 +47,16 @@ take it, or write a clearly-marked placeholder they will replace.
 
 Comments supplement readable code; they are not a memory dump.
 
-- Write them for what the code cannot say: why this invariant holds, why this ordering, which
-  constraint from the spec forced this shape, units and layouts of tensors.
+- Write them for what the code cannot say: why this invariant holds, why this ordering, units and
+  layouts of tensors — grounded entirely in the code they sit next to.
+- Never cite an external document as the reason for a shape: no "spec section N", no filenames like
+  `LLM_Serving_Engine_Spec.md`, no `CLAUDE.md`, no "per the spec/design doc". If a constraint from
+  one of those documents matters, restate the constraint itself in the comment — the code and the
+  comment must stand on their own without the reader opening another file.
+- No process or ownership narration either: no "user territory", "division of labor", "Day N
+  deliverable", "TODO(user)", "placeholder for the scheduler owner" — say what the code does or
+  raises (e.g. `NotImplementedError("int8 weight-only quantization")`), not who is meant to write it
+  or why the org chart put it there.
 - Do not narrate the code, log your debugging history, tag previous bugs, or leave "changed X to Y"
   notes. No `# TODO(claude)`, no section-banner ASCII art.
 - One line usually suffices. If a comment needs a paragraph, the code is wrong.
