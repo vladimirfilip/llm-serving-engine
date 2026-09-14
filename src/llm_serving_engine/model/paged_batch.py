@@ -1,26 +1,28 @@
-"""Per-iteration paging metadata shared by both forward paths that read the paged KV
-pool (ModelRunner.forward_fused and DecodeGraphRunner)."""
+"""Per-iteration paging metadata read by every layer's paged attention, and the host-side
+staging that ships it to the device."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    import torch
+import torch
 
 
 @dataclass(slots=True)
 class PagedBatch:
-    """Computed once per iteration and shared across every layer's attention_forward
-    call -- depends only on the plan and each Sequence's BlockTable, not on any layer's
-    K/V. One row per plan entry, in plan order."""
+    """One row per plan entry, in plan order; identical for every layer."""
 
-    block_table: torch.Tensor  # (num_entries, max_blocks), physical block ids
-    context_len: torch.Tensor  # (num_entries,), total cached length after this call's write
-    query_offset: torch.Tensor  # (num_entries,), cached length before this call's new tokens
-    q_start: torch.Tensor  # (num_entries,), entry's start offset in the flattened q/out
-    q_len: torch.Tensor  # (num_entries,), entry's token count this call
-    max_q_len: int  # q_len's max
-    dest_block_id: torch.Tensor  # (total_tokens,), physical block per new K/V row
-    dest_within: torch.Tensor  # (total_tokens,), within-block offset per new K/V row
+    block_table: torch.Tensor  # (num_entries, max_blocks) int32, physical block ids
+    context_len: torch.Tensor  # (num_entries,) int32, cached length after this call's write
+    query_offset: torch.Tensor  # (num_entries,) int32, cached length before this call's tokens
+    q_start: torch.Tensor  # (num_entries,) int32, entry's first row in the flattened q/out
+    q_len: torch.Tensor  # (num_entries,) int32, entry's token count this call
+    max_q_len: int
+    dest_block_id: torch.Tensor  # (total_tokens,) int64, physical block per new K/V row
+    dest_within: torch.Tensor  # (total_tokens,) int64, offset within that block
+
+
+def pinned(rows: list[list[int]], dtype: torch.dtype) -> torch.Tensor:
+    """Page-locked host tensor, so a `non_blocking` copy to the device neither blocks the
+    host nor goes through a pageable staging buffer."""
+    return torch.tensor(rows, dtype=dtype).pin_memory()

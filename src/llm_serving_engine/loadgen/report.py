@@ -1,7 +1,7 @@
 """Benchmark-report aggregation: turns one run's raw per-request result dicts (as
 produced by `open_loop_load_gen` + `client.send_request`) into the named metrics a
-benchmark report is judged on — TTFT, TPOT, ITL, end-to-end latency, throughput, and
-goodput — without recomputing percentile math already in `metrics.py`.
+benchmark report is judged on: TTFT, TPOT, ITL, end-to-end latency, throughput and
+goodput. Percentiles come from `observability.metrics.summarize`.
 """
 
 from __future__ import annotations

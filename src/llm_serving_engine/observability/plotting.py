@@ -1,7 +1,6 @@
 """Benchmark plots.
 
-Reads raw per-request result dicts (as written by loadgen/cli.py) and generates
-plots from them. matplotlib is imported lazily inside each function so importing
+Reads the raw per-request result dicts the load generator writes and plots them. matplotlib is imported lazily inside each function so importing
 this module never forces a matplotlib install.
 
 Latency stats reuse llm_serving_engine.observability.metrics.summarize/percentile; nothing here
@@ -36,7 +35,7 @@ def plot_latency_pareto(results: list[dict], out_path: str) -> None:
     `results` is one run per QPS setting: [{"target_qps", "duration_s", "results": [...]}],
     where each inner "results" entry is a per-request dict with a "latency" key and an
     optional "success" flag. Achieved throughput is completed requests per second of
-    wall-clock run time, not the offered target. Latency axis is milliseconds.
+    wall-clock run time. Latency axis is milliseconds.
     """
     import matplotlib
 
@@ -77,7 +76,7 @@ def _plot_percentiles_by_load(
     """Shared renderer for the *_by_qps percentile plots: p50/p95/p99 (already in the
     unit `summaries` carries, converted to ms by the caller) against an offered-load
     axis. Points whose summary is None (e.g. a QPS point with no successful requests
-    for that stage) are dropped rather than plotted as zero.
+    for that stage) are dropped.
     """
     import matplotlib
 
@@ -194,8 +193,8 @@ def plot_stage_latency_by_qps(results: list[dict], out_path: str) -> None:
 
     `results` is the same one-run-per-QPS shape `plot_latency_pareto` takes. Each
     stage's percentile is computed independently over its own distribution across
-    requests — an illustrative split of where time typically goes at that percentile,
-    not a decomposition of any single request's own latency.
+    requests: it shows where time typically goes at that percentile, and the two stages'
+    values need not come from the same request.
     """
     import matplotlib
 

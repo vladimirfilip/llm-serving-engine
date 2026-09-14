@@ -59,5 +59,6 @@ Check any code you touch against these.
   exact call sequence is worse than none.
 - Benchmarks and ablations write raw results to disk; plots are regenerated from them, never
   hand-edited.
-- Keep GPU-dependent code importable without a GPU, so tests and CI run on CPU.
+- Keep GPU-dependent code importable without a GPU. `pytest -q` runs every test, including those
+  marked `cuda`, which fail without a GPU; CPU-only CI runs `pytest -q -m "not cuda"`.
 - Commit only when asked.

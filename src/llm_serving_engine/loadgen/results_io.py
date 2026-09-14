@@ -13,9 +13,9 @@ from .report import RunReport, tpot
 
 
 def write_raw(json_path: Path, csv_path: Path, run: dict) -> None:
-    """`run` is `{"target_qps", "duration_s", "results": [...], **extra}` — the same
-    shape `plotting.py` reads. Written verbatim to JSON; flattened to one row per
-    request for CSV.
+    """`run` is `{"target_qps", "duration_s", "results": [...], **extra}`, the shape the
+    plotting functions read. Written verbatim to JSON; flattened to one row per request
+    for CSV.
     """
     json_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(json.dumps(run, indent=2))

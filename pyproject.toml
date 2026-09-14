@@ -29,6 +29,9 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
+markers = [
+    "cuda: needs a CUDA device; a CPU-only machine deselects these with -m 'not cuda'",
+]
 
 [tool.ruff]
 line-length = 100

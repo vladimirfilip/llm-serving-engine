@@ -1,10 +1,9 @@
-"""Wires the IO thread to the scheduler/GPU-worker threads.
+"""Wires the IO thread to the scheduler and GPU-worker threads.
 
-Three threads: the IO thread (asyncio, elsewhere) owns `submit`/`cancel`; the scheduler
-thread here drains `ingress`, runs `scheduler_step`, and applies `handle_iteration_results`;
-the GPU worker thread runs `model_runner.forward` on each plan. The two hops between
-them are plain `deque`s, not `queue.Queue`: append/popleft are GIL-atomic, so a single
-producer and a single consumer need no lock around them.
+The IO thread (asyncio) owns `submit`. The scheduler thread drains `ingress`, runs
+`scheduler_step` and applies each iteration's results. The GPU worker thread runs
+`model_runner.forward` on each plan. The two hops between those threads are plain `deque`s:
+append and popleft are GIL-atomic, so one producer and one consumer need no lock.
 """
 
 from __future__ import annotations
@@ -17,34 +16,49 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
+import torch
+
 from .config import EngineConfig
-from .model.model_runner import ModelRunner
+from .model.decode_graph import decode_graph_buckets
+from .model.model_runner import IterationResults, ModelRunner
 from .model.sampling import SamplingParams
 from .model.tokenizer import TokenizerWrapper
 from .observability.metrics import RequestMetrics
-from .scheduling.allocator import BlockAllocator, ContiguousAllocator
+from .observability.metrics_export import PREEMPTIONS_TOTAL, REQUESTS_IN_FLIGHT, record_request
+from .scheduling.allocator import BlockAllocator, ContiguousAllocator, KVAllocator
 from .scheduling.batch_plan import BatchPlan
-from .scheduling.dispatch import new_output_channel, output_channels
+from .scheduling.dispatch import new_output_channel
 from .scheduling.scheduler import ContinuousBatchedScheduler, Scheduler, StaticBatchedScheduler
 from .scheduling.sequence import Sequence
 
-KVAllocator = BlockAllocator | ContiguousAllocator
+logger = logging.getLogger(__name__)
 
-# An empty-deque spin with no blocking call starves the sibling thread under the GIL:
-# a CPU-bound Python loop doesn't yield often enough for the GPU worker's CUDA launches
-# to get scheduled. This sleep is what releases the GIL between polls.
+# A busy-polling Python thread holds the GIL long enough to starve the sibling thread's
+# CUDA launches; sleeping between empty polls releases it.
 _IDLE_POLL_S = 0.0005
+
+
+class EngineUnavailable(RuntimeError):
+    """The engine accepts no new requests: it is stopping, switching models, or failed."""
 
 
 @dataclass(slots=True)
 class IngressRequest:
-    """Plain values crossing the ingress queue from the IO thread to the scheduler
-    thread — no live Sequence object, just what's needed to build one."""
+    """Plain values crossing from the IO thread to the scheduler thread; the scheduler
+    thread builds the Sequence."""
 
     seq_id: int
     prompt_tokens: list[int]
     sampling_params: SamplingParams
     arrival_time: float
+
+
+@dataclass(slots=True)
+class Submission:
+    seq_id: int
+    output_queue: asyncio.Queue
+    prompt_len: int
+    tokenizer: TokenizerWrapper  # the tokenizer that encoded the prompt decodes its tokens
 
 
 class InferenceEngine:
@@ -60,56 +74,67 @@ class InferenceEngine:
         self.tokenizer = tokenizer
         self.model_runner = model_runner
         self.scheduler = scheduler if scheduler is not None else _build_scheduler(config)
-        num_blocks = config.kv_cache.num_blocks(_free_memory_bytes(model_runner))
-        self.allocator = allocator if allocator is not None else _build_allocator(config, num_blocks)
-        if config.kv_allocator == "paged" and config.model.use_custom_kernels:
-            model_runner.allocate_kv_pool(num_blocks, config.kv_cache.block_size)
+        self.allocator = (
+            allocator if allocator is not None else _build_allocator(config, model_runner)
+        )
+        if isinstance(self.allocator, BlockAllocator) and config.model.use_custom_kernels:
+            model_runner.allocate_kv_pool(self.allocator.num_blocks, self.allocator.block_size)
             if config.model.use_cuda_graphs:
-                model_runner.capture_decode_graphs()
+                model_runner.capture_decode_graphs(decode_graph_buckets(self.scheduler.max_running))
         self.ingress: queue.SimpleQueue[IngressRequest] = queue.SimpleQueue()
         self.waiting: deque[Sequence] = deque()
         self.running: list[Sequence] = []
         self._plan_queue: deque[tuple[BatchPlan, dict[int, Sequence]]] = deque()
-        self._results_queue: deque[list[tuple[int, int, bool]]] = deque()
+        self._results_queue: deque[IterationResults | Exception] = deque()
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
-        self._next_seq_id = 0
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Taken around the accepting check and the ingress put, so closing the ingress can't
+        # race a submit into an engine that no longer drains it.
+        self._ingress_lock = threading.Lock()
+        self._accepting = True
+        self._failed = False
+        # Each written by one thread only; the engine is idle when they are equal.
+        self._submitted = 0
+        self._ended = 0
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Called once from the IO thread at startup; the GPU worker targets this loop
-        for every call_soon_threadsafe."""
+        """Called once from the IO thread at startup; every token callback targets `loop`."""
         self._loop = loop
 
-    def submit(self, prompt: str, sampling_params: SamplingParams) -> tuple[int, asyncio.Queue]:
-        """IO thread: tokenize, create the output channel, hand off to the ingress queue.
-
-        Returns (seq_id, output_queue). The caller streams from output_queue until the
-        DONE sentinel (llm_serving_engine.scheduling.dispatch.DONE) and should pop its own entry
-        in a finally block so a disconnected client's channel doesn't linger.
-        """
-        seq_id = self._next_seq_id
-        self._next_seq_id += 1
+    def submit(self, prompt: str, sampling_params: SamplingParams) -> Submission:
+        """IO thread: tokenize, open the output channel, hand off to the scheduler thread.
+        The caller streams from `output_queue` until DONE or ABORTED, and pops its
+        `output_channels` entry when it stops reading."""
         prompt_tokens = self.tokenizer.encode_prompt(prompt)
-        q = new_output_channel(seq_id, self.config.server.output_queue_maxsize)
-        self.ingress.put(
-            IngressRequest(
-                seq_id=seq_id,
-                prompt_tokens=prompt_tokens,
-                sampling_params=sampling_params,
-                arrival_time=time.monotonic(),
+        with self._ingress_lock:
+            if not self._accepting:
+                raise EngineUnavailable("engine is not accepting requests")
+            seq_id, output_queue = new_output_channel(self.config.server.output_queue_maxsize)
+            self._submitted += 1
+            self.ingress.put(
+                IngressRequest(seq_id, prompt_tokens, sampling_params, time.monotonic())
             )
-        )
-        return seq_id, q
+        return Submission(seq_id, output_queue, len(prompt_tokens), self.tokenizer)
 
-    def cancel(self, seq_id: int) -> None:
-        """Client disconnected before the stream finished. Drops the output channel;
-        the sequence itself is only known to the scheduler thread, so freeing its blocks
-        still routes through the same result-handling path other finishes do."""
-        output_channels.pop(seq_id, None)
+    def close_ingress(self) -> None:
+        with self._ingress_lock:
+            self._accepting = False
+
+    @property
+    def is_idle(self) -> bool:
+        """Every submitted request has ended."""
+        return self._ended == self._submitted
+
+    @property
+    def healthy(self) -> bool:
+        return not self._failed and all(t.is_alive() for t in self._threads)
+
+    @property
+    def kv_utilization(self) -> float:
+        return self.allocator.utilization
 
     def start(self) -> None:
-        """Spawns the scheduler and GPU worker threads."""
         scheduler = threading.Thread(target=self._scheduler_loop, name="scheduler", daemon=True)
         worker = threading.Thread(target=self._gpu_worker_loop, name="gpu-worker", daemon=True)
         self._threads = [scheduler, worker]
@@ -117,9 +142,75 @@ class InferenceEngine:
         worker.start()
 
     def stop(self) -> None:
+        self.close_ingress()
         self._stop.set()
         for t in self._threads:
             t.join(timeout=5)
+
+    def _scheduler_loop(self) -> None:
+        try:
+            self._schedule_until_stopped()
+        except Exception:
+            logger.exception("scheduler thread failed; aborting every request")
+            self._failed = True
+            self.close_ingress()
+            self._drain_ingress()
+            self._abort(self.running + list(self.waiting))
+            self.waiting.clear()
+
+    def _schedule_until_stopped(self) -> None:
+        """Ping-pongs one BatchPlan at a time: a decode entry's input is the token the
+        previous iteration produced, which exists only once its results are applied."""
+        in_flight: tuple[BatchPlan, dict[int, Sequence]] | None = None
+        while not self._stop.is_set():
+            self._drain_ingress()
+            if in_flight is not None:
+                try:
+                    outcome = self._results_queue.popleft()
+                except IndexError:
+                    time.sleep(_IDLE_POLL_S)
+                    continue
+                self._apply(outcome, *in_flight)
+                in_flight = None
+
+            plan = self.scheduler.scheduler_step(self.running, self.waiting, self.allocator)
+            for seq_id in plan.preempted:
+                self.model_runner.free(seq_id)
+            PREEMPTIONS_TOTAL.inc(len(plan.preempted))
+            if plan.rejected:
+                self._abort(plan.rejected)
+            REQUESTS_IN_FLIGHT.set(len(self.running))
+
+            if len(plan):
+                in_flight = (plan, {seq.seq_id: seq for seq in self.running})
+                self._plan_queue.append(in_flight)
+            else:
+                time.sleep(_IDLE_POLL_S)
+
+    def _apply(
+        self, outcome: IterationResults | Exception, plan: BatchPlan, seqs: dict[int, Sequence]
+    ) -> None:
+        """Folds one iteration back into scheduler state. A failed batch had already
+        advanced its sequences' prefill progress and block tables, so every sequence in it
+        is aborted: retrying would run against state the model never computed."""
+        if isinstance(outcome, Exception):
+            self._abort([seqs[entry.seq_id] for entry in plan])
+            return
+        finished = self.scheduler.handle_iteration_results(
+            outcome, self.running, self.allocator, self._loop
+        )
+        for seq in finished:
+            self._end(seq)
+
+    def _abort(self, seqs: list[Sequence]) -> None:
+        self.scheduler.abort(seqs, self.running, self.allocator, self._loop)
+        for seq in seqs:
+            self._end(seq)
+
+    def _end(self, seq: Sequence) -> None:
+        self.model_runner.free(seq.seq_id)
+        record_request(seq.metrics)
+        self._ended += 1
 
     def _drain_ingress(self) -> None:
         while True:
@@ -129,35 +220,6 @@ class InferenceEngine:
                 return
             self.waiting.append(sequence_from_ingress(req))
 
-    def _scheduler_loop(self) -> None:
-        """Ping-pongs one BatchPlan in flight at a time: a decode entry's input is
-        `seq.generated_tokens[-1]`, which only reflects the prior iteration once
-        handle_iteration_results has run, so the next plan can't be built until the
-        previous one's results are back (no free pipelining across iterations here)."""
-        in_flight = False
-        while not self._stop.is_set():
-            self._drain_ingress()
-            if in_flight:
-                try:
-                    iter_results = self._results_queue.popleft()
-                except IndexError:
-                    time.sleep(_IDLE_POLL_S)
-                    continue
-                self.scheduler.handle_iteration_results(
-                    iter_results, self.running, self.allocator, self._loop
-                )
-                for seq_id, _token, finished in iter_results:
-                    if finished:
-                        self.model_runner.free(seq_id)
-                in_flight = False
-            plan = self.scheduler.scheduler_step(self.running, self.waiting, self.allocator)
-            if len(plan):
-                seqs = {seq.seq_id: seq for seq in self.running}
-                self._plan_queue.append((plan, seqs))
-                in_flight = True
-            elif not in_flight:
-                time.sleep(_IDLE_POLL_S)
-
     def _gpu_worker_loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -166,14 +228,11 @@ class InferenceEngine:
                 time.sleep(_IDLE_POLL_S)
                 continue
             try:
-                results = self.model_runner.forward(plan, seqs)
-            except Exception:
-                # An uncaught exception here would otherwise kill this thread silently,
-                # leaving the scheduler waiting forever for results that never arrive —
-                # one bad batch would hang every client, not just the one that caused it.
-                logging.getLogger(__name__).exception("GPU worker dropped a batch")
-                results = []
-            self._results_queue.append(results)
+                outcome: IterationResults | Exception = self.model_runner.forward(plan, seqs)
+            except Exception as e:
+                logger.exception("forward pass failed; aborting its batch")
+                outcome = e
+            self._results_queue.append(outcome)
 
 
 def _build_scheduler(config: EngineConfig) -> Scheduler:
@@ -187,37 +246,29 @@ def _build_scheduler(config: EngineConfig) -> Scheduler:
     )
 
 
-def _build_allocator(config: EngineConfig, num_blocks: int) -> KVAllocator:
-    """Both allocators are sized off the same `num_blocks`, so a run picking
-    "contiguous" reserves the identical total token budget a "paged" run would —
-    comparing the two at matched memory rather than matched block count."""
+def _build_allocator(config: EngineConfig, model_runner: ModelRunner) -> KVAllocator:
+    """Both allocators size off the same block count, so a contiguous run and a paged run
+    compare at matched memory."""
+    block_size = config.kv_cache.block_size
+    num_blocks = config.kv_cache.num_blocks(_free_memory_bytes(model_runner))
     if config.kv_allocator == "contiguous":
-        return ContiguousAllocator(capacity_tokens=num_blocks * config.kv_cache.block_size)
-    return BlockAllocator(num_blocks=num_blocks, block_size=config.kv_cache.block_size)
+        return ContiguousAllocator(capacity_tokens=num_blocks * block_size)
+    return BlockAllocator(num_blocks=num_blocks, block_size=block_size)
 
 
 def _free_memory_bytes(model_runner: ModelRunner) -> int:
-    """Sizing input for KVCacheConfig.num_blocks: real free VRAM on GPU, a fixed
-    dev-mode budget on CPU where there's no equivalent signal to query."""
+    """Free VRAM on GPU; a fixed 2 GiB budget on CPU, which has no equivalent to query."""
     if model_runner.device.startswith("cuda"):
-        import torch
-
         return torch.cuda.mem_get_info()[0]
     return 2 * 1024**3
 
 
 def sequence_from_ingress(req: IngressRequest) -> Sequence:
-    """Turns a queued plain-value request into scheduler-visible Sequence state.
-
-    admit_time stays None here: this sequence is only entering `waiting`, and
-    schedule_latency must cover that wait, so admit_time is stamped later, when the
-    scheduler actually admits the sequence.
-    """
-    metrics = RequestMetrics(enqueue_time=req.arrival_time)
+    """A WAITING Sequence. admit_time stays unset until the scheduler admits it, so
+    schedule_latency covers the time spent in `waiting`."""
     return Sequence(
         seq_id=req.seq_id,
         prompt_tokens=req.prompt_tokens,
         sampling_params=req.sampling_params,
-        arrival_time=req.arrival_time,
-        metrics=metrics,
+        metrics=RequestMetrics(enqueue_time=req.arrival_time),
     )

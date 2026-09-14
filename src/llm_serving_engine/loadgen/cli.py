@@ -1,7 +1,7 @@
 """CLI entrypoint for the load generator (`llm-loadgen` console script).
 
-Owns argument parsing and writing raw per-request results to disk; see plotting.py
-for reading those files back into plots.
+Parses arguments, runs the load, and writes raw per-request results and a summary to
+disk.
 """
 
 from __future__ import annotations
@@ -69,8 +69,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     results = asyncio.run(_run(config))
 
-    # One run per file, tagged with its offered load: exactly the shape
-    # plotting.plot_latency_pareto consumes, so a sweep is regenerable from the raw files.
+    # One run per file, tagged with its offered load: the shape plot_latency_pareto reads,
+    # so a sweep's plots regenerate from the raw files.
     run = {"target_qps": config.target_qps, "duration_s": config.duration_s, "results": results}
     stem = (args.out or Path(f"results_{int(time.time())}")).with_suffix("")
     write_raw(stem.with_suffix(".json"), stem.with_suffix(".csv"), run)

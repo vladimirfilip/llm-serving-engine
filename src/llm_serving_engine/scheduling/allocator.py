@@ -1,13 +1,8 @@
-"""KV-cache allocators: BlockAllocator (paged, grows a sequence's block table
-incrementally) and ContiguousAllocator (a naive baseline that reserves each
-sequence's worst-case span up front).
+"""KV-cache allocators. Both expose `allocate`, `free`, `can_ever_fit` and `utilization`,
+so the scheduler drives either one.
 
-Pool sizing (bytes/token/layer = 2 * n_kv_heads * head_dim * dtype_bytes) uses
-n_kv_heads, not n_heads, since K/V projections are shared across a group of query
-heads under grouped-query attention.
-
-Both expose the same `get_capacity(seq, new_tokens) -> bool` / `free(table) -> None`
-surface the scheduler calls, so either can be dropped into InferenceEngine unmodified.
+BlockAllocator grows a sequence's block table one block at a time as it needs slots.
+ContiguousAllocator reserves prompt + max_tokens at admission as one slab.
 """
 
 from __future__ import annotations
@@ -20,15 +15,19 @@ from .sequence import BlockTable, Sequence
 
 class BlockAllocator:
     def __init__(self, num_blocks: int, block_size: int):
-        self.free_blocks: deque[int] = deque(range(num_blocks))
+        self.num_blocks = num_blocks
         self.block_size = block_size
+        self.free_blocks: deque[int] = deque(range(num_blocks))
 
     def needed_blocks(self, table: BlockTable, new_tokens: int) -> int:
         return ceil((table.num_tokens + new_tokens) / self.block_size) - len(table.physical_blocks)
 
-    def get_capacity(self, seq: Sequence, new_tokens: int) -> bool:
+    def allocate(self, seq: Sequence, new_tokens: int, decode_reserve: int = 0) -> bool:
+        """Grows `seq` by `new_tokens` slots, or returns False and changes nothing.
+        `decode_reserve` blocks stay free afterwards: each running sequence may need one
+        new block for its next decode token."""
         needed = self.needed_blocks(seq.block_table, new_tokens)
-        if needed > len(self.free_blocks):
+        if needed + decode_reserve > len(self.free_blocks):
             return False
         seq.block_table.num_tokens += new_tokens
         for _ in range(needed):
@@ -38,24 +37,32 @@ class BlockAllocator:
     def free(self, table: BlockTable) -> None:
         self.free_blocks.extend(table.physical_blocks)
         table.physical_blocks.clear()
+        table.num_tokens = 0
+
+    def can_ever_fit(self, seq: Sequence) -> bool:
+        """Whether the whole pool could hold `seq` plus its next decode token."""
+        return ceil((seq.num_tokens + 1) / self.block_size) <= self.num_blocks
+
+    @property
+    def utilization(self) -> float:
+        return 1 - len(self.free_blocks) / self.num_blocks if self.num_blocks else 0.0
 
 
 class ContiguousAllocator:
-    """Naive per-sequence max-length reservation: reserves prompt + max_tokens worth of
-    capacity as one slab at admission, not incrementally in blocks, so a sequence that
-    finishes far short of max_tokens still holds its worst-case share until it's freed.
-    Construct it with `capacity_tokens` equal to `num_blocks * block_size` of a paged
-    pool it's being compared against, so the two run at matched memory.
-    """
+    """A sequence that finishes far short of max_tokens still holds its whole reservation
+    until freed. Give it `capacity_tokens = num_blocks * block_size` of the paged pool it
+    is compared against, so both run at matched memory."""
 
     def __init__(self, capacity_tokens: int):
         self.capacity_tokens = capacity_tokens
         self.used_tokens = 0
 
-    def get_capacity(self, seq: Sequence, new_tokens: int) -> bool:
+    def allocate(self, seq: Sequence, new_tokens: int, decode_reserve: int = 0) -> bool:
+        """Decode growth always lands inside the sequence's own reservation, so
+        `decode_reserve` never applies here."""
         table = seq.block_table
         if table.reserved_tokens == 0:
-            reservation = len(seq.prompt_tokens) + seq.sampling_params.max_tokens
+            reservation = self._reservation(seq)
             if self.used_tokens + reservation > self.capacity_tokens:
                 return False
             table.reserved_tokens = reservation
@@ -67,3 +74,17 @@ class ContiguousAllocator:
         self.used_tokens -= table.reserved_tokens
         table.reserved_tokens = 0
         table.num_tokens = 0
+
+    def can_ever_fit(self, seq: Sequence) -> bool:
+        return self._reservation(seq) <= self.capacity_tokens
+
+    @property
+    def utilization(self) -> float:
+        return self.used_tokens / self.capacity_tokens if self.capacity_tokens else 0.0
+
+    @staticmethod
+    def _reservation(seq: Sequence) -> int:
+        return len(seq.prompt_tokens) + seq.sampling_params.max_tokens
+
+
+KVAllocator = BlockAllocator | ContiguousAllocator

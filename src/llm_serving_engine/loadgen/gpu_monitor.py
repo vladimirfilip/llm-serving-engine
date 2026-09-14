@@ -1,7 +1,7 @@
 """Background GPU sampler for a benchmark run: peak/mean utilization% and memory-used,
 via `nvidia-smi` (whole-device, so it sees the server subprocess's usage even though
-this runs in the benchmark driver's own process). Absent `nvidia-smi` (CPU dev box),
-every stat comes back `None` rather than raising, so a run still completes off-GPU.
+this runs in the benchmark driver's own process). Without `nvidia-smi` every stat is
+`None`, so a run still completes off-GPU.
 """
 
 from __future__ import annotations

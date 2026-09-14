@@ -1,30 +1,25 @@
-"""Tokenizer glue around HuggingFace `transformers.AutoTokenizer`.
-
-Lazy-imports transformers so the rest of the package (allocator, scheduler, dispatch)
-stays importable on a machine without it installed.
-"""
+"""Tokenizer glue around HuggingFace `transformers.AutoTokenizer`."""
 
 from __future__ import annotations
+
+from transformers import AutoTokenizer
+
+# What `decode` yields for bytes that end mid-character.
+_INCOMPLETE_CHAR = "�"
 
 
 class TokenizerWrapper:
     def __init__(self, model_name_or_path: str):
-        from transformers import AutoTokenizer
-
         self._tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-        self._stream_text: dict[int, str] = {}
+        # seq_id -> (prefix_offset, read_offset) into that sequence's generated tokens.
+        self._decode_windows: dict[int, tuple[int, int]] = {}
 
     def encode(self, text: str) -> list[int]:
         return self._tokenizer.encode(text)
 
     def encode_prompt(self, prompt: str) -> list[int]:
-        """Encodes a raw `/v1/generate` prompt string for whichever checkpoint is loaded.
-
-        Instruct checkpoints (Llama-3-Instruct and similar) ship a chat template that
-        wraps the prompt in the header/turn tokens they were tuned on; base checkpoints
-        have none and expect the raw text continued as-is. Presence of a chat template is
-        what tells the two apart, so this branches on that instead of a config knob.
-        """
+        """Instruct checkpoints ship a chat template wrapping the prompt in the turn tokens
+        they were tuned on; base checkpoints have none and continue the raw text."""
         if self._tokenizer.chat_template is None:
             return self.encode(prompt)
         return self._tokenizer.apply_chat_template(
@@ -38,22 +33,22 @@ class TokenizerWrapper:
         return self._tokenizer.decode(token_ids, skip_special_tokens=True)
 
     def decode_incremental(self, seq_id: int, generated_tokens: list[int]) -> str:
-        """Text newly produced since the last call for this seq_id.
+        """Text completed since the last call for this seq_id.
 
-        BPE/sentencepiece merges mean a single new token decoded in isolation can come out
-        with the wrong leading-space/joining behavior, so this re-decodes the whole
-        (prompt-free) generated-token list each call and diffs against the previous decode,
-        rather than decoding the new token id alone. Still cheap: generated_tokens, not the
-        prompt, is what grows per step.
+        Decodes only a window: tokens[prefix_offset:read_offset] were already emitted and
+        give the merge context a token needs to decode with the right spacing. Text ending
+        in an incomplete character is held back until the tokens that complete it arrive.
         """
-        full_text = self.decode(generated_tokens)
-        prev_text = self._stream_text.get(seq_id, "")
-        self._stream_text[seq_id] = full_text
-        return full_text[len(prev_text) :]
+        prefix_offset, read_offset = self._decode_windows.get(seq_id, (0, 0))
+        prefix_text = self.decode(generated_tokens[prefix_offset:read_offset])
+        text = self.decode(generated_tokens[prefix_offset:])
+        if len(text) <= len(prefix_text) or text.endswith(_INCOMPLETE_CHAR):
+            return ""
+        self._decode_windows[seq_id] = (read_offset, len(generated_tokens))
+        return text[len(prefix_text) :]
 
     def forget(self, seq_id: int) -> None:
-        """Drops incremental-decode state for a finished/cancelled sequence."""
-        self._stream_text.pop(seq_id, None)
+        self._decode_windows.pop(seq_id, None)
 
     @property
     def eos_token_id(self) -> int | None:

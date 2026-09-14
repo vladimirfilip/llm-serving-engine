@@ -1,10 +1,9 @@
 """FlashAttention-2 in Triton: tiled attention with online softmax.
 
 Q may be shorter than K/V for incremental decoding (a KV cache holds `query_offset`
-prior tokens already resident). The causal mask compares each query's true position,
-`query_offset + row`, against each key position -- not the row index directly, so Q
-and K/V need not match in length. Backward pass assumes query_offset=0: this engine
-never trains against a cache.
+prior tokens). The causal mask compares each query's true position, `query_offset + row`,
+against each key position, so Q and K/V need not match in length. The backward pass
+assumes query_offset=0: this engine never trains against a cache.
 
 Notation follows the FlashAttention-2 paper: Q, K, V, O for the tensors, L for
 the saved log-sum-exp, m and l for the running max and denominator.
@@ -83,9 +82,8 @@ def flash_attention_2(
     running_denom = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
 
-    # A query row's true position is QUERY_OFFSET + offs_m, so the furthest key
-    # tile it can attend to is bounded by that, not by offs_m alone -- capped at
-    # N_K since the offset can push it past the cache.
+    # A query row's true position is QUERY_OFFSET + offs_m, which bounds the furthest
+    # key tile it can attend to; capped at N_K since the offset can push it past the cache.
     end_n = tl.minimum(QUERY_OFFSET + (start_m + 1) * BLOCK_M, N_K) if IS_CAUSAL else N_K
 
     for start_n in range(0, end_n, BLOCK_N):
@@ -98,9 +96,8 @@ def flash_attention_2(
         v_ptrs = V + v_offset + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
         v = tl.load(v_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
 
-        # softmax_scale = 1/sqrt(D) from the host, not 1/sqrt(BLOCK_D) -- BLOCK_D
-        # is the padded width and would silently shift the temperature whenever
-        # D isn't a power of 2.
+        # softmax_scale is 1/sqrt(D), the true head dimension: BLOCK_D is only the padded
+        # width, and scaling by it would shift the temperature whenever D isn't a power of 2.
         s = tl.dot(q, tl.trans(k), input_precision=PRECISION) * softmax_scale
 
         score_mask = m_mask[:, None] & n_mask[None, :]
@@ -133,11 +130,10 @@ def flash_attention_2(
     o_ptrs = O + off_z * stride_oz + off_h * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
     tl.store(o_ptrs, acc, mask=m_mask[:, None] & d_mask[None, :])
 
-# Tile schedule. fp16/bf16 feed tensor cores directly and fit the large tiles.
-# True IEEE fp32 needs ~2x the shared memory for the same tile -- Triton emits a
-# 3-pass split-float emulation instead of one tensor-core op -- so fp32 trades
-# tile size for accuracy. Measured on an RTX 4070 Ti (99 KB shared/SM): fp32 at
-# 128x64 needs 131 KB and does not launch.
+# Tile schedule. fp16/bf16 feed tensor cores directly and fit the large tiles. True IEEE
+# fp32 needs ~2x the shared memory for the same tile, because Triton emits a 3-pass
+# split-float emulation for it, so fp32 trades tile size for accuracy. On an RTX 4070 Ti
+# (99 KB shared/SM), fp32 at 128x64 needs 131 KB and does not launch.
 _TILES = {
     torch.float16:  (128, 64),
     torch.bfloat16: (128, 64),
@@ -154,8 +150,8 @@ def _softmax_precision(dtype: torch.dtype) -> str:
 def _oom_hint(
     e: triton.runtime.errors.OutOfResources, D: int, dtype: torch.dtype, BLOCK_M: int, BLOCK_N: int
 ) -> triton.runtime.errors.OutOfResources:
-    # Triton's message names byte counts but not the cause: this (dtype, head_dim) needs
-    # a tile that doesn't fit in this GPU's shared memory.
+    # Triton's message gives only byte counts; the cause is a (dtype, head_dim) tile that
+    # doesn't fit in this GPU's shared memory.
     return triton.runtime.errors.OutOfResources(
         e.required, e.limit,
         f"shared memory for head_dim={D} in {dtype} at "
@@ -166,9 +162,9 @@ def _oom_hint(
 
 def flash_attention_forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                             is_causal: bool = False, query_offset: int = 0):
-    """Q: (Z, H, N_Q, D); K, V: (Z, H, N_K, D). N_Q and N_K may differ -- a decode step
+    """Q: (Z, H, N_Q, D); K, V: (Z, H, N_K, D). N_Q and N_K may differ: a decode step
     passes N_Q=1 against the sequence's full cached N_K, with query_offset=N_K-N_Q so the
-    causal mask still compares true sequence positions rather than in-tile row indices.
+    causal mask compares true sequence positions.
     """
     Z, H, N_Q, D = q.shape
     Zk, Hk, N_K, Dk = k.shape
@@ -225,7 +221,7 @@ def paged_attention_2(
     stride_oh, stride_om, stride_od,
     stride_bt_row,
     H, D,
-    BLOCK_SIZE_KV,          # physical KV block size (runtime int, not necessarily a power of 2)
+    BLOCK_SIZE_KV,          # physical KV block size (runtime int, any positive value)
     softmax_scale,
     N_GROUPS: tl.constexpr,  # H // H_KV, query heads sharing one KV head under GQA
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
@@ -234,8 +230,9 @@ def paged_attention_2(
     """One program per (query tile, batch entry, query head). Grid axis 0 is sized to the
     longest entry in the batch.
 
-    K/V live in a shared per-layer pool indexed by physical block id, BLOCK_TABLE[entry, i] 
-    is the i-th physical block backing KV cache segment [i*BLOCK_SIZE_KV, (i+1)*BLOCK_SIZE_KV)]
+    K/V live in a shared per-layer pool indexed by physical block id. BLOCK_TABLE[entry, i]
+    is the physical block backing that entry's cache positions [i*BLOCK_SIZE_KV,
+    (i+1)*BLOCK_SIZE_KV); only positions below CONTEXT_LEN are ever read.
     """
     start_m = tl.program_id(0)
     entry_head = tl.program_id(1)
@@ -309,11 +306,10 @@ def paged_attention_forward(
     stored in a shared paged pool.
 
     q: (H, total_tokens, D).
-    k_pool/v_pool: (num_blocks, block_size, H_KV, D), shared
-    across every entry and already holding this call's new tokens (the caller writes
-    them in before calling this). 
-    block_table/context_len/query_offset/q_start/q_len are one row per batch entry
-    max_q_len is q_len's max
+    k_pool/v_pool: (num_blocks, block_size, H_KV, D), shared across every entry and
+    already holding this call's new tokens.
+    block_table/context_len/query_offset/q_start/q_len: one row per batch entry.
+    max_q_len: q_len's max.
     """
     H, _total_tokens, D = q.shape
     H_KV = k_pool.shape[2]
@@ -350,7 +346,7 @@ def paged_attention_forward(
 
 
 def flash_attention_backward(Q, K, V, O, L, dO, is_causal, scale):
-    """Unmodified: training has no KV cache, so query_offset is always 0 here."""
+    """Training has no KV cache, so query_offset is always 0 here."""
     S = (Q @ K.transpose(-1, -2)) * scale
     if is_causal:
         nq, nk = Q.shape[-2], K.shape[-2]

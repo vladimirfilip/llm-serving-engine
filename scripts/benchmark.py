@@ -1,11 +1,11 @@
 """Benchmark driver: launches `llm-serve` under different `EngineConfig` knobs,
 drives each instance with the real open-loop load generator, and regenerates plots
-from the raw results written to disk — the JSON files are the source of truth; rerun
-this script to update a plot rather than editing one by hand.
+from the raw results written to disk. The JSON files are the source of truth: rerun this
+script to update a plot.
 
 Every run starts from the same reference config (`_base_env`): a Llama-family model,
-fused forward, continuous batching, paged KV — continuous and paged are already the
-engine's own defaults, so only `--model`/`--device`/`--dtype`/`--use-custom-kernels`
+fused forward, continuous batching, paged KV. Continuous and paged are the engine's own
+defaults, so only `--model`/`--device`/`--dtype`/`--use-custom-kernels`
 need setting here. Each two-arm ablation overrides exactly one of those axes for its
 second arm; the rest stay at the reference default so the comparison is isolated.
 
@@ -19,10 +19,6 @@ second arm; the rest stay at the reference default so the comparison is isolated
 `pareto` additionally reports TTFT/TPOT/goodput/GPU/KV-cache against offered rate, and
 `offline` approximates an always-full-queue max-throughput run (see `bench_offline`).
 Every run's raw per-request results and aggregate report are written as JSON and CSV.
-
-Requires `loadgen/timing.py`'s `open_loop_load_gen` to be implemented — it raises
-NotImplementedError until then, which surfaces here as this script failing at the
-first load-gen call, not as a bug in this script.
 """
 
 from __future__ import annotations
@@ -64,8 +60,8 @@ from llm_serving_engine.observability.plotting import (
 @contextlib.contextmanager
 def _running_server(env_overrides: dict[str, str], ready_timeout: float):
     """Spawns `llm-serve` as a subprocess with `env_overrides` layered on the current
-    environment, blocks until `/health` answers, and always tears the process down —
-    a failed ablation run must not leave a stray server holding the port."""
+    environment, blocks until `/health` answers, and always tears the process down, so
+    a failed ablation run never leaves a stray server holding the port."""
     env = {**os.environ, **env_overrides}
     base_url = f"http://127.0.0.1:{env_overrides['LLM_PORT']}"
     proc = subprocess.Popen(
@@ -133,7 +129,7 @@ def _p99(results: list[dict]) -> float:
 def _base_env(args: argparse.Namespace) -> dict[str, str]:
     """The reference config every benchmark starts from: a Llama-family model, fused
     forward, on CUDA. Each ablation overrides exactly one of these keys for its second
-    arm — everything else stays at this default so the comparison isolates one axis."""
+    arm; everything else stays at this default so the comparison isolates one axis."""
     return {
         "LLM_MODEL": args.model,
         "LLM_DEVICE": args.device,
@@ -203,9 +199,8 @@ def bench_pareto(args: argparse.Namespace, out_dir: Path) -> None:
 def bench_offline(args: argparse.Namespace, out_dir: Path) -> None:
     """Offline/max-throughput mode: an always-full request queue, approximated by
     running the existing open-loop generator at an offered rate well above what the
-    server can sustain, so arrivals queue up continuously rather than draining between
-    them. Only throughput is reported — an offered-load-saturated open-loop run isn't
-    a steady-state per-request latency measurement."""
+    server can sustain, so arrivals queue continuously. Only throughput is reported: a
+    saturated open-loop run is no steady-state per-request latency measurement."""
     with _running_server(_base_env(args), args.ready_timeout) as base_url:
         with GpuMonitor() as gpu, KvUtilizationMonitor(base_url) as kv:
             results = asyncio.run(
@@ -266,7 +261,7 @@ def bench_scheduler(args: argparse.Namespace, out_dir: Path) -> None:
 def bench_allocator(args: argparse.Namespace, out_dir: Path) -> None:
     """Contiguous max-length reservation vs. paged KV cache: both allocators are sized
     off the same KVCacheConfig, so holding model/device/gpu-memory-utilization fixed
-    across arms compares the two at matched memory rather than matched block count."""
+    across arms compares the two at matched memory."""
     _run_ablation(args, out_dir, "allocator_ablation", "LLM_KV_ALLOCATOR", ["paged", "contiguous"])
 
 

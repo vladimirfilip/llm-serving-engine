@@ -1,62 +1,70 @@
-"""ContiguousAllocator correctness: whole-sequence reservation sized to prompt +
-max_tokens, charged once at admission and returned whole on free(). Assert behaviour
-and invariants, not implementation detail.
-"""
+"""ContiguousAllocator: one reservation of prompt + max_tokens, charged at admission and
+returned whole on free()."""
 
 from llm_serving_engine.model.sampling import SamplingParams
 from llm_serving_engine.scheduling.allocator import ContiguousAllocator
-from tests.test_sequence import make_sequence
+from tests.factories import make_sequence
 
 
-def test_first_call_reserves_prompt_plus_max_tokens():
+def _seq(**overrides):
+    return make_sequence(
+        prompt_tokens=[1, 2, 3], sampling_params=SamplingParams(max_tokens=10), **overrides
+    )
+
+
+def test_first_allocate_reserves_prompt_plus_max_tokens():
     alloc = ContiguousAllocator(capacity_tokens=100)
-    seq = make_sequence(prompt_tokens=[1, 2, 3], sampling_params=SamplingParams(max_tokens=10))
+    seq = _seq()
 
-    assert alloc.get_capacity(seq, new_tokens=3)  # prefill: the 3 prompt tokens
-    assert seq.block_table.reserved_tokens == 13  # 3 prompt + 10 max_tokens, not just new_tokens
+    assert alloc.allocate(seq, new_tokens=3)
+    assert seq.block_table.reserved_tokens == 13
     assert seq.block_table.num_tokens == 3
     assert alloc.used_tokens == 13
 
 
-def test_later_calls_grow_usage_without_charging_a_second_reservation():
+def test_later_allocations_draw_on_the_existing_reservation():
     alloc = ContiguousAllocator(capacity_tokens=100)
-    seq = make_sequence(prompt_tokens=[1, 2, 3], sampling_params=SamplingParams(max_tokens=10))
-
-    alloc.get_capacity(seq, new_tokens=3)
-    alloc.get_capacity(seq, new_tokens=1)  # one decode step
+    seq = _seq()
+    alloc.allocate(seq, new_tokens=3)
+    alloc.allocate(seq, new_tokens=1)
 
     assert seq.block_table.num_tokens == 4
-    assert seq.block_table.reserved_tokens == 13
-    assert alloc.used_tokens == 13  # unchanged: reservation was already worst-case
+    assert alloc.used_tokens == 13
 
 
-def test_get_capacity_returns_false_and_does_not_mutate_when_pool_is_short():
+def test_failed_allocate_changes_nothing():
     alloc = ContiguousAllocator(capacity_tokens=10)
-    seq = make_sequence(prompt_tokens=[1, 2, 3], sampling_params=SamplingParams(max_tokens=10))
+    seq = _seq()
 
-    assert not alloc.get_capacity(seq, new_tokens=3)  # needs 13, pool has 10
+    assert not alloc.allocate(seq, new_tokens=3)  # needs 13
     assert seq.block_table.reserved_tokens == 0
     assert seq.block_table.num_tokens == 0
     assert alloc.used_tokens == 0
 
 
-def test_two_sequences_share_capacity_by_worst_case_not_actual_usage():
+def test_sequences_share_capacity_by_worst_case():
     alloc = ContiguousAllocator(capacity_tokens=20)
     a = make_sequence(seq_id=1, prompt_tokens=[1], sampling_params=SamplingParams(max_tokens=9))
     b = make_sequence(seq_id=2, prompt_tokens=[1], sampling_params=SamplingParams(max_tokens=9))
 
-    assert alloc.get_capacity(a, new_tokens=1)  # reserves 10
-    assert alloc.get_capacity(b, new_tokens=1)  # reserves 10, exactly fills the pool
+    assert alloc.allocate(a, new_tokens=1)
+    assert alloc.allocate(b, new_tokens=1)
     assert alloc.used_tokens == 20
+    assert alloc.utilization == 1.0
 
 
-def test_free_returns_the_whole_reservation_and_clears_table():
+def test_free_returns_the_whole_reservation():
     alloc = ContiguousAllocator(capacity_tokens=100)
-    seq = make_sequence(prompt_tokens=[1, 2, 3], sampling_params=SamplingParams(max_tokens=10))
-    alloc.get_capacity(seq, new_tokens=3)
+    seq = _seq()
+    alloc.allocate(seq, new_tokens=3)
 
-    alloc.free(seq.block_table)  # freed after generating only 2 tokens, far short of max_tokens
+    alloc.free(seq.block_table)
 
     assert alloc.used_tokens == 0
     assert seq.block_table.reserved_tokens == 0
     assert seq.block_table.num_tokens == 0
+
+
+def test_can_ever_fit_compares_the_reservation_with_capacity():
+    assert ContiguousAllocator(capacity_tokens=13).can_ever_fit(_seq())
+    assert not ContiguousAllocator(capacity_tokens=12).can_ever_fit(_seq())

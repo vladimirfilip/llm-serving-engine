@@ -12,7 +12,7 @@ def test_sampling_params_built_from_given_overrides_only():
     args = cli._parse_args(["--target-qps", "2", "--duration-s", "1", "--max-tokens", "8"])
     params = cli._sampling_params_from_args(args)
     assert params.max_tokens == 8
-    assert params.temperature == 1.0  # untouched default, not None
+    assert params.temperature == 1.0  # the SamplingParams default
 
 
 def test_main_writes_the_run_envelope_plotting_reads(tmp_path, monkeypatch):

@@ -1,67 +1,44 @@
-"""Scheduler correctness, run against every Scheduler implementation: decode-first
-priority that's never budget-stalled, chunked-prefill progress and completion,
-admission that backs off without skipping the queue when the KV pool is short, and
-result handling that frees blocks and drops only finished sequences from `running`.
-Admission-policy differences between implementations (continuous interleaving vs.
-static batch-then-drain) are covered by dedicated per-class tests below.
+"""Scheduler behaviour, run against every Scheduler implementation where the policies
+agree: decode-first planning that TOKEN_BUDGET never stalls, chunked prefill, head-of-line
+admission, recompute preemption from the tail of `running`, and result handling. Where the
+policies differ (continuous interleaving vs. static batch-then-drain), per-class tests
+cover each.
 """
 
 from collections import deque
 
 import pytest
 
-from llm_serving_engine.model.sampling import SamplingParams
-from llm_serving_engine.observability.metrics import RequestMetrics
 from llm_serving_engine.scheduling.allocator import BlockAllocator
 from llm_serving_engine.scheduling.scheduler import (
-    TOKEN_BUDGET,
     ContinuousBatchedScheduler,
     StaticBatchedScheduler,
 )
-from llm_serving_engine.scheduling.sequence import Sequence
+from tests.factories import decoding_sequence, make_sequence
 
 SCHEDULER_CLASSES = [ContinuousBatchedScheduler, StaticBatchedScheduler]
 
 
-def make_sequence(**overrides) -> Sequence:
-    defaults = dict(
-        seq_id=1,
-        prompt_tokens=[1, 2, 3, 4, 5],
-        sampling_params=SamplingParams(),
-        arrival_time=0.0,
-        metrics=RequestMetrics(enqueue_time=0.0),
-    )
-    defaults.update(overrides)
-    return Sequence(**defaults)
-
-
-def test_token_budget_default():
-    assert TOKEN_BUDGET == 4096
-
-
 @pytest.mark.parametrize("scheduler_cls", SCHEDULER_CLASSES)
-def test_decoding_sequences_each_get_one_token_and_are_never_budget_stalled(scheduler_cls):
-    scheduler = scheduler_cls(token_budget=2)  # smaller than the batch
+def test_every_decoding_sequence_gets_a_token_even_past_the_token_budget(scheduler_cls):
+    scheduler = scheduler_cls(token_budget=2)
     alloc = BlockAllocator(num_blocks=100, block_size=16)
-    running = [
-        make_sequence(seq_id=i, status="DECODING", generated_tokens=[9]) for i in range(5)
-    ]
+    running = [decoding_sequence(alloc, seq_id=i, prompt_len=5) for i in range(5)]
 
     plan = scheduler.scheduler_step(running=running, waiting=deque(), allocator=alloc)
 
-    assert len(plan) == 5  # a stalled decode is the exact failure mode this ordering avoids
     assert {e.seq_id for e in plan} == {0, 1, 2, 3, 4}
     assert all(e.n_tokens == 1 and not e.is_prefill_chunk for e in plan)
 
 
 @pytest.mark.parametrize("scheduler_cls", SCHEDULER_CLASSES)
-def test_prefill_continues_from_progress_and_flips_to_decoding_on_completion(scheduler_cls):
+def test_prefill_continues_from_its_progress_and_flips_to_decoding_when_done(scheduler_cls):
     scheduler = scheduler_cls()
     alloc = BlockAllocator(num_blocks=100, block_size=16)
     seq = make_sequence(status="PREFILLING", prefill_progress=3)  # 2 of 5 tokens remain
-    running = [seq]
+    alloc.allocate(seq, 3)
 
-    plan = scheduler.scheduler_step(running=running, waiting=deque(), allocator=alloc)
+    plan = scheduler.scheduler_step(running=[seq], waiting=deque(), allocator=alloc)
 
     [entry] = list(plan)
     assert entry.n_tokens == 2
@@ -70,13 +47,12 @@ def test_prefill_continues_from_progress_and_flips_to_decoding_on_completion(sch
 
 
 @pytest.mark.parametrize("scheduler_cls", SCHEDULER_CLASSES)
-def test_prefill_chunk_is_capped_by_budget_and_stays_prefilling(scheduler_cls):
+def test_prefill_chunk_is_capped_by_the_token_budget(scheduler_cls):
     scheduler = scheduler_cls(token_budget=2)
     alloc = BlockAllocator(num_blocks=100, block_size=16)
-    seq = make_sequence(status="PREFILLING", prefill_progress=0)  # 5 prompt tokens
-    running = [seq]
+    seq = make_sequence(status="PREFILLING")  # 5 prompt tokens
 
-    plan = scheduler.scheduler_step(running=running, waiting=deque(), allocator=alloc)
+    plan = scheduler.scheduler_step(running=[seq], waiting=deque(), allocator=alloc)
 
     [entry] = list(plan)
     assert entry.n_tokens == 2
@@ -85,118 +61,253 @@ def test_prefill_chunk_is_capped_by_budget_and_stays_prefilling(scheduler_cls):
 
 
 @pytest.mark.parametrize("scheduler_cls", SCHEDULER_CLASSES)
-def test_admission_moves_a_waiting_sequence_into_running(scheduler_cls):
+def test_prefill_chunk_without_free_blocks_waits_without_losing_progress(scheduler_cls):
     scheduler = scheduler_cls()
-    alloc = BlockAllocator(num_blocks=100, block_size=16)
-    seq = make_sequence()
-    waiting = deque([seq])
-    running = []
+    alloc = BlockAllocator(num_blocks=2, block_size=4)
+    seq = make_sequence(prompt_tokens=[0] * 7, status="PREFILLING", prefill_progress=4)
+    alloc.allocate(seq, 4)
+    alloc.allocate(make_sequence(seq_id=99), 4)  # holds the other block
 
-    plan = scheduler.scheduler_step(running=running, waiting=waiting, allocator=alloc)
+    plan = scheduler.scheduler_step(running=[seq], waiting=deque(), allocator=alloc)
 
-    assert seq in running
-    assert seq not in waiting
-    [entry] = list(plan)
-    assert entry.n_tokens == len(seq.prompt_tokens)
-    assert seq.status == "DECODING"
+    assert len(plan) == 0
+    assert seq.prefill_progress == 4
+    assert seq.block_table.num_tokens == 4
+
+
+def test_a_blocked_prefill_continuation_stops_admission_behind_it():
+    alloc = BlockAllocator(num_blocks=6, block_size=4)
+    long_prompt = make_sequence(seq_id=1, prompt_tokens=[0] * 20, status="PREFILLING")
+    alloc.allocate(long_prompt, 4)
+    long_prompt.prefill_progress = 4
+    alloc.allocate(make_sequence(seq_id=99), 12)  # 2 blocks left; the next chunk needs 4
+    newcomer = make_sequence(seq_id=2, prompt_tokens=[0] * 2)  # 1 block + 1 of headroom
+    running, waiting = [long_prompt], deque([newcomer])
+
+    plan = ContinuousBatchedScheduler().scheduler_step(running, waiting, alloc)
+
+    assert len(plan) == 0
+    assert running == [long_prompt]
+    assert list(waiting) == [newcomer]
 
 
 @pytest.mark.parametrize("scheduler_cls", SCHEDULER_CLASSES)
-def test_admission_backs_off_without_skipping_the_queue_when_pool_is_short(scheduler_cls):
+def test_admission_moves_the_head_of_waiting_into_running(scheduler_cls):
     scheduler = scheduler_cls()
-    alloc = BlockAllocator(num_blocks=0, block_size=16)  # nothing ever fits
-    seq_a = make_sequence(seq_id=1)
-    seq_b = make_sequence(seq_id=2)
-    waiting = deque([seq_a, seq_b])
-    running = []
+    alloc = BlockAllocator(num_blocks=100, block_size=16)
+    seq = make_sequence()
+    waiting, running = deque([seq]), []
+
+    plan = scheduler.scheduler_step(running=running, waiting=waiting, allocator=alloc)
+
+    assert running == [seq]
+    assert not waiting
+    [entry] = list(plan)
+    assert entry.n_tokens == len(seq.prompt_tokens)
+    assert seq.status == "DECODING"
+    assert seq.metrics.admit_time is not None
+
+
+@pytest.mark.parametrize("scheduler_cls", SCHEDULER_CLASSES)
+def test_admission_stops_at_a_head_that_does_not_fit_without_skipping_it(scheduler_cls):
+    scheduler = scheduler_cls()
+    alloc = BlockAllocator(num_blocks=3, block_size=4)
+    alloc.allocate(make_sequence(seq_id=99), 8)  # 1 block left
+    head = make_sequence(seq_id=1, prompt_tokens=[0] * 5)  # needs 2 blocks now
+    small = make_sequence(seq_id=2, prompt_tokens=[0] * 2)  # would fit in 1
+    waiting, running = deque([head, small]), []
 
     plan = scheduler.scheduler_step(running=running, waiting=waiting, allocator=alloc)
 
     assert len(plan) == 0
-    assert list(waiting) == [seq_a, seq_b]  # head of the line, not skipped or dropped
+    assert list(waiting) == [head, small]
     assert running == []
 
 
 @pytest.mark.parametrize("scheduler_cls", SCHEDULER_CLASSES)
-def test_handle_iteration_results_frees_blocks_and_drops_only_finished_sequences(
-    scheduler_cls, monkeypatch
-):
-    monkeypatch.setattr("llm_serving_engine.scheduling.scheduler.dispatch_results", lambda *a, **k: None)
+def test_a_sequence_the_whole_pool_cannot_hold_is_rejected(scheduler_cls):
+    scheduler = scheduler_cls()
+    alloc = BlockAllocator(num_blocks=2, block_size=4)
+    too_long = make_sequence(seq_id=1, prompt_tokens=[0] * 8)  # 9 slots, 3 blocks
+    fits = make_sequence(seq_id=2, prompt_tokens=[0] * 3)
+    waiting, running = deque([too_long, fits]), []
+
+    plan = scheduler.scheduler_step(running=running, waiting=waiting, allocator=alloc)
+
+    assert plan.rejected == [too_long]
+    assert running == [fits]
+    assert not waiting
+
+
+def test_admission_keeps_a_free_block_for_each_running_sequence():
+    alloc = BlockAllocator(num_blocks=3, block_size=4)
+    running = [decoding_sequence(alloc, seq_id=1, prompt_len=3)]  # 1 block
+    newcomer = make_sequence(seq_id=2, prompt_tokens=[0] * 8)  # 2 blocks
+    waiting = deque([newcomer])
+
+    ContinuousBatchedScheduler().scheduler_step(running=running, waiting=waiting, allocator=alloc)
+
+    # 2 free blocks cover the newcomer, but not also the running sequence's next block.
+    assert list(waiting) == [newcomer]
+
+
+@pytest.mark.parametrize("scheduler_cls", SCHEDULER_CLASSES)
+def test_decode_without_a_free_block_preempts_the_latest_arrival(scheduler_cls):
+    scheduler = scheduler_cls()
+    alloc = BlockAllocator(num_blocks=2, block_size=4)
+    oldest = decoding_sequence(alloc, seq_id=1, prompt_len=4)  # block full
+    latest = decoding_sequence(alloc, seq_id=2, prompt_len=4)  # block full, pool empty
+    running, waiting = [oldest, latest], deque()
+
+    plan = scheduler.scheduler_step(running=running, waiting=waiting, allocator=alloc)
+
+    assert [e.seq_id for e in plan] == [oldest.seq_id]
+    assert plan.preempted == [latest.seq_id]
+    assert running == [oldest]
+    assert list(waiting) == [latest]
+    assert latest.status == "WAITING"
+    assert latest.prefill_progress == 0
+    assert latest.block_table.physical_blocks == []
+    assert latest.block_table.num_tokens == 0
+
+
+@pytest.mark.parametrize("scheduler_cls", SCHEDULER_CLASSES)
+def test_preempted_sequences_return_to_the_head_of_waiting_in_arrival_order(scheduler_cls):
+    scheduler = scheduler_cls()
+    alloc = BlockAllocator(num_blocks=3, block_size=4)
+    a, b, c = (decoding_sequence(alloc, seq_id=i, prompt_len=4) for i in (1, 2, 3))
+    queued = make_sequence(seq_id=4)
+    running, waiting = [a, b, c], deque([queued])
+
+    plan = scheduler.scheduler_step(running=running, waiting=waiting, allocator=alloc)
+
+    # a takes c's block; b then finds none and, now the tail, preempts itself.
+    assert [e.seq_id for e in plan] == [a.seq_id]
+    assert running == [a]
+    assert list(waiting) == [b, c, queued]
+
+
+def test_a_preempted_sequence_re_prefills_its_prompt_and_generated_tokens():
+    alloc = BlockAllocator(num_blocks=10, block_size=4)
+    seq = make_sequence(prompt_tokens=[1, 2, 3, 4], generated_tokens=[9, 10])
+    running, waiting = [], deque([seq])
+
+    plan = ContinuousBatchedScheduler().scheduler_step(running, waiting, alloc)
+
+    [entry] = list(plan)
+    assert entry.is_prefill_chunk
+    assert entry.n_tokens == 6
+    assert seq.status == "DECODING"
+    assert seq.block_table.num_tokens == 6
+
+
+def test_a_sequence_that_outgrows_the_whole_pool_is_preempted_then_rejected():
+    scheduler = ContinuousBatchedScheduler()
+    alloc = BlockAllocator(num_blocks=1, block_size=4)
+    seq = decoding_sequence(alloc, seq_id=1, prompt_len=4)
+    running, waiting = [seq], deque()
+
+    plan = scheduler.scheduler_step(running, waiting, alloc)
+
+    assert plan.preempted == [seq.seq_id]
+    assert plan.rejected == [seq]
+    assert not running
+    assert not waiting
+
+
+@pytest.mark.parametrize("scheduler_cls", SCHEDULER_CLASSES)
+def test_handle_iteration_results_frees_and_returns_only_finished_sequences(scheduler_cls):
     scheduler = scheduler_cls()
     alloc = BlockAllocator(num_blocks=4, block_size=16)
-    seq_a = make_sequence(seq_id=1, status="DECODING")
-    seq_b = make_sequence(seq_id=2, status="DECODING")
-    alloc.get_capacity(seq_a, new_tokens=1)
-    alloc.get_capacity(seq_b, new_tokens=1)
+    seq_a = decoding_sequence(alloc, seq_id=1, prompt_len=2)
+    seq_b = decoding_sequence(alloc, seq_id=2, prompt_len=2)
     running = [seq_a, seq_b]
 
-    scheduler.handle_iteration_results(
+    finished = scheduler.handle_iteration_results(
         [(1, 99, True), (2, 100, False)], running=running, allocator=alloc, loop=None
     )
 
-    assert seq_a.generated_tokens == [99]
-    assert seq_b.generated_tokens == [100]
-    assert seq_a not in running
-    assert seq_b in running
+    assert finished == [seq_a]
+    assert running == [seq_b]
+    assert seq_a.generated_tokens == [9, 99]
+    assert seq_b.generated_tokens == [9, 100]
     assert seq_a.block_table.physical_blocks == []
     assert seq_b.block_table.physical_blocks != []
 
 
-def test_continuous_scheduler_admits_new_work_while_others_are_already_running():
+def test_handle_iteration_results_stamps_token_and_completion_times():
     scheduler = ContinuousBatchedScheduler()
+    alloc = BlockAllocator(num_blocks=4, block_size=16)
+    seq = make_sequence(status="DECODING")
+    running = [seq]
+
+    scheduler.handle_iteration_results([(1, 7, False)], running, alloc, loop=None)
+    scheduler.handle_iteration_results([(1, 8, True)], running, alloc, loop=None)
+
+    metrics = seq.metrics
+    assert metrics.first_token_time == metrics.token_times[0]
+    assert len(metrics.token_times) == 2
+    assert metrics.done_time == metrics.token_times[-1]
+
+
+def test_abort_frees_blocks_and_drops_sequences_from_running():
+    scheduler = ContinuousBatchedScheduler()
+    alloc = BlockAllocator(num_blocks=4, block_size=4)
+    keep = decoding_sequence(alloc, seq_id=1, prompt_len=4)
+    drop = decoding_sequence(alloc, seq_id=2, prompt_len=4)
+    running = [keep, drop]
+
+    scheduler.abort([drop], running, alloc, loop=None)
+
+    assert running == [keep]
+    assert len(alloc.free_blocks) == 3
+
+
+def test_continuous_scheduler_admits_while_others_are_running():
     alloc = BlockAllocator(num_blocks=100, block_size=16)
-    decoding = make_sequence(seq_id=1, status="DECODING", generated_tokens=[9])
-    waiting_seq = make_sequence(seq_id=2)
-    running = [decoding]
-    waiting = deque([waiting_seq])
+    decoding = decoding_sequence(alloc, seq_id=1, prompt_len=5)
+    newcomer = make_sequence(seq_id=2)
+    running, waiting = [decoding], deque([newcomer])
 
-    plan = scheduler.scheduler_step(running=running, waiting=waiting, allocator=alloc)
+    plan = ContinuousBatchedScheduler().scheduler_step(running, waiting, alloc)
 
-    assert waiting_seq in running  # admitted alongside the already-running decode
+    assert newcomer in running
     assert {e.seq_id for e in plan} == {1, 2}
 
 
 def test_continuous_scheduler_admission_stops_at_the_concurrency_cap():
-    scheduler = ContinuousBatchedScheduler(max_concurrent_sequences=1)
     alloc = BlockAllocator(num_blocks=100, block_size=16)
-    decoding = make_sequence(seq_id=1, status="DECODING", generated_tokens=[9])
-    waiting_seq = make_sequence(seq_id=2)
-    running = [decoding]
-    waiting = deque([waiting_seq])
+    decoding = decoding_sequence(alloc, seq_id=1, prompt_len=5)
+    newcomer = make_sequence(seq_id=2)
+    running, waiting = [decoding], deque([newcomer])
 
-    plan = scheduler.scheduler_step(running=running, waiting=waiting, allocator=alloc)
+    plan = ContinuousBatchedScheduler(max_concurrent_sequences=1).scheduler_step(
+        running, waiting, alloc
+    )
 
-    assert waiting_seq not in running  # cap already met by the running decode
-    assert list(waiting) == [waiting_seq]
+    assert list(waiting) == [newcomer]
     assert {e.seq_id for e in plan} == {1}
 
 
-def test_static_scheduler_blocks_admission_until_the_running_batch_fully_drains():
-    scheduler = StaticBatchedScheduler()
+def test_static_scheduler_admits_nothing_until_the_running_batch_drains():
     alloc = BlockAllocator(num_blocks=100, block_size=16)
-    decoding = make_sequence(seq_id=1, status="DECODING", generated_tokens=[9])
-    waiting_seq = make_sequence(seq_id=2)
-    running = [decoding]
-    waiting = deque([waiting_seq])
+    decoding = decoding_sequence(alloc, seq_id=1, prompt_len=5)
+    newcomer = make_sequence(seq_id=2)
+    running, waiting = [decoding], deque([newcomer])
 
-    plan = scheduler.scheduler_step(running=running, waiting=waiting, allocator=alloc)
+    plan = StaticBatchedScheduler().scheduler_step(running, waiting, alloc)
 
-    assert waiting_seq not in running  # batch is still in flight, no new admissions
-    assert list(waiting) == [waiting_seq]
+    assert list(waiting) == [newcomer]
     assert {e.seq_id for e in plan} == {1}
 
 
-def test_static_scheduler_admits_next_batch_once_running_is_empty():
-    scheduler = StaticBatchedScheduler(batch_size=2)
+def test_static_scheduler_admits_up_to_batch_size_once_running_is_empty():
     alloc = BlockAllocator(num_blocks=100, block_size=16)
-    seq_a = make_sequence(seq_id=1)
-    seq_b = make_sequence(seq_id=2)
-    seq_c = make_sequence(seq_id=3)
-    running = []
-    waiting = deque([seq_a, seq_b, seq_c])
+    seqs = [make_sequence(seq_id=i) for i in (1, 2, 3)]
+    running, waiting = [], deque(seqs)
 
-    plan = scheduler.scheduler_step(running=running, waiting=waiting, allocator=alloc)
+    plan = StaticBatchedScheduler(batch_size=2).scheduler_step(running, waiting, alloc)
 
-    assert running == [seq_a, seq_b]  # capped at batch_size, third stays queued
-    assert list(waiting) == [seq_c]
+    assert running == seqs[:2]
+    assert list(waiting) == seqs[2:]
     assert {e.seq_id for e in plan} == {1, 2}

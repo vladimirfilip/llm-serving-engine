@@ -27,9 +27,8 @@ class SamplingParams:
 
 
 def sample_token(logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
-    """Sampling math only, no `.item()`: returns a 0-dim tensor so a caller sampling
-    many entries in one iteration can batch every entry's host sync into one transfer
-    (`torch.stack(...).tolist()`) instead of one `cudaStreamSynchronize` per entry."""
+    """Returns a 0-dim device tensor, so a caller sampling a whole batch pays one host
+    sync (`torch.stack(...).tolist()`) for all of it."""
     import torch
 
     if params.temperature == 0:
@@ -54,6 +53,3 @@ def sample_token(logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
 
     return torch.multinomial(probs, 1).squeeze(0)
 
-
-def sample(logits: torch.Tensor, params: SamplingParams) -> int:
-    return int(sample_token(logits, params).item())

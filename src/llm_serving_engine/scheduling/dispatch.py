@@ -1,49 +1,63 @@
-"""GPU worker -> IO thread token delivery.
+"""Scheduler thread -> IO thread token delivery.
 
-`call_soon_threadsafe` schedules a callback and returns immediately, so the
-`except QueueFull` guard must live inside the callback that runs on the loop, not
-around the call that schedules it.
+`call_soon_threadsafe` only schedules a callback, so `QueueFull` is caught inside the
+callback that runs on the loop.
 """
 
 from __future__ import annotations
 
 import asyncio
+import itertools
 from typing import Final
 
 DONE: Final = object()
+ABORTED: Final = object()
 
-# seq_id -> per-request output queue.
+# seq_id -> per-request output queue. seq_ids come from one process-wide counter, so an
+# id is never reused, even by an engine that replaced another.
 output_channels: dict[int, asyncio.Queue] = {}
+_seq_ids = itertools.count()
 
 
-def new_output_channel(seq_id: int, maxsize: int) -> asyncio.Queue:
-    """Bounded per-request channel: a slow client drops tokens instead of stalling
-    delivery to every other sequence's channel."""
+def new_output_channel(maxsize: int) -> tuple[int, asyncio.Queue]:
+    """Bounded per-request channel: a slow client drops its own tokens, so delivery to
+    every other channel never waits on it."""
+    seq_id = next(_seq_ids)
     q: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
     output_channels[seq_id] = q
-    return q
+    return seq_id, q
 
 
-def _safe_put(q: asyncio.Queue, item: object) -> None:
+def _put_token(q: asyncio.Queue, token: int) -> None:
     try:
-        q.put_nowait(item)
+        q.put_nowait(token)
     except asyncio.QueueFull:
-        pass  # slow client; drop rather than block the GPU worker
+        pass
+
+
+def _put_terminal(q: asyncio.Queue, sentinel: object) -> None:
+    """The stream only ends once its sentinel lands, so a full queue gives up its oldest
+    token to make room."""
+    if q.full():
+        q.get_nowait()
+    q.put_nowait(sentinel)
 
 
 def dispatch_results(
-    iter_results: list[tuple[int, int, bool]],
-    loop: asyncio.AbstractEventLoop,
+    iter_results: list[tuple[int, int, bool]], loop: asyncio.AbstractEventLoop
 ) -> None:
-    """Called from the GPU worker thread after each forward() with (seq_id, token, finished).
-
-    Never call q.put_nowait directly from this thread: asyncio.Queue isn't thread-safe to
-    push into from a thread that isn't running its event loop.
-    """
+    """(seq_id, token, finished) from one iteration, delivered from a non-loop thread."""
     for seq_id, token, finished in iter_results:
         q = output_channels.get(seq_id)
         if q is None:
-            continue  # client already disconnected
-        loop.call_soon_threadsafe(_safe_put, q, token)
+            continue  # client disconnected
+        loop.call_soon_threadsafe(_put_token, q, token)
         if finished:
-            loop.call_soon_threadsafe(_safe_put, q, DONE)
+            loop.call_soon_threadsafe(_put_terminal, q, DONE)
+
+
+def dispatch_aborted(seq_ids: list[int], loop: asyncio.AbstractEventLoop) -> None:
+    for seq_id in seq_ids:
+        q = output_channels.get(seq_id)
+        if q is not None:
+            loop.call_soon_threadsafe(_put_terminal, q, ABORTED)

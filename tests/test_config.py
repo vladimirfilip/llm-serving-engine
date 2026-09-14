@@ -57,8 +57,8 @@ class _FakeGQAConfig:
 
 
 class _FakeMHAConfig:
-    # No GQA / explicit head_dim fields — must fall back to num_attention_heads and
-    # hidden_size // num_attention_heads rather than raising.
+    # No GQA or explicit head_dim fields: one K/V head per query head, and
+    # head_dim = hidden_size // num_attention_heads.
     num_hidden_layers = 12
     num_attention_heads = 12
     hidden_size = 768

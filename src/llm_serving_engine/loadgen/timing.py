@@ -1,10 +1,9 @@
 """Open-loop, coordinated-omission-aware load generator timing loop.
 
-`intended_send_time` must be recorded from a fixed arrival schedule before `send_fn`
-is ever awaited, not from when the request actually goes out. Timing from actual-send,
-or waiting for each request to finish before scheduling the next, absorbs sender-side
-delay into a smaller sample instead of reporting it: a stall must show up as a cluster
-of high latencies, never as fewer completed requests.
+`intended_send_time` comes from a fixed arrival schedule and is recorded before `send_fn`
+is awaited. A stall anywhere, sender side included, then shows up as a cluster of high
+latencies; timing from the actual send, or waiting for one request before scheduling the
+next, would hide it as fewer completed requests.
 
 Arrival schedule: `next_send` starts at `time.monotonic()` and advances by
 `random.expovariate(target_qps)` each iteration (Poisson arrivals). The loop sleeps

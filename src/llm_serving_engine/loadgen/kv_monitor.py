@@ -1,7 +1,6 @@
 """Background poller for the running server's `/metrics` endpoint, tracking peak/mean
 KV-cache utilization over one benchmark run. Scrapes the same Prometheus text any
-external monitor would, from the driver process — no direct access to engine
-internals needed here.
+external monitor would, from the driver process.
 """
 
 from __future__ import annotations

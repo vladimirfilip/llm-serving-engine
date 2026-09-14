@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from .scheduling.scheduler import BATCH_SIZE, MAX_CONCURRENT_SEQUENCES, TOKEN_BUDGET
+
 
 def _env_str(name: str, default: str) -> str:
     return os.environ.get(name, default)
@@ -25,18 +27,14 @@ def _env_bool(name: str, default: bool) -> bool:
 @dataclass
 class ModelConfig:
     model_name_or_path: str = "unsloth/Llama-3.2-3B-Instruct"
-    device: str = "cuda"  # ModelRunner falls back to "cpu" if unavailable
+    device: str = "cuda"  # "cpu" when CUDA is unavailable
     dtype: str = "float16"
     quantize: str = "none"  # "none" or "int8"
-    # Hand-written Triton kernels on the hot path, not HF's per-sequence forward. Defaults on:
-    # a CPU or non-Llama deployment should fail loudly at load time (wire_custom_kernels), not
-    # silently fall back to the path that can't hit the latency budget.
+    # Batched Triton attention on the hot path. On by default, so a CPU or non-Llama
+    # deployment fails at load time; the per-sequence HF forward is opt-in.
     use_custom_kernels: bool = True
-    # Capture the decode step as a CUDA graph (paged mode only) instead of dispatching
-    # ~30 kernel launches per layer through eager Python each iteration: ~925 launches
-    # collapse to ~9, cutting measured decode latency roughly 5x. A captured graph that
-    # fails its post-capture self-check is dropped and the run falls back to
-    # forward_fused automatically, so this defaults on.
+    # Replays pure-decode iterations as one captured CUDA graph (paged KV only). A graph
+    # that fails its post-capture self-check is dropped and decode runs eagerly.
     use_cuda_graphs: bool = True
 
     @classmethod
@@ -53,9 +51,8 @@ class ModelConfig:
 
 @dataclass
 class KVCacheConfig:
-    """Sizing inputs for the block pool. num_blocks is derived from these fields:
-    (memory_budget_bytes) / (block_size * 2 * n_kv_heads * head_dim * dtype_bytes).
-    """
+    """Sizing inputs for the block pool: num_blocks = memory budget / (block_size *
+    bytes_per_token)."""
 
     block_size: int = 16
     n_kv_heads: int = 8
@@ -78,7 +75,8 @@ class KVCacheConfig:
         )
 
     def bytes_per_token(self) -> int:
-        # 2 for K and V; n_kv_heads, not n_heads, since GQA shares K/V across head groups.
+        # 2 for K and V. Under GQA a group of query heads shares one K/V head, so K/V
+        # storage scales with n_kv_heads.
         return 2 * self.n_kv_heads * self.head_dim * self.dtype_bytes * self.n_layers
 
     def num_blocks(self, free_memory_bytes: int) -> int:
@@ -87,12 +85,10 @@ class KVCacheConfig:
 
     @classmethod
     def from_model(cls, hf_config: object, dtype_bytes: int | None = None) -> "KVCacheConfig":
-        """Reads n_kv_heads/head_dim/n_layers off the loaded model's own config, and
-        dtype_bytes off its actual loaded dtype (pass e.g. `model.dtype.itemsize`), instead
-        of requiring them kept in sync by hand — swapping model size/family or dtype must
-        not silently mis-size the KV pool against what allocate_kv_pool actually allocates.
-        num_key_value_heads falls back to num_attention_heads for non-GQA models; env vars
-        still override if set.
+        """Pool shape read off the loaded model's config, and dtype_bytes off its loaded
+        dtype (e.g. `model.dtype.itemsize`), so the sizing always matches the pool the
+        model runner allocates. A model without num_key_value_heads has one K/V head per
+        query head. Env vars override every field.
         """
         d = cls()
         n_kv_heads = getattr(hf_config, "num_key_value_heads", hf_config.num_attention_heads)
@@ -104,7 +100,9 @@ class KVCacheConfig:
             n_kv_heads=_env_int("LLM_N_KV_HEADS", n_kv_heads),
             head_dim=_env_int("LLM_HEAD_DIM", head_dim),
             n_layers=_env_int("LLM_N_LAYERS", hf_config.num_hidden_layers),
-            dtype_bytes=_env_int("LLM_DTYPE_BYTES", dtype_bytes if dtype_bytes is not None else d.dtype_bytes),
+            dtype_bytes=_env_int(
+                "LLM_DTYPE_BYTES", dtype_bytes if dtype_bytes is not None else d.dtype_bytes
+            ),
             gpu_memory_utilization=_env_float("LLM_GPU_MEM_UTIL", d.gpu_memory_utilization),
         )
 
@@ -129,10 +127,10 @@ class EngineConfig:
     model: ModelConfig
     kv_cache: KVCacheConfig
     server: ServerConfig
-    token_budget: int = 4096  # mirrors scheduler.TOKEN_BUDGET; kept here so it's one env knob
+    token_budget: int = TOKEN_BUDGET
     scheduler: str = "continuous"  # "continuous" (ContinuousBatchedScheduler) or "static"
-    static_batch_size: int = 8  # mirrors scheduler.BATCH_SIZE; only used when scheduler == "static"
-    max_concurrent_sequences: int = 64  # mirrors scheduler.MAX_CONCURRENT_SEQUENCES
+    static_batch_size: int = BATCH_SIZE  # only used when scheduler == "static"
+    max_concurrent_sequences: int = MAX_CONCURRENT_SEQUENCES
     kv_allocator: str = "paged"  # "paged" (BlockAllocator) or "contiguous" (ContiguousAllocator)
 
     @classmethod

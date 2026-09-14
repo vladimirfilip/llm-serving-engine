@@ -1,12 +1,10 @@
-"""HTTP/SSE server shell: FastAPI app factory plus the `llm-serve` entrypoint.
-
-No scheduling or sampling logic lives here — this only tokenizes, hands off to
-InferenceEngine.submit, and streams whatever comes back out of output_channels.
-"""
+"""HTTP/SSE server: the FastAPI app factory and the `llm-serve` entrypoint. Requests go
+through `submit`; tokens stream back out of `output_channels`."""
 
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
 import threading
@@ -15,64 +13,65 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import AsyncIterator
 
+import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from .config import EngineConfig, KVCacheConfig
-from .engine import InferenceEngine
+from .engine import EngineUnavailable, InferenceEngine, Submission
 from .model.model_runner import ModelRunner
 from .model.sampling import SamplingParams
 from .model.tokenizer import TokenizerWrapper
-from .observability.metrics_export import (
-    CONTENT_TYPE_LATEST,
-    KV_CACHE_UTILIZATION,
-    generate_latest,
-    sample_kv_utilization,
-)
-from .scheduling.dispatch import DONE
+from .observability.metrics_export import CONTENT_TYPE_LATEST, KV_CACHE_UTILIZATION, generate_latest
+from .scheduling.dispatch import ABORTED, DONE, output_channels
+
+logger = logging.getLogger(__name__)
+
+_KV_SAMPLE_INTERVAL_S = 0.2
+_DRAIN_POLL_S = 0.05
 
 
 class EngineHandle:
-    """Owns the currently-loaded InferenceEngine and can replace it wholesale.
+    """Owns the loaded InferenceEngine and replaces it wholesale on a model switch.
 
-    A single GPU has no room to hold two models' weights and KV pools at once, so
-    "switching models" means fully loading the replacement, swapping it in, then
-    stopping the old engine — never running both.
+    One GPU can't hold two models' weights and KV pools, so a switch drains and stops the
+    old engine, releases its memory, then loads the replacement. Requests arriving in
+    between get EngineUnavailable.
     """
 
     def __init__(self, config: EngineConfig):
         self._config = config
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._lock = threading.Lock()
-        self._engine = self._load(config.model.model_name_or_path)
+        self._switch_lock = threading.Lock()
+        self._engine: InferenceEngine | None = self._load(config.model.model_name_or_path)
 
     def _load(self, model_name_or_path: str) -> InferenceEngine:
         model_config = replace(self._config.model, model_name_or_path=model_name_or_path)
         tokenizer = TokenizerWrapper(model_name_or_path)
         model_runner = ModelRunner(model_config)
-        kv_cache = KVCacheConfig.from_model(model_runner.model.config, model_runner.model.dtype.itemsize)
-        self._config = replace(self._config, model=model_config, kv_cache=kv_cache)
-        engine = InferenceEngine(self._config, tokenizer, model_runner)
+        kv_cache = KVCacheConfig.from_model(
+            model_runner.model.config, model_runner.model.dtype.itemsize
+        )
+        config = replace(self._config, model=model_config, kv_cache=kv_cache)
+        engine = InferenceEngine(config, tokenizer, model_runner)
         if self._loop is not None:
             engine.bind_loop(self._loop)
         engine.start()
+        self._config = config
         return engine
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
-        self._engine.bind_loop(loop)
+        if self._engine is not None:
+            self._engine.bind_loop(loop)
 
-    @property
-    def tokenizer(self) -> TokenizerWrapper:
-        return self._engine.tokenizer
-
-    def submit(self, prompt: str, sampling_params: SamplingParams) -> tuple[int, asyncio.Queue]:
-        return self._engine.submit(prompt, sampling_params)
-
-    def cancel(self, seq_id: int) -> None:
-        self._engine.cancel(seq_id)
+    def submit(self, prompt: str, sampling_params: SamplingParams) -> Submission:
+        engine = self._engine
+        if engine is None:
+            raise EngineUnavailable("switching models")
+        return engine.submit(prompt, sampling_params)
 
     @property
     def config(self) -> EngineConfig:
@@ -83,45 +82,48 @@ class EngineHandle:
         return self._config.model.model_name_or_path
 
     @property
-    def allocator(self):
-        return self._engine.allocator
+    def healthy(self) -> bool:
+        return self._engine is not None and self._engine.healthy
 
     @property
-    def running(self):
-        return self._engine.running
+    def kv_utilization(self) -> float | None:
+        engine = self._engine
+        return engine.kv_utilization if engine is not None else None
 
     def switch_model(self, model_name_or_path: str) -> None:
-        """Blocking: drains the current engine, stops it, then loads the replacement.
-        Call off the event loop (the /v1/model route routes this through
-        asyncio.to_thread) — this is disk I/O plus a GPU weight load.
-
-        Draining before building the new engine matters beyond tidiness: seq_id
-        numbering starts at 0 per InferenceEngine instance (engine.py), and
-        output_channels (dispatch.py) is one global dict keyed only by seq_id. Flipping
-        self._engine while the old one still has in-flight sequences would let a new
-        engine's seq_id 0 collide with an old one still writing to the same
-        output_channels slot — cross-talk between two unrelated clients' streams. There
-        is no such collision once the old engine is confirmed idle before it is retired.
-        """
-        if model_name_or_path == self.current_model_name:
-            return
-        with self._lock:
-            if model_name_or_path == self.current_model_name:
+        """Blocking disk and GPU work: call off the event loop. If the new model fails to
+        load, its memory is released, the previous model reloads, and the error is
+        re-raised. If that reload fails too, the handle serves nothing until a later
+        switch succeeds."""
+        with self._switch_lock:
+            if model_name_or_path == self.current_model_name and self._engine is not None:
                 return
-            old_engine = self._engine
-            while old_engine.running or old_engine.waiting:
-                time.sleep(0.05)
-            old_engine.stop()
-            on_cuda = old_engine.model_runner.device.startswith("cuda")
+            previous = self.current_model_name
+            old_engine, self._engine = self._engine, None
+            if old_engine is not None:
+                old_engine.close_ingress()
+                while not old_engine.is_idle:
+                    time.sleep(_DRAIN_POLL_S)
+                old_engine.stop()
             del old_engine
-            if on_cuda:
-                import gc
+            _release_gpu_memory()
 
-                import torch
+            try:
+                self._engine = self._load(model_name_or_path)
+                return
+            except Exception as e:
+                logger.exception("loading %s failed; reloading %s", model_name_or_path, previous)
+                # The traceback's frames hold the failed model's tensors.
+                error = e.with_traceback(None)
+            _release_gpu_memory()
+            self._engine = self._load(previous)
+            raise error
 
-                gc.collect()
-                torch.cuda.empty_cache()
-            self._engine = self._load(model_name_or_path)
+
+def _release_gpu_memory() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 class GenerateRequest(BaseModel):
@@ -152,18 +154,15 @@ def _format_sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
 
-_KV_SAMPLE_INTERVAL_S = 0.2
-
-
-async def _sample_kv_utilization_loop(engine) -> None:
+async def _sample_kv_utilization_loop(engine: InferenceEngine | EngineHandle) -> None:
     while True:
-        utilization = sample_kv_utilization(engine)
+        utilization = engine.kv_utilization
         if utilization is not None:
             KV_CACHE_UTILIZATION.set(utilization)
         await asyncio.sleep(_KV_SAMPLE_INTERVAL_S)
 
 
-def create_app(engine: InferenceEngine) -> FastAPI:
+def create_app(engine: InferenceEngine | EngineHandle) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         engine.bind_loop(asyncio.get_running_loop())
@@ -174,19 +173,22 @@ def create_app(engine: InferenceEngine) -> FastAPI:
             sampler.cancel()
 
     app = FastAPI(lifespan=lifespan)
-    # Allows the standalone console in web/index.html (opened from file:// or a
-    # separate static server) to call this API cross-origin.
-    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+    # Lets a browser console served from another origin (or file://) call this API.
+    app.add_middleware(
+        CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    )
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
+    async def health() -> JSONResponse:
+        if engine.healthy:
+            return JSONResponse({"status": "ok"})
+        return JSONResponse({"status": "unavailable"}, status_code=503)
 
     @app.get("/metrics")
     async def metrics() -> Response:
         return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-    if hasattr(engine, "switch_model"):
+    if isinstance(engine, EngineHandle):
 
         @app.get("/v1/model")
         async def get_model() -> dict[str, str]:
@@ -202,26 +204,36 @@ def create_app(engine: InferenceEngine) -> FastAPI:
 
     @app.post("/v1/generate")
     async def generate(body: GenerateRequest) -> StreamingResponse:
-        seq_id, output_queue = engine.submit(body.prompt, _sampling_params(body))
-
-        prompt_tokens = len(engine.tokenizer.encode_prompt(body.prompt))
+        try:
+            submission = engine.submit(body.prompt, _sampling_params(body))
+        except EngineUnavailable as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
 
         async def stream() -> AsyncIterator[str]:
+            seq_id, tokenizer = submission.seq_id, submission.tokenizer
             generated: list[int] = []
             try:
                 while True:
-                    item = await output_queue.get()
+                    item = await submission.output_queue.get()
                     if item is DONE:
                         yield _format_sse(
-                            {"done": True, "prompt_tokens": prompt_tokens, "output_tokens": len(generated)}
+                            {
+                                "done": True,
+                                "prompt_tokens": submission.prompt_len,
+                                "output_tokens": len(generated),
+                            }
                         )
                         break
+                    if item is ABORTED:
+                        yield _format_sse({"error": "request aborted by the engine"})
+                        break
                     generated.append(item)
-                    text = engine.tokenizer.decode_incremental(seq_id, generated)
-                    yield _format_sse({"token": text})
+                    # One event per token, even while its text is held back, so clients
+                    # timing token events measure every token.
+                    yield _format_sse({"token": tokenizer.decode_incremental(seq_id, generated)})
             finally:
-                engine.cancel(seq_id)
-                engine.tokenizer.forget(seq_id)
+                output_channels.pop(seq_id, None)
+                tokenizer.forget(seq_id)
 
         return StreamingResponse(stream(), media_type="text/event-stream")
 

@@ -1,10 +1,8 @@
-"""Non-timing load-gen plumbing: the `send_fn` that open_loop_load_gen calls.
+"""The `send_fn` that open_loop_load_gen calls: transport and per-request bookkeeping.
 
-Everything here is transport and bookkeeping, not timing. `send_request` reports
-request-level facts it can observe locally (first_token_latency measured client-side,
-token count, success/error) but never an overall request latency — that number is
-computed by the timing module from its own `intended_send_time`, and duplicating it
-here would let two clocks disagree.
+`send_request` reports what it observes locally (client-side first_token_latency, token
+count, success/error). Overall request latency is measured only by the timing loop, from
+`intended_send_time`, so exactly one clock defines it.
 """
 
 from __future__ import annotations
@@ -57,8 +55,8 @@ async def send_request(
 ) -> dict:
     """POST /v1/generate, consume the SSE stream to completion, report request facts.
 
-    Returns a dict merged by the caller's timing wrapper into its own result — must not
-    carry a "latency" key, that's the timing module's number to compute. `transport` lets
+    Returns a dict the timing loop merges into its own result, so it never carries a
+    "latency" key. `transport` lets
     tests substitute an httpx.MockTransport for a real connection.
     """
     body: dict = {"prompt": prompt}

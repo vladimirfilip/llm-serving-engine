@@ -26,7 +26,7 @@ async def test_send_request_counts_tokens_and_measures_first_token_latency():
     assert result["num_tokens_received"] == 2
     assert result["first_token_latency"] is not None
     assert result["first_token_latency"] >= 0
-    assert "latency" not in result  # the timing module's number, not ours to compute
+    assert "latency" not in result  # only the timing loop measures latency
     assert result["prompt_tokens"] == 5
     assert result["output_tokens"] == 2
     assert len(result["token_times"]) == 2

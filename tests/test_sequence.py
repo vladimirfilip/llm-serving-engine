@@ -1,27 +1,14 @@
-from llm_serving_engine.model.sampling import SamplingParams
-from llm_serving_engine.observability.metrics import RequestMetrics
-from llm_serving_engine.scheduling.sequence import BlockTable, Sequence
+from llm_serving_engine.scheduling.sequence import Sequence
+from tests.factories import make_sequence
 
 
-def make_sequence(**overrides) -> Sequence:
-    defaults = dict(
-        seq_id=1,
-        prompt_tokens=[1, 2, 3],
-        sampling_params=SamplingParams(),
-        arrival_time=0.0,
-        metrics=RequestMetrics(enqueue_time=0.0),
-    )
-    defaults.update(overrides)
-    return Sequence(**defaults)
-
-
-def test_defaults():
+def test_a_new_sequence_waits_with_no_state():
     seq = make_sequence()
     assert seq.status == "WAITING"
     assert seq.generated_tokens == []
     assert seq.block_table.physical_blocks == []
+    assert seq.block_table.num_tokens == 0
     assert seq.prefill_progress == 0
-    assert not seq.is_finished
 
 
 def test_num_tokens_counts_prompt_and_generated():
@@ -30,23 +17,21 @@ def test_num_tokens_counts_prompt_and_generated():
     assert seq.num_tokens == 5
 
 
-def test_is_finished_reflects_status():
-    seq = make_sequence(status="FINISHED")
-    assert seq.is_finished
+def test_prefill_token_ids_continue_from_the_prompt_into_generated_tokens():
+    seq = make_sequence(prompt_tokens=[1, 2, 3], generated_tokens=[4, 5])
+    assert seq.prefill_token_ids(0, 2) == [1, 2]
+    assert seq.prefill_token_ids(2, 5) == [3, 4, 5]
 
 
-def test_no_output_channel_field():
-    # Sequence must not carry a live asyncio.Queue.
+def test_sequence_carries_no_output_channel():
     assert "output_channel" not in Sequence.__slots__
 
 
-def test_block_table_is_independent_per_instance():
+def test_block_tables_are_independent_per_sequence():
     a, b = make_sequence(), make_sequence(seq_id=2)
     a.block_table.physical_blocks.append(0)
     assert b.block_table.physical_blocks == []
 
 
-def test_block_table_defaults():
-    t = BlockTable()
-    assert t.physical_blocks == []
-    assert t.num_tokens == 0
+def test_sequences_compare_by_identity():
+    assert make_sequence() != make_sequence()

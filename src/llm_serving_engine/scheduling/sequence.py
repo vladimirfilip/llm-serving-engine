@@ -1,8 +1,4 @@
-"""Request-lifetime state.
-
-These are plain data containers. The behavior that mutates them (admission, chunked
-prefill, block allocation) belongs to the scheduler and allocator, not here.
-"""
+"""Request-lifetime state. Plain data: the scheduler and allocator own every mutation."""
 
 from __future__ import annotations
 
@@ -12,22 +8,21 @@ from typing import Literal
 from ..model.sampling import SamplingParams
 from ..observability.metrics import RequestMetrics
 
-SequenceStatus = Literal["WAITING", "PREFILLING", "DECODING", "FINISHED"]
+SequenceStatus = Literal["WAITING", "PREFILLING", "DECODING"]
 
 
 @dataclass(slots=True)
 class BlockTable:
     physical_blocks: list[int] = field(default_factory=list)
-    num_tokens: int = 0
-    reserved_tokens: int = 0  # ContiguousAllocator's up-front reservation; unused by BlockAllocator
+    num_tokens: int = 0  # tokens with a KV slot, including any this iteration writes
+    reserved_tokens: int = 0  # ContiguousAllocator's whole-lifetime reservation
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class Sequence:
     seq_id: int
     prompt_tokens: list[int]
     sampling_params: SamplingParams
-    arrival_time: float
     metrics: RequestMetrics
     generated_tokens: list[int] = field(default_factory=list)
     block_table: BlockTable = field(default_factory=BlockTable)
@@ -35,9 +30,12 @@ class Sequence:
     prefill_progress: int = 0
 
     @property
-    def is_finished(self) -> bool:
-        return self.status == "FINISHED"
-
-    @property
     def num_tokens(self) -> int:
+        """Prompt plus generated; also the prefill length of a WAITING sequence, since a
+        preempted sequence recomputes the KV of every token it already generated."""
         return len(self.prompt_tokens) + len(self.generated_tokens)
+
+    def prefill_token_ids(self, start: int, end: int) -> list[int]:
+        if end <= len(self.prompt_tokens):
+            return self.prompt_tokens[start:end]
+        return (self.prompt_tokens + self.generated_tokens)[start:end]

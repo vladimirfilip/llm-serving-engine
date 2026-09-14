@@ -173,6 +173,8 @@ async function send() {
         if (payload.done) {
           const totalMs = performance.now() - start;
           setStatus(`done — first token ${firstTokenMs?.toFixed(0)}ms, total ${totalMs.toFixed(0)}ms`);
+        } else if (payload.error !== undefined) {
+          setStatus(`error: ${payload.error}`, true);
         } else if (payload.token !== undefined) {
           if (firstTokenMs === null) firstTokenMs = performance.now() - start;
           output.textContent += payload.token;

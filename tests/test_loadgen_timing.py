@@ -39,7 +39,7 @@ async def test_a_stalled_request_does_not_delay_later_arrivals(monkeypatch):
 
     assert len(results) == 5  # the stall didn't shrink the completed count
     gaps = [b - a for a, b in pairwise(call_times)]
-    assert all(gap < 0.1 for gap in gaps)  # later sends fired on schedule, not after the stall
+    assert all(gap < 0.1 for gap in gaps)  # later sends kept their schedule through the stall
 
 
 @pytest.mark.asyncio

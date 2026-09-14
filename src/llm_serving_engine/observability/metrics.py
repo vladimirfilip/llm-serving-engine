@@ -1,7 +1,7 @@
 """Per-request latency decomposition and cross-request aggregation.
 
-RequestMetrics instruments every stage boundary of a request's lifetime so a bad
-tail latency can be attributed to a stage, not guessed at.
+RequestMetrics stamps every stage boundary of a request's lifetime, so a bad tail latency
+is attributable to a stage.
 """
 
 from __future__ import annotations
