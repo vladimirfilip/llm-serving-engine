@@ -32,6 +32,12 @@ class ModelConfig:
     # a CPU or non-Llama deployment should fail loudly at load time (wire_custom_kernels), not
     # silently fall back to the path that can't hit the latency budget.
     use_custom_kernels: bool = True
+    # Capture the decode step as a CUDA graph (paged mode only) instead of dispatching
+    # ~30 kernel launches per layer through eager Python each iteration: ~925 launches
+    # collapse to ~9, cutting measured decode latency roughly 5x. A captured graph that
+    # fails its post-capture self-check is dropped and the run falls back to
+    # forward_fused automatically, so this defaults on.
+    use_cuda_graphs: bool = True
 
     @classmethod
     def from_env(cls) -> "ModelConfig":
@@ -41,6 +47,7 @@ class ModelConfig:
             dtype=_env_str("LLM_DTYPE", cls.dtype),
             quantize=_env_str("LLM_QUANTIZE", cls.quantize),
             use_custom_kernels=_env_bool("LLM_USE_CUSTOM_KERNELS", cls.use_custom_kernels),
+            use_cuda_graphs=_env_bool("LLM_USE_CUDA_GRAPHS", cls.use_cuda_graphs),
         )
 
 

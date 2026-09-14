@@ -27,12 +27,16 @@ class FakeModelRunner:
 
     def __init__(self):
         self.kv_pool_calls = []
+        self.graph_capture_calls = 0
 
     def forward(self, plan, seqs):
         return []
 
     def allocate_kv_pool(self, num_blocks, block_size):
         self.kv_pool_calls.append((num_blocks, block_size))
+
+    def capture_decode_graphs(self):
+        self.graph_capture_calls += 1
 
 
 @pytest.fixture(autouse=True)
@@ -179,6 +183,31 @@ def test_non_custom_kernels_skips_the_kv_pool_even_when_paged():
     runner = FakeModelRunner()
     InferenceEngine(config=cfg, tokenizer=FakeTokenizer(), model_runner=runner)
     assert runner.kv_pool_calls == []
+
+
+def test_use_cuda_graphs_default_on_captures_decode_graphs_after_the_kv_pool():
+    cfg = EngineConfig(model=ModelConfig(), kv_cache=KVCacheConfig(), server=ServerConfig())
+    runner = FakeModelRunner()
+    InferenceEngine(config=cfg, tokenizer=FakeTokenizer(), model_runner=runner)
+    assert runner.kv_pool_calls  # capture must come after the pool exists
+    assert runner.graph_capture_calls == 1
+
+
+def test_use_cuda_graphs_explicitly_off_skips_capture():
+    cfg = EngineConfig(model=ModelConfig(use_cuda_graphs=False), kv_cache=KVCacheConfig(), server=ServerConfig())
+    runner = FakeModelRunner()
+    InferenceEngine(config=cfg, tokenizer=FakeTokenizer(), model_runner=runner)
+    assert runner.graph_capture_calls == 0
+
+
+def test_use_cuda_graphs_skipped_for_contiguous_allocator():
+    cfg = EngineConfig(
+        model=ModelConfig(use_cuda_graphs=True), kv_cache=KVCacheConfig(), server=ServerConfig(),
+        kv_allocator="contiguous",
+    )
+    runner = FakeModelRunner()
+    InferenceEngine(config=cfg, tokenizer=FakeTokenizer(), model_runner=runner)
+    assert runner.graph_capture_calls == 0
 
 
 def test_explicit_scheduler_and_allocator_override_the_config_knobs():

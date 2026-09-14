@@ -8,37 +8,27 @@ Two forward paths, chosen by config.use_custom_kernels:
   (allocate_kv_pool) lets one Triton launch per layer cover the whole batch; a
   contiguous allocator falls back to one disjoint per-sequence buffer and one
   launch per entry.
+
+A third path, forward_graphed, replaces forward_fused's ~30-launch-per-layer eager
+dispatch with a single CUDA graph replay, for pure-decode iterations only. That
+machinery (capture, self-check, replay) lives in decode_graph.DecodeGraphRunner;
+this module only fills real per-iteration data into it and dispatches to it.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .batch_plan import BatchEntry, BatchPlan
 from .config import ModelConfig
-from .sampling import SamplingParams
+from .decode_graph import DECODE_GRAPH_BUCKETS, DecodeGraphRunner
+from .paged_batch import PagedBatch
+from .sampling import SamplingParams, sample, sample_token
 from .sequence import Sequence
 
 if TYPE_CHECKING:
     import torch
     from transformers import PreTrainedModel
-
-
-@dataclass(slots=True)
-class PagedBatch:
-    """Per-iteration paging metadata, computed once and shared across every layer's
-    attention_forward call -- depends only on the plan and each Sequence's BlockTable,
-    not on any layer's K/V. One row per plan entry, in plan order."""
-
-    block_table: torch.Tensor  # (num_entries, max_blocks), physical block ids
-    context_len: torch.Tensor  # (num_entries,), total cached length after this call's write
-    query_offset: torch.Tensor  # (num_entries,), cached length before this call's new tokens
-    q_start: torch.Tensor  # (num_entries,), entry's start offset in the flattened q/out
-    q_len: torch.Tensor  # (num_entries,), entry's token count this call
-    max_q_len: int  # q_len's max
-    dest_block_id: torch.Tensor  # (total_tokens,), physical block per new K/V row
-    dest_within: torch.Tensor  # (total_tokens,), within-block offset per new K/V row
 
 
 class ModelRunner:
@@ -55,6 +45,8 @@ class ModelRunner:
         self._k_pool: list[torch.Tensor] | None = None  # layer_idx -> (num_blocks, block_size, n_kv_heads, D)
         self._v_pool: list[torch.Tensor] | None = None
         self._block_size: int | None = None
+        self._scratch_block_id: int | None = None  # padding rows' pool write target; see allocate_kv_pool
+        self._decode_graphs = DecodeGraphRunner(self)
 
         self.device = config.device if torch.cuda.is_available() else "cpu"
         dtype = getattr(torch, config.dtype)  # an unknown dtype name must fail loudly
@@ -67,10 +59,17 @@ class ModelRunner:
             self.wire_custom_kernels()
 
     def allocate_kv_pool(self, num_blocks: int, block_size: int) -> None:
-        """One (num_blocks, block_size, n_kv_heads, head_dim) K/V buffer per layer, shared
-        across every sequence and addressed by the same physical block ids BlockAllocator
-        hands out. Called once, after num_blocks is sized off free GPU memory, before the
-        first forward()."""
+        """One (num_blocks + 1, block_size, n_kv_heads, head_dim) K/V buffer per layer,
+        shared across every sequence and addressed by the same physical block ids
+        BlockAllocator hands out. Called once, after num_blocks is sized off free GPU
+        memory, before the first forward().
+
+        The pool has one row more than BlockAllocator ever hands out: block id
+        num_blocks itself, reserved as a scratch write target for a graphed decode
+        batch's padding rows. Those rows' K/V write is unconditional -- it happens in
+        Python before the attention kernel launches, with no mask -- so without a
+        dedicated target it would scatter into whatever block a live sequence owns.
+        """
         import torch
 
         cfg = self.model.config
@@ -80,7 +79,8 @@ class ModelRunner:
         dtype = next(self.model.parameters()).dtype
 
         self._block_size = block_size
-        shape = (num_blocks, block_size, n_kv_heads, head_dim)
+        self._scratch_block_id = num_blocks
+        shape = (num_blocks + 1, block_size, n_kv_heads, head_dim)
         self._k_pool = [torch.empty(shape, device=self.device, dtype=dtype) for _ in self._layers]
         self._v_pool = [torch.empty(shape, device=self.device, dtype=dtype) for _ in self._layers]
 
@@ -132,6 +132,10 @@ class ModelRunner:
         import torch
 
         if self.config.use_custom_kernels:
+            if self._decode_graphs and all(not entry.is_prefill_chunk for entry in plan):
+                bucket = self._decode_graphs.bucket_for(len(plan))
+                if bucket is not None:
+                    return self.forward_graphed(plan, seqs, bucket)
             return self.forward_fused(plan, seqs)
 
         results = []
@@ -363,10 +367,7 @@ class ModelRunner:
             ]
             results = []
             if eligible:
-                # One lm_head call over every entry owing a token: the vocab projection is
-                # an ~800MB weight matrix, so a per-entry call re-reads it from HBM each
-                # time. Sampling runs per entry (params differ per sequence) but stays
-                # on-GPU until one combined transfer, not one host/device sync per entry.
+                # One lm_head call over every entry owing a token
                 positions = torch.tensor([p for _, p in eligible], device=hidden.device)
                 logits = self.model.get_output_embeddings()(hidden[0, positions])
                 tokens = torch.stack([
@@ -381,6 +382,14 @@ class ModelRunner:
                     results.append((seq.seq_id, token_id, finished))
         return results
 
+    def capture_decode_graphs(self, bucket_sizes: list[int] = DECODE_GRAPH_BUCKETS) -> None:
+        self._decode_graphs.capture(bucket_sizes)
+
+    def forward_graphed(
+        self, plan: BatchPlan, seqs: dict[int, Sequence], bucket: int
+    ) -> list[tuple[int, int, bool]]:
+        return self._decode_graphs.replay(plan, seqs, bucket)
+
     def free(self, seq_id: int) -> None:
         """Drops a finished/cancelled sequence's KV cache; call alongside allocator.free
         from result handling. The paged pool needs nothing here -- its blocks are
@@ -390,35 +399,10 @@ class ModelRunner:
             layer_cache.pop(seq_id, None)
 
     def _sample(self, logits: torch.Tensor, params: SamplingParams) -> int:
-        return int(self._sample_token(logits, params).item())
+        return sample(logits, params)
 
     def _sample_token(self, logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
-        """Sampling math only, no `.item()`: returns a 0-dim tensor so a caller sampling
-        many entries in one iteration can batch every entry's host sync into one transfer
-        (`torch.stack(...).tolist()`) instead of one `cudaStreamSynchronize` per entry."""
-        import torch
-
-        if params.temperature == 0:
-            return torch.argmax(logits)
-
-        logits = logits / params.temperature
-        if params.top_k > 0:
-            top_k = min(params.top_k, logits.size(-1))
-            kth_value = torch.topk(logits, top_k).values[..., -1]
-            logits = torch.where(logits < kth_value, torch.full_like(logits, float("-inf")), logits)
-
-        probs = torch.softmax(logits, dim=-1)
-        if params.top_p < 1.0:
-            sorted_probs, sorted_idx = torch.sort(probs, descending=True)
-            cumulative = torch.cumsum(sorted_probs, dim=-1)
-            drop = cumulative > params.top_p
-            drop[..., 1:] = drop[..., :-1].clone()
-            drop[..., 0] = False
-            sorted_probs[drop] = 0.0
-            probs = torch.zeros_like(probs).scatter(-1, sorted_idx, sorted_probs)
-            probs = probs / probs.sum()
-
-        return torch.multinomial(probs, 1).squeeze(0)
+        return sample_token(logits, params)
 
     @property
     def eos_token_ids(self) -> frozenset[int]:

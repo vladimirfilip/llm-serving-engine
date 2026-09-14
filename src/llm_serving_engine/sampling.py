@@ -1,8 +1,12 @@
-"""Per-request sampling configuration."""
+"""Per-request sampling configuration and the sampling math itself."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass(slots=True)
@@ -20,3 +24,36 @@ class SamplingParams:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}")
         if self.max_tokens <= 0:
             raise ValueError(f"max_tokens must be > 0, got {self.max_tokens}")
+
+
+def sample_token(logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
+    """Sampling math only, no `.item()`: returns a 0-dim tensor so a caller sampling
+    many entries in one iteration can batch every entry's host sync into one transfer
+    (`torch.stack(...).tolist()`) instead of one `cudaStreamSynchronize` per entry."""
+    import torch
+
+    if params.temperature == 0:
+        return torch.argmax(logits)
+
+    logits = logits / params.temperature
+    if params.top_k > 0:
+        top_k = min(params.top_k, logits.size(-1))
+        kth_value = torch.topk(logits, top_k).values[..., -1]
+        logits = torch.where(logits < kth_value, torch.full_like(logits, float("-inf")), logits)
+
+    probs = torch.softmax(logits, dim=-1)
+    if params.top_p < 1.0:
+        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        drop = cumulative > params.top_p
+        drop[..., 1:] = drop[..., :-1].clone()
+        drop[..., 0] = False
+        sorted_probs[drop] = 0.0
+        probs = torch.zeros_like(probs).scatter(-1, sorted_idx, sorted_probs)
+        probs = probs / probs.sum()
+
+    return torch.multinomial(probs, 1).squeeze(0)
+
+
+def sample(logits: torch.Tensor, params: SamplingParams) -> int:
+    return int(sample_token(logits, params).item())

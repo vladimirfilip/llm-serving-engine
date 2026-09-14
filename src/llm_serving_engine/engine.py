@@ -64,6 +64,8 @@ class InferenceEngine:
         self.allocator = allocator if allocator is not None else _build_allocator(config, num_blocks)
         if config.kv_allocator == "paged" and config.model.use_custom_kernels:
             model_runner.allocate_kv_pool(num_blocks, config.kv_cache.block_size)
+            if config.model.use_cuda_graphs:
+                model_runner.capture_decode_graphs()
         self.ingress: queue.SimpleQueue[IngressRequest] = queue.SimpleQueue()
         self.waiting: deque[Sequence] = deque()
         self.running: list[Sequence] = []

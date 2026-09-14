@@ -254,7 +254,11 @@ def _build_tiny_llama_runner():
     runner._k_pool = None
     runner._v_pool = None
     runner._block_size = None
+    runner._scratch_block_id = None
     runner.model = LlamaForCausalLM(hf_config).to("cuda").eval()
+    from llm_serving_engine.decode_graph import DecodeGraphRunner
+
+    runner._decode_graphs = DecodeGraphRunner(runner)
     return runner
 
 
@@ -277,6 +281,33 @@ def paged_llama_runner():
     runner = _build_tiny_llama_runner()
     runner.allocate_kv_pool(num_blocks=64, block_size=4)
     return runner
+
+
+@pytest.fixture(scope="module")
+def graphed_llama_runner():
+    """A third, separate instance: capture_decode_graphs captures against this specific
+    model's weights and pool, so it can't be shared with paged_llama_runner (whose tests
+    exercise the non-graphed paged path and shouldn't silently start taking the graphed
+    one) or across test runs within this module (each capture is tied to this process's
+    CUDA context)."""
+    if not torch.cuda.is_available():
+        pytest.skip("attention_forward calls a CUDA-only Triton kernel")
+    pytest.importorskip("triton")
+    runner = _build_tiny_llama_runner()
+    runner.allocate_kv_pool(num_blocks=64, block_size=4)
+    runner.capture_decode_graphs(bucket_sizes=[1, 2, 4, 8])
+    assert runner._decode_graphs, "capture/self-check failed in test setup"
+    return runner
+
+
+def _admit_seq(allocator, seq_id, prompt_len):
+    """Builds and fully admits (via a real BlockAllocator) a fresh decoding sequence, used
+    by the graphed-decode tests below where each sequence's real block ids matter (unlike
+    attention_forward's own tests, which mostly use hand-built BatchPlans against a
+    shared fixture)."""
+    seq = _make_sequence(seq_id, list(range(3, 3 + prompt_len)), temperature=0.0, max_tokens=32)
+    assert allocator.get_capacity(seq, prompt_len)
+    return seq
 
 
 def _normed_layer0(runner, plan, seqs):
@@ -575,9 +606,229 @@ def test_forward_fused_paged_mixed_decode_and_prefill_in_one_plan(paged_llama_ru
 def test_allocate_kv_pool_shape(paged_llama_runner):
     cfg = paged_llama_runner.model.config
     assert len(paged_llama_runner._k_pool) == cfg.num_hidden_layers
-    expected = (64, 4, cfg.num_key_value_heads, cfg.hidden_size // cfg.num_attention_heads)
+    # +1: allocate_kv_pool reserves one extra row (block id == num_blocks) that
+    # BlockAllocator never hands out, as a scratch target for graphed decode padding.
+    expected = (65, 4, cfg.num_key_value_heads, cfg.hidden_size // cfg.num_attention_heads)
     assert tuple(paged_llama_runner._k_pool[0].shape) == expected
     assert tuple(paged_llama_runner._v_pool[0].shape) == expected
+    assert paged_llama_runner._scratch_block_id == 64
+
+
+def _prefill_to_decoding(runner, allocator, seq):
+    """Runs one full (unchunked) prefill through forward_fused and leaves `seq` ready for
+    a decode step: generated_tokens has its first token, and the block table already has
+    capacity reserved for the next one -- exactly the state scheduler_step would leave a
+    freshly-admitted sequence in by the time it first appears in a decode-only plan."""
+    from llm_serving_engine.batch_plan import BatchPlan
+
+    prefill_plan = BatchPlan()
+    prefill_plan.entries.append(_admit(seq, len(seq.prompt_tokens)))
+    (result,) = runner.forward_fused(prefill_plan, {seq.seq_id: seq})
+    seq.generated_tokens.append(result[1])
+    assert allocator.get_capacity(seq, 1)
+
+
+def test_forward_graphed_matches_eager_no_padding(graphed_llama_runner):
+    """Decode batch size exactly equal to a bucket (no padding rows at all)."""
+    import copy
+
+    from llm_serving_engine.allocator import BlockAllocator
+    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+
+    allocator = BlockAllocator(num_blocks=64, block_size=4)
+    seqs = {}
+    for i, plen in enumerate([3, 5, 2, 4]):  # bucket=4, no padding
+        seq = _admit_seq(allocator, 400 + i, plen)
+        _prefill_to_decoding(graphed_llama_runner, allocator, seq)
+        seqs[seq.seq_id] = seq
+
+    decode_plan = BatchPlan()
+    for seq_id in seqs:
+        decode_plan.entries.append(BatchEntry(seq_id, 1, is_prefill_chunk=False))
+
+    eager_seqs = copy.deepcopy(seqs)
+    eager = graphed_llama_runner.forward_fused(decode_plan, eager_seqs)
+    graphed = graphed_llama_runner.forward(decode_plan, seqs)
+    assert sorted(graphed) == sorted(eager)
+
+    for seq in seqs.values():
+        allocator.free(seq.block_table)
+
+
+def test_forward_graphed_matches_eager_with_padding(graphed_llama_runner):
+    """3 real decode entries rounded up to bucket=4 -- exercises one padding row."""
+    import copy
+
+    from llm_serving_engine.allocator import BlockAllocator
+    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+
+    allocator = BlockAllocator(num_blocks=64, block_size=4)
+    seqs = {}
+    for i, plen in enumerate([6, 2, 9]):
+        seq = _admit_seq(allocator, 410 + i, plen)
+        _prefill_to_decoding(graphed_llama_runner, allocator, seq)
+        seqs[seq.seq_id] = seq
+
+    decode_plan = BatchPlan()
+    for seq_id in seqs:
+        decode_plan.entries.append(BatchEntry(seq_id, 1, is_prefill_chunk=False))
+
+    eager_seqs = copy.deepcopy(seqs)
+    eager = graphed_llama_runner.forward_fused(decode_plan, eager_seqs)
+    graphed = graphed_llama_runner.forward(decode_plan, seqs)
+    assert sorted(graphed) == sorted(eager)
+
+    for seq in seqs.values():
+        allocator.free(seq.block_table)
+
+
+def test_forward_graphed_padding_does_not_touch_other_pool_blocks(graphed_llama_runner):
+    """A heavily-padded graphed decode (1 real row in a bucket=8 graph, 7 padding rows)
+    must never write outside the reserved scratch block -- directly checks the bug the
+    padding scheme exists to prevent: an unconditional pool write landing on a block a
+    live, unrelated sequence owns.
+    """
+    from llm_serving_engine.allocator import BlockAllocator
+    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+
+    allocator = BlockAllocator(num_blocks=64, block_size=4)
+    seq = _admit_seq(allocator, 420, 3)
+    _prefill_to_decoding(graphed_llama_runner, allocator, seq)
+    seqs = {seq.seq_id: seq}
+
+    sentinel_block = 50  # not the scratch block (64), not owned by `seq`
+    sentinel = 12345.0
+    for layer_idx in range(len(graphed_llama_runner._k_pool)):
+        graphed_llama_runner._k_pool[layer_idx][sentinel_block].fill_(sentinel)
+        graphed_llama_runner._v_pool[layer_idx][sentinel_block].fill_(sentinel)
+
+    decode_plan = BatchPlan()
+    decode_plan.entries.append(BatchEntry(seq.seq_id, 1, is_prefill_chunk=False))
+    graphed_llama_runner.forward(decode_plan, seqs)  # 1 real row, bucket=8 -> 7 padding rows
+
+    for layer_idx in range(len(graphed_llama_runner._k_pool)):
+        assert torch.all(graphed_llama_runner._k_pool[layer_idx][sentinel_block] == sentinel)
+        assert torch.all(graphed_llama_runner._v_pool[layer_idx][sentinel_block] == sentinel)
+
+    allocator.free(seq.block_table)
+
+
+def test_forward_graphed_row_reassignment_matches_eager(graphed_llama_runner):
+    """Two consecutive graphed iterations where the occupied rows change (one sequence
+    finishes-equivalent scope ends, a different one is admitted) -- catches both a stale
+    q_len reactivating a now-padding row and a stale dest_block_id leaking a write into a
+    block that row no longer owns.
+    """
+    import copy
+
+    from llm_serving_engine.allocator import BlockAllocator
+    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+
+    allocator = BlockAllocator(num_blocks=64, block_size=4)
+    seqs = {}
+    for i, plen in enumerate([4, 7]):
+        seq = _admit_seq(allocator, 430 + i, plen)
+        _prefill_to_decoding(graphed_llama_runner, allocator, seq)
+        seqs[seq.seq_id] = seq
+
+    decode_plan = BatchPlan()
+    for seq_id in seqs:
+        decode_plan.entries.append(BatchEntry(seq_id, 1, is_prefill_chunk=False))
+    results = graphed_llama_runner.forward(decode_plan, seqs)
+    for seq_id, token, _finished in results:
+        seqs[seq_id].generated_tokens.append(token)
+        assert allocator.get_capacity(seqs[seq_id], 1)
+
+    # Iteration 2: admit a third sequence, decode all three together -- different rows,
+    # different real batch size, same bucket (still rounds up to 4).
+    new_seq = _admit_seq(allocator, 432, 5)
+    _prefill_to_decoding(graphed_llama_runner, allocator, new_seq)
+    seqs[new_seq.seq_id] = new_seq
+
+    decode_plan2 = BatchPlan()
+    for seq_id in seqs:
+        decode_plan2.entries.append(BatchEntry(seq_id, 1, is_prefill_chunk=False))
+
+    eager_seqs = copy.deepcopy(seqs)
+    eager2 = graphed_llama_runner.forward_fused(decode_plan2, eager_seqs)
+    graphed2 = graphed_llama_runner.forward(decode_plan2, seqs)
+    assert sorted(graphed2) == sorted(eager2)
+
+    for seq in seqs.values():
+        allocator.free(seq.block_table)
+
+
+def test_forward_graphed_replay_reflects_new_inputs(graphed_llama_runner):
+    """Two different real plans at the same bucket must produce different logits --
+    catches a forgotten .copy_() before replay, which would otherwise silently keep
+    returning whatever was captured the first time."""
+    from llm_serving_engine.allocator import BlockAllocator
+    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+
+    allocator = BlockAllocator(num_blocks=64, block_size=4)
+    seq_a = _admit_seq(allocator, 440, 3)
+    _prefill_to_decoding(graphed_llama_runner, allocator, seq_a)
+    seq_b = _admit_seq(allocator, 441, 11)
+    _prefill_to_decoding(graphed_llama_runner, allocator, seq_b)
+
+    plan_a = BatchPlan()
+    plan_a.entries.append(BatchEntry(seq_a.seq_id, 1, is_prefill_chunk=False))
+    graphed_llama_runner.forward(plan_a, {seq_a.seq_id: seq_a})
+    bucket = min(b for b in graphed_llama_runner._decode_graphs if b >= 1)
+    logits_a = graphed_llama_runner._decode_graphs[bucket].buffers.logits.clone()
+
+    plan_b = BatchPlan()
+    plan_b.entries.append(BatchEntry(seq_b.seq_id, 1, is_prefill_chunk=False))
+    graphed_llama_runner.forward(plan_b, {seq_b.seq_id: seq_b})
+    logits_b = graphed_llama_runner._decode_graphs[bucket].buffers.logits.clone()
+
+    assert not torch.allclose(logits_a, logits_b), "replay returned stale, capture-time output"
+
+    allocator.free(seq_a.block_table)
+    allocator.free(seq_b.block_table)
+
+
+def test_forward_dispatch_skips_graphs_for_mixed_prefill_and_decode(graphed_llama_runner, monkeypatch):
+    from llm_serving_engine.allocator import BlockAllocator
+    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+
+    allocator = BlockAllocator(num_blocks=64, block_size=4)
+    decoding_seq = _admit_seq(allocator, 450, 3)
+    _prefill_to_decoding(graphed_llama_runner, allocator, decoding_seq)
+    prefill_seq = _admit_seq(allocator, 451, 5)
+    seqs = {decoding_seq.seq_id: decoding_seq, prefill_seq.seq_id: prefill_seq}
+
+    plan = BatchPlan()
+    plan.entries.append(BatchEntry(decoding_seq.seq_id, 1, is_prefill_chunk=False))
+    plan.entries.append(_admit(prefill_seq, 5))
+
+    called = {"graphed": False}
+    monkeypatch.setattr(
+        graphed_llama_runner, "forward_graphed",
+        lambda *a, **k: called.__setitem__("graphed", True),
+    )
+    graphed_llama_runner.forward(plan, seqs)
+    assert not called["graphed"], "a plan with a prefill entry must never take the graphed path"
+
+    allocator.free(decoding_seq.block_table)
+
+
+def test_forward_dispatch_skips_graphs_above_the_largest_bucket(graphed_llama_runner, monkeypatch):
+    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+
+    largest = max(graphed_llama_runner._decode_graphs)
+    plan = BatchPlan()
+    for i in range(largest + 1):
+        plan.entries.append(BatchEntry(i, 1, is_prefill_chunk=False))
+
+    called = {"graphed": False}
+    monkeypatch.setattr(
+        graphed_llama_runner, "forward_graphed",
+        lambda *a, **k: called.__setitem__("graphed", True),
+    )
+    monkeypatch.setattr(graphed_llama_runner, "forward_fused", lambda *a, **k: [])
+    graphed_llama_runner.forward(plan, {})
+    assert not called["graphed"], "a plan larger than every captured bucket must fall back to forward_fused"
 
 
 def test_sample_temperature_zero_is_argmax(loaded_runner):
