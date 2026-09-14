@@ -6,17 +6,6 @@ A single-GPU LLM serving engine built like a trading system: lock-free queues, c
 batching, paged KV cache, custom CUDA/Triton kernels on the hot path, and honest tail-latency
 measurement.
 
-Authoritative documents, in precedence order:
-
-1. [LLM_Serving_Engine_Spec.md](LLM_Serving_Engine_Spec.md) — the design. Architecture, scheduler
-   algorithm, allocator, benchmarks, failure modes. Follow it; it is not a sketch.
-2. [LLM_Systems_Technical_Reference.md](LLM_Systems_Technical_Reference.md) — the theory the spec
-   applies (continuous batching §7, quantization §8, nsys/roofline §9, coordinated omission §11).
-3. [Jump_ML_RE_10Day_Sprint (1).md](Jump_ML_RE_10Day_Sprint%20(1).md) — day-by-day roadmap and
-   triage order if a day slips.
-
-When code and spec disagree, say so rather than silently picking one.
-
 ## Division of labor
 
 **You write:** HTTP/SSE server shell, tokenizer glue, model weight loading, config, the load
@@ -39,8 +28,8 @@ take it, or write a clearly-marked placeholder they will replace.
 - No defensive scaffolding nobody asked for: no speculative abstraction layers, no config knobs with
   one caller, no try/except that swallows a bug, no compatibility shims for versions we don't use.
 - Type hints on signatures. Dataclasses for state. `dataclass(slots=True)` on anything per-request.
-- Match the spec's names exactly (`Sequence`, `BlockTable`, `BlockAllocator`, `BatchPlan`,
-  `RequestMetrics`, `TOKEN_BUDGET`, `output_channels`) so code and spec read as one document.
+- Match these names exactly across the codebase (`Sequence`, `BlockTable`, `BlockAllocator`,
+  `BatchPlan`, `RequestMetrics`, `TOKEN_BUDGET`, `output_channels`) so code reads as one document.
 - Delete code rather than commenting it out. Git remembers.
 
 ## Comments
@@ -49,21 +38,21 @@ Comments supplement readable code; they are not a memory dump.
 
 - Write them for what the code cannot say: why this invariant holds, why this ordering, units and
   layouts of tensors — grounded entirely in the code they sit next to.
-- Never cite an external document as the reason for a shape: no "spec section N", no filenames like
-  `LLM_Serving_Engine_Spec.md`, no `CLAUDE.md`, no "per the spec/design doc". If a constraint from
-  one of those documents matters, restate the constraint itself in the comment — the code and the
-  comment must stand on their own without the reader opening another file.
-- No process or ownership narration either: no "user territory", "division of labor", "Day N
-  deliverable", "TODO(user)", "placeholder for the scheduler owner" — say what the code does or
-  raises (e.g. `NotImplementedError("int8 weight-only quantization")`), not who is meant to write it
-  or why the org chart put it there.
+- Never cite an external document as the reason for a shape: no document section numbers, no
+  filenames, no `CLAUDE.md`, no "per the design doc". If a constraint from elsewhere matters,
+  restate the constraint itself in the comment — the code and the comment must stand on their own
+  without the reader opening another file.
+- No process or ownership narration either: no "user territory", "division of labor", "TODO(user)",
+  "placeholder for the scheduler owner" — say what the code does or raises (e.g.
+  `NotImplementedError("int8 weight-only quantization")`), not who is meant to write it or why the
+  org chart put it there.
 - Do not narrate the code, log your debugging history, tag previous bugs, or leave "changed X to Y"
   notes. No `# TODO(claude)`, no section-banner ASCII art.
 - One line usually suffices. If a comment needs a paragraph, the code is wrong.
 
 ## Invariants that are easy to break silently
 
-These come from the spec's failure-mode list; check any code you touch against them.
+Check any code you touch against these.
 
 - Tokens cross into the event loop only via `loop.call_soon_threadsafe`; never a direct
   `put_nowait` from the GPU worker thread.
