@@ -62,6 +62,8 @@ class InferenceEngine:
         self.scheduler = scheduler if scheduler is not None else _build_scheduler(config)
         num_blocks = config.kv_cache.num_blocks(_free_memory_bytes(model_runner))
         self.allocator = allocator if allocator is not None else _build_allocator(config, num_blocks)
+        if config.kv_allocator == "paged" and config.model.use_custom_kernels:
+            model_runner.allocate_kv_pool(num_blocks, config.kv_cache.block_size)
         self.ingress: queue.SimpleQueue[IngressRequest] = queue.SimpleQueue()
         self.waiting: deque[Sequence] = deque()
         self.running: list[Sequence] = []

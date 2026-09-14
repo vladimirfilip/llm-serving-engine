@@ -297,12 +297,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8321)
     parser.add_argument("--out-dir", type=Path, default=Path("results"))
     parser.add_argument(
-        "--duration-s", type=float, default=300.0,
-        help="run length per config, seconds; long enough at the lowest configured QPS "
-        "for a few hundred completed requests, since p99 on a handful of samples is just max()",
+        "--quick", action="store_true",
+        help="shrink --duration-s and --qps for fast local iteration, at the cost of a "
+        "small per-run sample; p99 on a handful of requests is just max(), so don't use "
+        "this for numbers that go in a report",
     )
     parser.add_argument(
-        "--qps", type=float, nargs="+", default=[1, 2, 4], help="pareto: QPS points to sweep"
+        "--duration-s", type=float, default=None,
+        help="run length per config, seconds; long enough at the lowest configured QPS "
+        "for a few hundred completed requests, since p99 on a handful of samples is just "
+        "max() (default: 300, or 60 with --quick)",
+    )
+    parser.add_argument(
+        "--qps", type=float, nargs="+", default=None,
+        help="pareto: QPS points to sweep (default: [1, 2, 4], or [1, 4] with --quick)",
     )
     parser.add_argument(
         "--ablation-qps", type=float, default=2.0,
@@ -320,7 +328,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--slo-ttft-ms", type=float, default=None, help="goodput: TTFT SLO, ms")
     parser.add_argument("--slo-tpot-ms", type=float, default=None, help="goodput: TPOT SLO, ms")
     parser.add_argument("--slo-e2e-ms", type=float, default=None, help="goodput: end-to-end SLO, ms")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.duration_s is None:
+        args.duration_s = 60.0 if args.quick else 300.0
+    if args.qps is None:
+        args.qps = [1, 4] if args.quick else [1, 2, 4]
+    return args
 
 
 def main(argv: list[str] | None = None) -> None:

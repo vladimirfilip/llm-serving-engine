@@ -16,7 +16,9 @@ def loaded_runner():
     from llm_serving_engine.model_runner import ModelRunner
 
     try:
-        runner = ModelRunner(ModelConfig(model_name_or_path=MODEL, device="cpu"))
+        runner = ModelRunner(
+            ModelConfig(model_name_or_path=MODEL, device="cpu", use_custom_kernels=False)
+        )
     except Exception as e:
         pytest.skip(f"can't fetch {MODEL} from the HF Hub: {e}")
     return runner
@@ -226,17 +228,10 @@ def test_flatten_plan_offsets_and_positions(loaded_runner):
     assert offsets == [(0, 3), (3, 4)]
 
 
-@pytest.fixture(scope="module")
-def tiny_llama_runner():
-    """attention_forward calls the CUDA-only FA-2 Triton kernel in kernels/flash_attention.py,
-    so this exercises the real wiring end to end rather than standing in a fake. A random tiny
-    LlamaConfig (GQA: 4 heads / 2 kv heads) needs no network or pretrained weights — it's the
-    smallest thing shaped like the Llama-family decoder attention_forward assumes.
-    """
-    if not torch.cuda.is_available():
-        pytest.skip("attention_forward calls a CUDA-only Triton kernel")
-    pytest.importorskip("triton")
-
+def _build_tiny_llama_runner():
+    """A random tiny LlamaConfig (GQA: 4 heads / 2 kv heads) needs no network or pretrained
+    weights — it's the smallest thing shaped like the Llama-family decoder attention_forward
+    assumes, letting these tests exercise the real CUDA-only Triton kernels end to end."""
     from transformers import LlamaConfig, LlamaForCausalLM
 
     from llm_serving_engine.config import ModelConfig
@@ -256,7 +251,31 @@ def tiny_llama_runner():
     runner.device = "cuda"
     runner._past_key_values = {}
     runner._kv_cache = {}
+    runner._k_pool = None
+    runner._v_pool = None
+    runner._block_size = None
     runner.model = LlamaForCausalLM(hf_config).to("cuda").eval()
+    return runner
+
+
+@pytest.fixture(scope="module")
+def tiny_llama_runner():
+    if not torch.cuda.is_available():
+        pytest.skip("attention_forward calls a CUDA-only Triton kernel")
+    pytest.importorskip("triton")
+    return _build_tiny_llama_runner()
+
+
+@pytest.fixture(scope="module")
+def paged_llama_runner():
+    """A separate instance from tiny_llama_runner: allocate_kv_pool mutates the runner
+    (attention_forward's paged path is picked up automatically once a pool exists), and
+    the non-paged tests above rely on sharing one fixture with no pool ever allocated."""
+    if not torch.cuda.is_available():
+        pytest.skip("attention_forward calls a CUDA-only Triton kernel")
+    pytest.importorskip("triton")
+    runner = _build_tiny_llama_runner()
+    runner.allocate_kv_pool(num_blocks=64, block_size=4)
     return runner
 
 
@@ -396,8 +415,8 @@ def test_attention_forward_disjoint_caches_stay_independent(tiny_llama_runner):
         )
 
     cache = tiny_llama_runner._kv_cache[0]
-    assert cache[seq_a.seq_id][0].shape[2] == 2
-    assert cache[seq_b.seq_id][0].shape[2] == 4
+    assert cache[seq_a.seq_id][2] == 2  # filled length, not the preallocated capacity
+    assert cache[seq_b.seq_id][2] == 4
 
 
 def test_wire_custom_kernels_accepts_a_cuda_llama_model(tiny_llama_runner):
@@ -435,6 +454,130 @@ def test_forward_fused_prefill_then_decode_matches_hf_reference(tiny_llama_runne
     with torch.no_grad():
         ref_logits = tiny_llama_runner.model(torch.tensor([[*prompt, token_id]], device="cuda")).logits
     assert token_id2 == int(torch.argmax(ref_logits[0, -1]).item())
+
+
+def test_forward_fused_paged_prefill_then_decode_matches_hf_reference(paged_llama_runner):
+    """Same contract as test_forward_fused_prefill_then_decode_matches_hf_reference, but
+    routed through allocate_kv_pool's shared block-addressed pool (one Triton launch per
+    layer covering the whole plan) instead of one disjoint buffer and launch per entry."""
+    from llm_serving_engine.allocator import BlockAllocator
+    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+
+    allocator = BlockAllocator(num_blocks=64, block_size=4)
+    prompt = [3, 1, 4, 1, 5]
+    seq = _make_sequence(50, prompt, temperature=0.0, max_tokens=8)
+    seqs = {seq.seq_id: seq}
+
+    assert allocator.get_capacity(seq, len(prompt))
+    prefill_plan = BatchPlan()
+    prefill_plan.entries.append(_admit(seq, len(prompt)))
+
+    (result,) = paged_llama_runner.forward_fused(prefill_plan, seqs)
+    seq_id, token_id, finished = result
+    assert seq_id == seq.seq_id
+    assert not finished
+
+    with torch.no_grad():
+        ref_logits = paged_llama_runner.model(torch.tensor([prompt], device="cuda")).logits
+    assert token_id == int(torch.argmax(ref_logits[0, -1]).item())
+
+    seq.generated_tokens.append(token_id)
+    assert allocator.get_capacity(seq, 1)
+    decode_plan = BatchPlan()
+    decode_plan.entries.append(BatchEntry(seq.seq_id, 1, is_prefill_chunk=False))
+    (result,) = paged_llama_runner.forward_fused(decode_plan, seqs)
+    _seq_id, token_id2, _finished = result
+
+    with torch.no_grad():
+        ref_logits = paged_llama_runner.model(torch.tensor([[*prompt, token_id]], device="cuda")).logits
+    assert token_id2 == int(torch.argmax(ref_logits[0, -1]).item())
+
+    allocator.free(seq.block_table)
+
+
+def test_forward_fused_paged_disjoint_sequences_match_hf_reference(paged_llama_runner):
+    """Two different-length sequences sharing one pool, admitted through a real
+    BlockAllocator so their physical blocks differ, must not see each other's tokens --
+    checked against each one's own non-incremental HF reference, not just by comparing
+    block ids, so a gather-addressing bug would show up as a wrong token, not just a
+    suspicious-looking block table.
+    """
+    from llm_serving_engine.allocator import BlockAllocator
+    from llm_serving_engine.batch_plan import BatchPlan
+
+    allocator = BlockAllocator(num_blocks=64, block_size=4)
+    prompt_a, prompt_b = [1, 1, 3], [2, 2, 2, 2, 2]
+    seq_a = _make_sequence(51, prompt_a, temperature=0.0, max_tokens=8)
+    seq_b = _make_sequence(52, prompt_b, temperature=0.0, max_tokens=8)
+    seqs = {seq_a.seq_id: seq_a, seq_b.seq_id: seq_b}
+
+    assert allocator.get_capacity(seq_a, len(prompt_a))
+    assert allocator.get_capacity(seq_b, len(prompt_b))
+    assert set(seq_a.block_table.physical_blocks).isdisjoint(seq_b.block_table.physical_blocks)
+
+    plan = BatchPlan()
+    plan.entries.append(_admit(seq_a, len(prompt_a)))
+    plan.entries.append(_admit(seq_b, len(prompt_b)))
+
+    result_a, result_b = paged_llama_runner.forward_fused(plan, seqs)
+
+    with torch.no_grad():
+        ref_a = paged_llama_runner.model(torch.tensor([prompt_a], device="cuda")).logits
+        ref_b = paged_llama_runner.model(torch.tensor([prompt_b], device="cuda")).logits
+    assert result_a[1] == int(torch.argmax(ref_a[0, -1]).item())
+    assert result_b[1] == int(torch.argmax(ref_b[0, -1]).item())
+
+    allocator.free(seq_a.block_table)
+    allocator.free(seq_b.block_table)
+
+
+def test_forward_fused_paged_mixed_decode_and_prefill_in_one_plan(paged_llama_runner):
+    """A decode entry (q_len=1, deep into its cache) and a fresh prefill entry (q_len>1,
+    empty cache) in the same BatchPlan and the same grid launch -- the shape every real
+    continuous-batching iteration takes once more than one sequence is in flight.
+    """
+    from llm_serving_engine.allocator import BlockAllocator
+    from llm_serving_engine.batch_plan import BatchEntry, BatchPlan
+
+    allocator = BlockAllocator(num_blocks=64, block_size=4)
+    prompt_a = [4, 4, 4]
+    seq_a = _make_sequence(53, prompt_a, temperature=0.0, max_tokens=8)
+    seqs = {seq_a.seq_id: seq_a}
+    assert allocator.get_capacity(seq_a, len(prompt_a))
+    prefill_plan = BatchPlan()
+    prefill_plan.entries.append(_admit(seq_a, len(prompt_a)))
+    (result,) = paged_llama_runner.forward_fused(prefill_plan, seqs)
+    seq_a.generated_tokens.append(result[1])
+    assert allocator.get_capacity(seq_a, 1)
+
+    prompt_b = [6, 6, 6, 6]
+    seq_b = _make_sequence(54, prompt_b, temperature=0.0, max_tokens=8)
+    seqs[seq_b.seq_id] = seq_b
+    assert allocator.get_capacity(seq_b, len(prompt_b))
+
+    plan = BatchPlan()
+    plan.entries.append(BatchEntry(seq_a.seq_id, 1, is_prefill_chunk=False))
+    plan.entries.append(_admit(seq_b, len(prompt_b)))
+
+    result_a, result_b = paged_llama_runner.forward_fused(plan, seqs)
+
+    with torch.no_grad():
+        full_a = [*prompt_a, seq_a.generated_tokens[0]]
+        ref_a = paged_llama_runner.model(torch.tensor([full_a], device="cuda")).logits
+        ref_b = paged_llama_runner.model(torch.tensor([prompt_b], device="cuda")).logits
+    assert result_a[1] == int(torch.argmax(ref_a[0, -1]).item())
+    assert result_b[1] == int(torch.argmax(ref_b[0, -1]).item())
+
+    allocator.free(seq_a.block_table)
+    allocator.free(seq_b.block_table)
+
+
+def test_allocate_kv_pool_shape(paged_llama_runner):
+    cfg = paged_llama_runner.model.config
+    assert len(paged_llama_runner._k_pool) == cfg.num_hidden_layers
+    expected = (64, 4, cfg.num_key_value_heads, cfg.hidden_size // cfg.num_attention_heads)
+    assert tuple(paged_llama_runner._k_pool[0].shape) == expected
+    assert tuple(paged_llama_runner._v_pool[0].shape) == expected
 
 
 def test_sample_temperature_zero_is_argmax(loaded_runner):

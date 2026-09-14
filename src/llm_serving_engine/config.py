@@ -28,7 +28,10 @@ class ModelConfig:
     device: str = "cuda"  # ModelRunner falls back to "cpu" if unavailable
     dtype: str = "float16"
     quantize: str = "none"  # "none" or "int8"
-    use_custom_kernels: bool = False  # use the hand-written Triton kernels instead of HF's
+    # Hand-written Triton kernels on the hot path, not HF's per-sequence forward. Defaults on:
+    # a CPU or non-Llama deployment should fail loudly at load time (wire_custom_kernels), not
+    # silently fall back to the path that can't hit the latency budget.
+    use_custom_kernels: bool = True
 
     @classmethod
     def from_env(cls) -> "ModelConfig":
@@ -76,11 +79,13 @@ class KVCacheConfig:
         return budget // (self.bytes_per_token() * self.block_size)
 
     @classmethod
-    def from_model(cls, hf_config: object) -> "KVCacheConfig":
-        """Reads n_kv_heads/head_dim/n_layers off the loaded model's own config instead of
-        requiring them kept in sync by hand — swapping model size/family (e.g. Llama-3.2-1B
-        vs. Llama-3-8B) must not silently mis-size the KV pool. num_key_value_heads falls
-        back to num_attention_heads for non-GQA models; env vars still override if set.
+    def from_model(cls, hf_config: object, dtype_bytes: int | None = None) -> "KVCacheConfig":
+        """Reads n_kv_heads/head_dim/n_layers off the loaded model's own config, and
+        dtype_bytes off its actual loaded dtype (pass e.g. `model.dtype.itemsize`), instead
+        of requiring them kept in sync by hand — swapping model size/family or dtype must
+        not silently mis-size the KV pool against what allocate_kv_pool actually allocates.
+        num_key_value_heads falls back to num_attention_heads for non-GQA models; env vars
+        still override if set.
         """
         d = cls()
         n_kv_heads = getattr(hf_config, "num_key_value_heads", hf_config.num_attention_heads)
@@ -92,7 +97,7 @@ class KVCacheConfig:
             n_kv_heads=_env_int("LLM_N_KV_HEADS", n_kv_heads),
             head_dim=_env_int("LLM_HEAD_DIM", head_dim),
             n_layers=_env_int("LLM_N_LAYERS", hf_config.num_hidden_layers),
-            dtype_bytes=_env_int("LLM_DTYPE_BYTES", d.dtype_bytes),
+            dtype_bytes=_env_int("LLM_DTYPE_BYTES", dtype_bytes if dtype_bytes is not None else d.dtype_bytes),
             gpu_memory_utilization=_env_float("LLM_GPU_MEM_UTIL", d.gpu_memory_utilization),
         )
 

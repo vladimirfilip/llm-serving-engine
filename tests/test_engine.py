@@ -25,8 +25,14 @@ class FakeModelRunner:
 
     device = "cpu"
 
+    def __init__(self):
+        self.kv_pool_calls = []
+
     def forward(self, plan, seqs):
         return []
+
+    def allocate_kv_pool(self, num_blocks, block_size):
+        self.kv_pool_calls.append((num_blocks, block_size))
 
 
 @pytest.fixture(autouse=True)
@@ -147,6 +153,32 @@ def test_allocator_config_knob_selects_contiguous_allocator_at_matched_capacity(
     assert isinstance(paged_engine.allocator, BlockAllocator)
     num_blocks = len(paged_engine.allocator.free_blocks)  # nothing allocated yet
     assert engine.allocator.capacity_tokens == num_blocks * 16
+
+
+def test_paged_allocator_and_custom_kernels_allocates_the_kv_pool():
+    cfg = EngineConfig(model=ModelConfig(), kv_cache=KVCacheConfig(block_size=16), server=ServerConfig())
+    runner = FakeModelRunner()
+    engine = InferenceEngine(config=cfg, tokenizer=FakeTokenizer(), model_runner=runner)
+    num_blocks = len(engine.allocator.free_blocks)
+    assert runner.kv_pool_calls == [(num_blocks, 16)]
+
+
+def test_contiguous_allocator_skips_the_kv_pool():
+    cfg = EngineConfig(
+        model=ModelConfig(), kv_cache=KVCacheConfig(), server=ServerConfig(), kv_allocator="contiguous",
+    )
+    runner = FakeModelRunner()
+    InferenceEngine(config=cfg, tokenizer=FakeTokenizer(), model_runner=runner)
+    assert runner.kv_pool_calls == []
+
+
+def test_non_custom_kernels_skips_the_kv_pool_even_when_paged():
+    cfg = EngineConfig(
+        model=ModelConfig(use_custom_kernels=False), kv_cache=KVCacheConfig(), server=ServerConfig(),
+    )
+    runner = FakeModelRunner()
+    InferenceEngine(config=cfg, tokenizer=FakeTokenizer(), model_runner=runner)
+    assert runner.kv_pool_calls == []
 
 
 def test_explicit_scheduler_and_allocator_override_the_config_knobs():

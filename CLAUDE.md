@@ -6,18 +6,6 @@ A single-GPU LLM serving engine built like a trading system: lock-free queues, c
 batching, paged KV cache, custom CUDA/Triton kernels on the hot path, and honest tail-latency
 measurement.
 
-## Division of labor
-
-**You write:** HTTP/SSE server shell, tokenizer glue, model weight loading, config, the load
-generator's non-timing plumbing, metrics export and dashboards, tests, CI, plotting.
-
-**The user writes:** the threading model, the scheduler, the KV-cache manager, the C++ core and its
-queues, and the load generator's timing logic. Anything on a latency-critical path.
-
-The line: a bug in your code shows up as a **broken endpoint**; a bug in theirs shows up as a
-**wrong latency number**. Do not write the second kind unscaffolded — propose it and let the user
-take it, or write a clearly-marked placeholder they will replace.
-
 ## Code style
 
 > "Code is just a sequence of invariants and transformations."
@@ -42,10 +30,9 @@ Comments supplement readable code; they are not a memory dump.
   filenames, no `CLAUDE.md`, no "per the design doc". If a constraint from elsewhere matters,
   restate the constraint itself in the comment — the code and the comment must stand on their own
   without the reader opening another file.
-- No process or ownership narration either: no "user territory", "division of labor", "TODO(user)",
-  "placeholder for the scheduler owner" — say what the code does or raises (e.g.
-  `NotImplementedError("int8 weight-only quantization")`), not who is meant to write it or why the
-  org chart put it there.
+- No process or ownership narration either: no "TODO(user)", no "placeholder" — say what the code
+  does or raises (e.g. `NotImplementedError("int8 weight-only quantization")`), not who is meant to
+  write it.
 - Do not narrate the code, log your debugging history, tag previous bugs, or leave "changed X to Y"
   notes. No `# TODO(claude)`, no section-banner ASCII art.
 - One line usually suffices. If a comment needs a paragraph, the code is wrong.

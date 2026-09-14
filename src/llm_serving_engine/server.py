@@ -52,7 +52,7 @@ class EngineHandle:
         model_config = replace(self._config.model, model_name_or_path=model_name_or_path)
         tokenizer = TokenizerWrapper(model_name_or_path)
         model_runner = ModelRunner(model_config)
-        kv_cache = KVCacheConfig.from_model(model_runner.model.config)
+        kv_cache = KVCacheConfig.from_model(model_runner.model.config, model_runner.model.dtype.itemsize)
         self._config = replace(self._config, model=model_config, kv_cache=kv_cache)
         engine = InferenceEngine(self._config, tokenizer, model_runner)
         if self._loop is not None:
