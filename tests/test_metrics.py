@@ -3,6 +3,7 @@ import pytest
 from llm_serving_engine.observability.metrics import (
     LatencySummary,
     RequestMetrics,
+    min_samples,
     percentile,
     summarize,
     summarize_stage_latencies,
@@ -58,6 +59,13 @@ def test_percentile_rank_is_exact_where_float_multiplication_is_not():
 
 def test_percentile_unsorted_input():
     assert percentile([5, 1, 3, 2, 4], 50) == 3
+
+
+@pytest.mark.parametrize("p", [50, 90, 95, 99, 99.9])
+def test_min_samples_is_the_first_count_whose_percentile_is_not_the_maximum(p):
+    n = min_samples(p)
+    assert percentile(list(range(n)), p) < n - 1
+    assert percentile(list(range(n - 1)), p) == n - 2
 
 
 def test_summarize_empty_raises():

@@ -1,310 +1,379 @@
 """Benchmark plots, drawn from the raw per-request results the load generator writes.
-matplotlib is a dev dependency, so each function imports it lazily."""
+matplotlib is a dev dependency, so it is imported lazily.
+
+Conventions shared by every load plot:
+- A marker's fill is its point's keep-up verdict: filled kept up, hollow fell behind (its
+  values depend on run length), x too few requests to tell.
+- A rate measured over repeated runs is drawn at its median, with a bar from min to max.
+- A latency percentile over too few samples to differ from the maximum is not drawn.
+"""
 
 from __future__ import annotations
 
-from ..loadgen.report import wall_clock_s
-from .metrics import LatencySummary, percentile, summarize
+from statistics import median
+
+from ..loadgen.report import LatencyReport
+from .metrics import LatencySummary, min_samples, percentile
+
+KEEPS_UP_NOTE = "filled: kept up   hollow: fell behind   x: too few requests to tell"
+_PERCENTILES = {"p50": 50, "p95": 95, "p99": 99}
 
 
-def _successful_latencies(results: list[dict]) -> list[float]:
-    return [r["latency"] for r in results if r.get("success", True)]
+def trusted_ms(summary: LatencySummary | None, name: str) -> float | None:
+    """`summary`'s percentile `name` ("p50", "p95" or "p99") in milliseconds, or None if it
+    rests on too few samples to be anything but the maximum."""
+    if summary is None or summary.count < min_samples(_PERCENTILES[name]):
+        return None
+    return getattr(summary, name) * 1000
 
 
-def _stage_latencies(results: list[dict]) -> tuple[list[float], list[float]]:
-    """(queue+prefill, decode) durations per request that reached a first token:
-    queue+prefill is client-measured first_token_latency; decode is what's left of the
-    open-loop `latency` once that's subtracted.
-    """
-    reached_first_token = [
-        r for r in results if r.get("success", True) and r.get("first_token_latency") is not None
-    ]
-    queue_and_prefill = [r["first_token_latency"] for r in reached_first_token]
-    decode = [r["latency"] - r["first_token_latency"] for r in reached_first_token]
-    return queue_and_prefill, decode
-
-
-def plot_latency_pareto(results: list[dict], out_path: str) -> None:
-    """Throughput-latency Pareto sweep.
-
-    `results` is one run per QPS setting: [{"target_qps", "duration_s", "results": [...]}],
-    where each inner "results" entry is a per-request dict with a "latency" key and an
-    optional "success" flag. Achieved throughput is completed requests over the run's
-    wall clock, start to last completion. Latency axis is milliseconds.
-    """
+def _pyplot():
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    throughputs, p50s, p95s, p99s = [], [], [], []
-    for run in sorted(results, key=lambda r: r["target_qps"]):
-        latencies = _successful_latencies(run["results"])
-        if not latencies:
-            continue
-        throughputs.append(len(latencies) / wall_clock_s(run["results"]))
-        summary = summarize(latencies)
-        p50s.append(summary.p50 * 1000)
-        p95s.append(summary.p95 * 1000)
-        p99s.append(summary.p99 * 1000)
+    return plt
 
-    fig, ax = plt.subplots()
-    ax.plot(throughputs, p50s, marker="o", label="p50")
-    ax.plot(throughputs, p95s, marker="o", label="p95")
-    ax.plot(throughputs, p99s, marker="o", label="p99")
-    ax.set_xlabel("achieved throughput (req/s)")
-    ax.set_ylabel("latency (ms)")
-    ax.set_title("Throughput-latency Pareto")
-    ax.legend()
+
+def _figure(xlabel: str, ylabel: str, title: str | None = None):
+    fig, ax = _pyplot().subplots()
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title)
+    return fig, ax
+
+
+def _save(fig, out_path: str, keeps_up_note: bool = True) -> None:
+    if keeps_up_note:
+        fig.tight_layout(rect=(0, 0.04, 1, 1))  # the strip below the axes holds the note
+        fig.text(0.01, 0.01, KEEPS_UP_NOTE, fontsize="x-small", color="gray")
+    else:
+        fig.tight_layout()
     fig.savefig(out_path)
-    plt.close(fig)
+    _pyplot().close(fig)
+
+
+def _mark(ax, x: float, y: float, keeps_up: bool | None, color) -> None:
+    if keeps_up is None:
+        ax.plot(x, y, marker="x", color=color, linestyle="none")
+    else:
+        face = color if keeps_up else "none"
+        ax.plot(x, y, marker="o", color=color, markerfacecolor=face, linestyle="none")
+
+
+def _draw_series(
+    ax, xs: list[float], ys: list[float | None], keeps_up: list[bool | None], **line_kwargs
+):
+    """A line through the points whose y is not None, marked by keep-up verdict. Returns the
+    line's color, or None if every y was None."""
+    points = [(x, y, k) for x, y, k in zip(xs, ys, keeps_up, strict=True) if y is not None]
+    if not points:
+        return None
+    (line,) = ax.plot([p[0] for p in points], [p[1] for p in points], **line_kwargs)
+    for x, y, k in points:
+        _mark(ax, x, y, k, line.get_color())
+    return line.get_color()
+
+
+def _draw_spread(
+    ax, xs: list[float], repeats: list[list[float | None]], keeps_up: list[bool | None], **kwargs
+) -> None:
+    """Median line over each point's repeats, with a min-to-max bar."""
+    values = [[v for v in point if v is not None] for point in repeats]
+    medians = [median(v) if v else None for v in values]
+    color = _draw_series(ax, xs, medians, keeps_up, **kwargs)
+    for x, v, m in zip(xs, values, medians, strict=True):
+        if len(v) > 1:
+            ax.errorbar(x, m, yerr=[[m - min(v)], [max(v) - m]], color=color, capsize=3)
+
+
+def plot_latency_pareto(
+    throughputs: list[list[float]],
+    latencies: list[LatencyReport],
+    keeps_up: list[bool | None],
+    out_path: str,
+) -> None:
+    """End-to-end latency p50 (solid) and p99 (dashed) per request shape against median
+    achieved throughput, one point per offered load. Shapes are never blended: a shape's
+    output length sets most of its latency, so a blend would chart the workload mix."""
+    fig, ax = _figure(
+        "achieved throughput (req/s, median of repeats)", "end-to-end latency (ms)",
+        "Latency by request shape vs throughput",
+    )
+    xs = [median(t) for t in throughputs]
+    shapes = sorted({shape for latency in latencies for shape in latency.e2e_by_shape})
+    for shape in shapes:
+        summaries = [latency.e2e_by_shape.get(shape) for latency in latencies]
+        color = _draw_series(
+            ax, xs, [trusted_ms(s, "p50") for s in summaries], keeps_up, label=f"{shape} p50"
+        )
+        _draw_series(
+            ax, xs, [trusted_ms(s, "p99") for s in summaries], keeps_up,
+            label=f"{shape} p99", linestyle="--", color=color,
+        )
+    ax.set_yscale("log")
+    ax.legend(fontsize="small")
+    _save(fig, out_path)
 
 
 def _plot_percentiles_by_load(
     load_values: list[float],
     summaries: list[LatencySummary | None],
+    keeps_up: list[bool | None],
     out_path: str,
     ylabel: str,
     title: str,
-    xlabel: str = "offered request rate (req/s)",
 ) -> None:
-    """Shared renderer for the *_by_qps percentile plots: p50/p95/p99 of summaries in
-    seconds, drawn in milliseconds, against an offered-load axis. Points whose summary is
-    None (a QPS point with no successful requests for that stage, say) are dropped.
-    """
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    points = [(load, s) for load, s in zip(load_values, summaries, strict=True) if s is not None]
-    xs = [p[0] for p in points]
-
-    fig, ax = plt.subplots()
-    for pct, label in ((lambda s: s.p50, "p50"), (lambda s: s.p95, "p95"), (lambda s: s.p99, "p99")):
-        ax.plot(xs, [pct(s) * 1000 for _x, s in points], marker="o", label=label)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
+    fig, ax = _figure("offered request rate (req/s)", ylabel, title)
+    for name in _PERCENTILES:
+        _draw_series(
+            ax, load_values, [trusted_ms(s, name) for s in summaries], keeps_up, label=name
+        )
     ax.legend()
-    fig.savefig(out_path)
-    plt.close(fig)
+    _save(fig, out_path)
 
 
 def plot_ttft_by_qps(
-    qps_values: list[float], ttft_by_shape: list[dict[str, LatencySummary]], out_path: str
+    qps_values: list[float],
+    ttft_by_shape: list[dict[str, LatencySummary]],
+    keeps_up: list[bool | None],
+    out_path: str,
 ) -> None:
     """Offered request rate vs TTFT p50 (solid) and p99 (dashed), one color per request
     shape, on a log axis: TTFT grows with prompt length, so shapes span orders of magnitude.
-    A shape missing at a QPS point (no successful request of it there) is dropped there."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
+    Each legend entry carries the shape's fewest and most requests at any point."""
+    fig, ax = _figure("offered request rate (req/s)", "TTFT (ms)", "TTFT by request shape")
     shapes = sorted({shape for point in ttft_by_shape for shape in point})
-    fig, ax = plt.subplots()
     for shape in shapes:
-        points = [(qps, point[shape]) for qps, point in zip(qps_values, ttft_by_shape, strict=True)
-                  if shape in point]
-        xs = [qps for qps, _summary in points]
-        (line,) = ax.plot(xs, [s.p50 * 1000 for _q, s in points], marker="o", label=f"{shape} p50")
-        ax.plot(xs, [s.p99 * 1000 for _q, s in points], marker="o", linestyle="--",
-                color=line.get_color(), label=f"{shape} p99")
+        summaries = [point.get(shape) for point in ttft_by_shape]
+        counts = [s.count for s in summaries if s is not None]
+        label = f"{shape} (n {min(counts)}-{max(counts)})"
+        color = _draw_series(
+            ax, qps_values, [trusted_ms(s, "p50") for s in summaries], keeps_up,
+            label=f"{label} p50",
+        )
+        _draw_series(
+            ax, qps_values, [trusted_ms(s, "p99") for s in summaries], keeps_up,
+            label=f"{shape} p99", linestyle="--", color=color,
+        )
     ax.set_yscale("log")
-    ax.set_xlabel("offered request rate (req/s)")
-    ax.set_ylabel("TTFT (ms)")
-    ax.set_title("TTFT by request shape vs offered rate")
-    ax.legend(fontsize="small")
-    fig.savefig(out_path)
-    plt.close(fig)
+    ax.legend(fontsize="x-small")
+    _save(fig, out_path)
 
 
 def plot_tpot_by_qps(
-    qps_values: list[float], tpot_summaries: list[LatencySummary | None], out_path: str
+    qps_values: list[float],
+    tpot_summaries: list[LatencySummary | None],
+    keeps_up: list[bool | None],
+    out_path: str,
 ) -> None:
-    """Offered request rate vs p50/p95/p99 time-per-output-token."""
-    _plot_percentiles_by_load(qps_values, tpot_summaries, out_path, "TPOT (ms)", "TPOT vs offered rate")
+    """Offered request rate vs each request's mean time per output token. A mean over one
+    request hides its stalls; plot_itl_by_qps shows those."""
+    _plot_percentiles_by_load(
+        qps_values, tpot_summaries, keeps_up, out_path, "TPOT (ms)", "Time per output token"
+    )
+
+
+def plot_itl_by_qps(
+    qps_values: list[float],
+    itl_summaries: list[LatencySummary | None],
+    keeps_up: list[bool | None],
+    out_path: str,
+) -> None:
+    """Offered request rate vs every gap between consecutive tokens, across all requests:
+    the stall a client actually sees mid-stream."""
+    _plot_percentiles_by_load(
+        qps_values, itl_summaries, keeps_up, out_path, "inter-token latency (ms)",
+        "Inter-token latency",
+    )
 
 
 def plot_e2e_latency_by_qps(
-    qps_values: list[float], e2e_summaries: list[LatencySummary | None], out_path: str
+    qps_values: list[float],
+    e2e_summaries: list[LatencySummary | None],
+    keeps_up: list[bool | None],
+    out_path: str,
 ) -> None:
-    """Offered request rate vs p50/p95/p99 end-to-end latency."""
+    """Offered request rate vs end-to-end latency over every request shape."""
     _plot_percentiles_by_load(
-        qps_values, e2e_summaries, out_path, "end-to-end latency (ms)", "E2E latency vs offered rate"
+        qps_values, e2e_summaries, keeps_up, out_path, "end-to-end latency (ms)",
+        "End-to-end latency, all shapes",
     )
 
 
-def _plot_scalar_by_load(
+def plot_throughput_by_qps(
+    qps_values: list[float],
+    throughputs: list[list[float]],
+    offered: list[list[float]],
+    keeps_up: list[bool | None],
+    out_path: str,
+) -> None:
+    """Target request rate vs achieved throughput, beside the arrival rate each run actually
+    drew: a Poisson schedule over a short run lands off its target, and a server that keeps
+    up tracks its arrivals, not the target."""
+    fig, ax = _figure("target request rate (req/s)", "request rate (req/s)", "Throughput")
+    _draw_spread(ax, qps_values, offered, keeps_up, label="arrivals", linestyle="--")
+    _draw_spread(ax, qps_values, throughputs, keeps_up, label="achieved throughput")
+    ax.legend()
+    _save(fig, out_path)
+
+
+def _plot_rate_by_load(
     load_values: list[float],
-    values: list[float | None],
+    repeats: list[list[float | None]],
+    keeps_up: list[bool | None],
     out_path: str,
     ylabel: str,
     title: str,
-    xlabel: str = "offered request rate (req/s)",
 ) -> None:
-    """Shared renderer for single-line load-vs-metric plots (throughput, goodput, GPU
-    memory, KV utilization). Points with a None value are dropped."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    points = [(load, v) for load, v in zip(load_values, values, strict=True) if v is not None]
-    fig, ax = plt.subplots()
-    ax.plot([p[0] for p in points], [p[1] for p in points], marker="o")
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    fig.savefig(out_path)
-    plt.close(fig)
-
-
-def plot_throughput_by_qps(qps_values: list[float], throughputs: list[float], out_path: str) -> None:
-    """Offered request rate vs achieved request throughput."""
-    _plot_scalar_by_load(
-        qps_values, throughputs, out_path, "achieved throughput (req/s)", "Throughput vs offered rate"
-    )
+    fig, ax = _figure("offered request rate (req/s)", ylabel, title)
+    _draw_spread(ax, load_values, repeats, keeps_up)
+    _save(fig, out_path)
 
 
 def plot_output_throughput_by_qps(
-    qps_values: list[float], output_tokens_s: list[float], out_path: str
+    qps_values: list[float],
+    output_tokens_s: list[list[float]],
+    keeps_up: list[bool | None],
+    out_path: str,
 ) -> None:
-    """Offered request rate vs output-token throughput."""
-    _plot_scalar_by_load(
-        qps_values, output_tokens_s, out_path,
-        "output-token throughput (tok/s)", "Output-token throughput vs offered rate",
+    _plot_rate_by_load(
+        qps_values, output_tokens_s, keeps_up, out_path,
+        "output-token throughput (tok/s)", "Output-token throughput",
     )
 
 
-def plot_goodput_by_qps(qps_values: list[float], goodputs: list[float | None], out_path: str) -> None:
-    """Offered request rate vs goodput (requests/s meeting every configured SLO)."""
-    _plot_scalar_by_load(qps_values, goodputs, out_path, "goodput (req/s)", "Goodput vs offered rate")
+def plot_goodput_by_qps(
+    qps_values: list[float],
+    goodputs: list[list[float | None]],
+    keeps_up: list[bool | None],
+    out_path: str,
+) -> None:
+    """Requests/s meeting every configured SLO."""
+    _plot_rate_by_load(qps_values, goodputs, keeps_up, out_path, "goodput (req/s)", "Goodput")
 
 
 def plot_gpu_memory_by_load(
-    load_values: list[float], peak_memory_mb: list[float | None], out_path: str
+    load_values: list[float],
+    peak_memory_mb: list[list[float | None]],
+    keeps_up: list[bool | None],
+    out_path: str,
 ) -> None:
-    """Offered load vs peak GPU memory usage."""
-    _plot_scalar_by_load(
-        load_values, peak_memory_mb, out_path, "peak GPU memory (MB)",
-        "Peak GPU memory vs offered load", xlabel="offered load (req/s)",
+    _plot_rate_by_load(
+        load_values, peak_memory_mb, keeps_up, out_path, "peak GPU memory (MB)",
+        "Peak GPU memory",
     )
 
 
 def plot_kv_utilization_by_load(
-    load_values: list[float], peak_kv_utilization: list[float | None], out_path: str
+    load_values: list[float],
+    peak_utilization: list[list[float | None]],
+    mean_utilization: list[list[float | None]],
+    keeps_up: list[bool | None],
+    out_path: str,
 ) -> None:
-    """Offered load vs peak KV-cache utilization."""
-    _plot_scalar_by_load(
-        load_values, peak_kv_utilization, out_path, "peak KV-cache utilization",
-        "Peak KV-cache utilization vs offered load", xlabel="offered load (req/s)",
+    """Peak utilization pins at 1.0 once any moment fills the pool; the mean shows how long
+    the pool stays under pressure."""
+    fig, ax = _figure("offered request rate (req/s)", "KV-cache utilization", "KV-cache pressure")
+    _draw_spread(ax, load_values, peak_utilization, keeps_up, label="peak")
+    _draw_spread(ax, load_values, mean_utilization, keeps_up, label="mean")
+    ax.set_ylim(0, 1.05)
+    ax.legend()
+    _save(fig, out_path)
+
+
+def plot_preemptions_by_load(
+    load_values: list[float],
+    preemptions: list[list[float | None]],
+    keeps_up: list[bool | None],
+    out_path: str,
+) -> None:
+    """Sequences evicted for KV blocks per run; each re-prefills everything it had."""
+    _plot_rate_by_load(
+        load_values, preemptions, keeps_up, out_path, "preemptions per run", "Preemptions"
     )
 
 
-def plot_stage_latency_by_qps(results: list[dict], out_path: str) -> None:
-    """p50/p90/p99 latency at each offered QPS, split into queue+prefill (up to the
-    first token) and decode (first token to completion).
+def plot_stage_latency_by_qps(runs: list[dict], out_path: str) -> None:
+    """At each offered QPS, p50/p90/p99 of queue+prefill (up to the first token), of decode
+    (first token to completion) and of the whole request, as side-by-side bars.
 
-    `results` is the same one-run-per-QPS shape `plot_latency_pareto` takes. Each
-    stage's percentile is computed independently over its own distribution across
-    requests: it shows where time typically goes at that percentile, and the two stages'
-    values need not come from the same request.
-    """
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    runs = sorted(results, key=lambda r: r["target_qps"])
-    qps_labels = [f"{run['target_qps']:g}" for run in runs]
-    stage_latencies = [_stage_latencies(run["results"]) for run in runs]
-
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4), sharey=True)
+    `runs` is one `{"target_qps", "results"}` per QPS. Each bar is its own distribution's
+    percentile, so the stage bars need not sum to the total bar: the slowest prefills and the
+    slowest decodes are rarely the same requests."""
+    fig, axes = _pyplot().subplots(1, 3, figsize=(12, 4), sharey=True)
+    runs = sorted(runs, key=lambda r: r["target_qps"])
+    stages = [_stage_latencies(run["results"]) for run in runs]
+    x = range(len(runs))
+    width = 0.27
     for ax, p in zip(axes, (50, 90, 99), strict=True):
-        queue = [percentile(q, p) * 1000 if q else 0.0 for q, _d in stage_latencies]
-        decode = [percentile(d, p) * 1000 if d else 0.0 for _q, d in stage_latencies]
-        x = range(len(qps_labels))
-        ax.bar(x, queue, label="queue + prefill")
-        ax.bar(x, decode, bottom=queue, label="decode")
+        for i, label in enumerate(("queue + prefill", "decode", "total")):
+            heights = [
+                percentile(stage[i], p) * 1000 if len(stage[i]) >= min_samples(p) else float("nan")
+                for stage in stages
+            ]
+            ax.bar([xi + (i - 1) * width for xi in x], heights, width, label=label)
         ax.set_xticks(list(x))
-        ax.set_xticklabels(qps_labels)
+        ax.set_xticklabels([f"{run['target_qps']:g}" for run in runs])
         ax.set_xlabel("offered QPS")
         ax.set_title(f"p{p}")
     axes[0].set_ylabel("latency (ms)")
     axes[0].legend()
-    fig.savefig(out_path)
-    plt.close(fig)
+    _save(fig, out_path, keeps_up_note=False)
+
+
+def _stage_latencies(results: list[dict]) -> tuple[list[float], list[float], list[float]]:
+    """(queue+prefill, decode, total) durations of each successful request that reached a
+    first token."""
+    reached = [
+        r for r in results if r.get("success", True) and r.get("first_token_latency") is not None
+    ]
+    return (
+        [r["first_token_latency"] for r in reached],
+        [r["latency"] - r["first_token_latency"] for r in reached],
+        [r["latency"] for r in reached],
+    )
 
 
 def plot_latency_cdf_or_histogram(
     results: list[dict], out_path: str, kind: str = "cdf"
 ) -> None:
     """Per-request latency distribution for one run. `kind` is "cdf" or "hist"."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    latencies = [latency * 1000 for latency in _successful_latencies(results)]
-    fig, ax = plt.subplots()
+    latencies = [r["latency"] * 1000 for r in results if r.get("success", True)]
+    fig, ax = _figure("latency (ms)", "count" if kind == "hist" else "CDF", "Latency distribution")
     if kind == "hist":
         ax.hist(latencies, bins=50)
-        ax.set_ylabel("count")
     else:
         ordered = sorted(latencies)
-        ys = [(i + 1) / len(ordered) for i in range(len(ordered))]
-        ax.plot(ordered, ys)
-        ax.set_ylabel("CDF")
-    ax.set_xlabel("latency (ms)")
-    ax.set_title("Latency distribution")
-    fig.savefig(out_path)
-    plt.close(fig)
+        ax.plot(ordered, [(i + 1) / len(ordered) for i in range(len(ordered))])
+    _save(fig, out_path, keeps_up_note=False)
 
 
-def plot_ablation_bar(labels: list[str], values: list[float], out_path: str, ylabel: str) -> None:
-    """One bar per ablation arm for a single scalar, such as closed-loop capacity."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots()
-    ax.bar(labels, values)
-    ax.set_ylabel(ylabel)
-    fig.savefig(out_path)
-    plt.close(fig)
+def plot_ablation_bar(
+    labels: list[str], repeats: list[list[float]], out_path: str, ylabel: str
+) -> None:
+    """One bar per ablation arm at the median of its repeats, each repeat drawn as a dot."""
+    fig, ax = _figure("", ylabel)
+    ax.bar(labels, [median(r) for r in repeats], color="lightgray")
+    for i, values in enumerate(repeats):
+        ax.plot([i] * len(values), values, "o", color="black")
+    _save(fig, out_path, keeps_up_note=False)
 
 
 def plot_ablation_sweep(
-    qps_values: list[float],
+    qps_by_arm: dict[str, list[float]],
     values_by_arm: dict[str, list[float | None]],
-    kept_up_by_arm: dict[str, list[bool]],
+    keeps_up_by_arm: dict[str, list[bool | None]],
     out_path: str,
     ylabel: str,
 ) -> None:
-    """One line per ablation arm against offered QPS. Filled markers are points where the
-    arm kept up with arrivals; hollow ones are points where its backlog grew, so their
-    values depend on run length. None values are dropped."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots()
-    for arm, values in values_by_arm.items():
-        points = [
-            (qps, value, kept_up)
-            for qps, value, kept_up in zip(qps_values, values, kept_up_by_arm[arm], strict=True)
-            if value is not None
-        ]
-        (line,) = ax.plot([p[0] for p in points], [p[1] for p in points], label=arm)
-        for qps, value, kept_up in points:
-            face = line.get_color() if kept_up else "none"
-            ax.plot(qps, value, marker="o", color=line.get_color(), markerfacecolor=face)
-    ax.set_xlabel("offered request rate (req/s)")
-    ax.set_ylabel(ylabel)
+    """One line per ablation arm against offered QPS, each arm over its own sweep. The QPS
+    axis is logarithmic: arms can differ in capacity by an order of magnitude."""
+    fig, ax = _figure("offered request rate (req/s)", ylabel)
+    for arm, qps_values in qps_by_arm.items():
+        _draw_series(ax, qps_values, values_by_arm[arm], keeps_up_by_arm[arm], label=arm)
+    ax.set_xscale("log")
     ax.legend()
-    fig.savefig(out_path)
-    plt.close(fig)
+    _save(fig, out_path)

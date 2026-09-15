@@ -52,6 +52,12 @@ def percentile(values: list[float], p: float) -> float:
     return ordered[max(0, min(rank, len(ordered) - 1))]
 
 
+def min_samples(p: float) -> int:
+    """Fewest samples for which nearest-rank percentile p, p in [0, 100), is not the maximum:
+    100 for p99, 20 for p95."""
+    return math.ceil(round(100 / (100 - p), 6))
+
+
 @dataclass
 class LatencySummary:
     count: int

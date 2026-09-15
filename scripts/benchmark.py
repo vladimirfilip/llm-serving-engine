@@ -33,6 +33,7 @@ import time
 import traceback
 from dataclasses import replace
 from pathlib import Path
+from typing import Callable
 
 import httpx
 
@@ -56,13 +57,16 @@ from llm_serving_engine.observability.plotting import (
     plot_e2e_latency_by_qps,
     plot_goodput_by_qps,
     plot_gpu_memory_by_load,
+    plot_itl_by_qps,
     plot_kv_utilization_by_load,
     plot_latency_pareto,
     plot_output_throughput_by_qps,
+    plot_preemptions_by_load,
     plot_stage_latency_by_qps,
     plot_throughput_by_qps,
     plot_tpot_by_qps,
     plot_ttft_by_qps,
+    trusted_ms,
 )
 from llm_serving_engine.scheduling.scheduler import MAX_CONCURRENT_SEQUENCES
 
@@ -217,36 +221,53 @@ def bench_pareto(args: argparse.Namespace, out_dir: Path) -> None:
                 f"preemptions={kv.stats.preemptions}"
             )
 
+    qps = args.qps
+    keeps_up = [r.keeps_up for r in reports]
     plot_dir = out_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
-    plot_latency_pareto(runs, str(plot_dir / "pareto.png"))
+    plot_latency_pareto(
+        [[r.throughput_req_s] for r in reports], [r.latency for r in reports], keeps_up,
+        str(plot_dir / "pareto.png"),
+    )
     plot_stage_latency_by_qps(runs, str(plot_dir / "pareto_stage_latency.png"))
     plot_ttft_by_qps(
-        args.qps, [r.latency.ttft_by_shape for r in reports], str(plot_dir / "pareto_ttft.png")
+        qps, [r.latency.ttft_by_shape for r in reports], keeps_up,
+        str(plot_dir / "pareto_ttft.png"),
     )
-    plot_tpot_by_qps(args.qps, [r.latency.tpot for r in reports], str(plot_dir / "pareto_tpot.png"))
+    plot_tpot_by_qps(
+        qps, [r.latency.tpot for r in reports], keeps_up, str(plot_dir / "pareto_tpot.png")
+    )
+    plot_itl_by_qps(
+        qps, [r.latency.itl for r in reports], keeps_up, str(plot_dir / "pareto_itl.png")
+    )
     plot_e2e_latency_by_qps(
-        args.qps, [r.latency.e2e_latency for r in reports],
+        qps, [r.latency.e2e_latency for r in reports], keeps_up,
         str(plot_dir / "pareto_e2e_latency.png"),
     )
     plot_throughput_by_qps(
-        args.qps, [r.throughput_req_s for r in reports], str(plot_dir / "pareto_throughput.png")
+        qps, [[r.throughput_req_s] for r in reports], [[r.offered_req_s] for r in reports],
+        keeps_up, str(plot_dir / "pareto_throughput.png"),
     )
     plot_output_throughput_by_qps(
-        args.qps, [r.output_tokens_s for r in reports],
+        qps, [[r.output_tokens_s] for r in reports], keeps_up,
         str(plot_dir / "pareto_output_throughput.png"),
     )
     plot_gpu_memory_by_load(
-        args.qps, [g.peak_memory_used_mb for g in gpu_stats],
+        qps, [[g.peak_memory_used_mb] for g in gpu_stats], keeps_up,
         str(plot_dir / "pareto_gpu_memory.png"),
     )
     plot_kv_utilization_by_load(
-        args.qps, [k.peak_utilization for k in kv_stats],
-        str(plot_dir / "pareto_kv_utilization.png"),
+        qps, [[k.peak_utilization] for k in kv_stats], [[k.mean_utilization] for k in kv_stats],
+        keeps_up, str(plot_dir / "pareto_kv_utilization.png"),
+    )
+    plot_preemptions_by_load(
+        qps, [[k.preemptions] for k in kv_stats], keeps_up,
+        str(plot_dir / "pareto_preemptions.png"),
     )
     if slo is not None:
         plot_goodput_by_qps(
-            args.qps, [r.goodput_req_s for r in reports], str(plot_dir / "pareto_goodput.png")
+            qps, [[r.goodput_req_s] for r in reports], keeps_up,
+            str(plot_dir / "pareto_goodput.png"),
         )
     print(f"[pareto] wrote plots to {plot_dir}")
 
@@ -339,39 +360,30 @@ def _run_ablation(
 
     plot_dir = out_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
-    kept_up = {arm: [r.keeps_up for r in reports[arm]] for arm in arms}
+    qps_by_arm = {arm: qps_values for arm in arms}
+    keeps_up = {arm: [r.keeps_up for r in reports[arm]] for arm in arms}
 
-    def ms(summary):
-        return summary.p99 * 1000 if summary is not None else None
+    def sweep(metric: Callable[[RunReport], float | None], filename: str, ylabel: str) -> None:
+        plot_ablation_sweep(
+            qps_by_arm, {arm: [metric(r) for r in reports[arm]] for arm in arms},
+            keeps_up, str(plot_dir / f"{name}_{filename}.png"), ylabel,
+        )
 
     plot_ablation_bar(
-        arms, [capacity[arm] for arm in arms], str(plot_dir / f"{name}_capacity.png"),
+        arms, [[capacity[arm]] for arm in arms], str(plot_dir / f"{name}_capacity.png"),
         "closed-loop capacity (req/s)",
     )
-    plot_ablation_sweep(
-        qps_values,
-        {arm: [ms(r.latency.e2e_latency) for r in reports[arm]] for arm in arms},
-        kept_up,
-        str(plot_dir / f"{name}_e2e_p99.png"), "end-to-end latency p99 (ms)",
-    )
+    sweep(lambda r: trusted_ms(r.latency.e2e_latency, "p99"), "e2e_p99", "end-to-end p99 (ms)")
+    sweep(lambda r: trusted_ms(r.latency.itl, "p99"), "itl_p99", "inter-token latency p99 (ms)")
     shapes = {shape for arm in arms for r in reports[arm] for shape in r.latency.ttft_by_shape}
     for shape in sorted(shapes):
-        plot_ablation_sweep(
-            qps_values,
-            {arm: [ms(r.latency.ttft_by_shape.get(shape)) for r in reports[arm]] for arm in arms},
-            kept_up,
-            str(plot_dir / f"{name}_ttft_p99_{shape}.png"),
-            f"{shape} TTFT p99 (ms)",
+        sweep(
+            lambda r, shape=shape: trusted_ms(r.latency.ttft_by_shape.get(shape), "p50"),
+            f"ttft_p50_{shape}", f"{shape} TTFT p50 (ms)",
         )
-    plot_ablation_sweep(
-        qps_values, {arm: [r.throughput_req_s for r in reports[arm]] for arm in arms}, kept_up,
-        str(plot_dir / f"{name}_throughput.png"), "achieved throughput (req/s)",
-    )
+    sweep(lambda r: r.throughput_req_s, "throughput", "achieved throughput (req/s)")
     if slo is not None:
-        plot_ablation_sweep(
-            qps_values, {arm: [r.goodput_req_s for r in reports[arm]] for arm in arms}, kept_up,
-            str(plot_dir / f"{name}_goodput.png"), "goodput (req/s)",
-        )
+        sweep(lambda r: r.goodput_req_s, "goodput", "goodput (req/s)")
     print(f"[{name}] wrote plots to {plot_dir}")
 
 
