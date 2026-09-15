@@ -59,17 +59,30 @@ def test_prefill_continues_from_its_progress_and_flips_to_decoding_when_done(sch
 
 
 @pytest.mark.parametrize("scheduler_cls", SCHEDULER_CLASSES)
-def test_prefill_chunk_is_capped_by_the_token_budget(scheduler_cls):
-    scheduler = scheduler_cls(token_budget=2)
+def test_one_prefill_chunk_takes_only_a_fraction_of_the_token_budget(scheduler_cls):
+    scheduler = scheduler_cls(token_budget=8)  # chunks of at most 4
     alloc = BlockAllocator(num_blocks=100, block_size=16)
-    seq = make_sequence(status="PREFILLING")  # 5 prompt tokens
+    seq = make_sequence(status="PREFILLING", prompt_tokens=[0] * 10)
 
     plan = scheduler.scheduler_step(running=[seq], waiting=deque(), allocator=alloc)
 
     [entry] = list(plan)
-    assert entry.n_tokens == 2
-    assert seq.prefill_progress == 2
+    assert entry.n_tokens == 4
+    assert seq.prefill_progress == 4
     assert seq.status == "PREFILLING"
+
+
+def test_a_long_prefill_leaves_budget_to_admit_a_waiting_prompt():
+    scheduler = ContinuousBatchedScheduler(token_budget=8)  # chunks of at most 4
+    alloc = BlockAllocator(num_blocks=100, block_size=16)
+    prefilling = make_sequence(seq_id=1, status="PREFILLING", prompt_tokens=[0] * 40)
+    newcomer = make_sequence(seq_id=2, prompt_tokens=[0] * 3)
+    running, waiting = [prefilling], deque([newcomer])
+
+    plan = scheduler.scheduler_step(running, waiting, alloc)
+
+    assert [(e.seq_id, e.n_tokens) for e in plan] == [(1, 4), (2, 3)]
+    assert running == [prefilling, newcomer]
 
 
 @pytest.mark.parametrize("scheduler_cls", SCHEDULER_CLASSES)

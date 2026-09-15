@@ -8,7 +8,8 @@ back in. Subclasses differ only in `admission_cap`.
 
   1. DECODING sequences, one token each. Decode tokens don't draw on TOKEN_BUDGET, so a
      client mid-stream is never stalled behind prefill work.
-  2. The PREFILLING sequence continues its chunk, if its next chunk's blocks are free.
+  2. The PREFILLING sequence continues its chunk, if its next chunk's blocks are free. No
+     one chunk exceeds `max_prefill_chunk`, so a long prompt leaves budget for step 3.
   3. Admissions from `waiting` in arrival order, gated by the remaining budget, the
      allocator and `admission_cap`. A head that doesn't fit is skipped, so a short prompt
      doesn't wait on the blocks a long one needs, until MAX_ADMISSION_SKIPS admissions
@@ -20,7 +21,9 @@ preempted sequence frees its blocks, returns to the head of `waiting` and later 
 prompt + generated tokens.
 
 TOKEN_BUDGET bounds one iteration's prefill compute, so a long prompt can't spike
-inter-token latency for the sequences decoding beside it. MAX_CONCURRENT_SEQUENCES bounds
+inter-token latency for the sequences decoding beside it, and no single prompt may take
+more than MAX_PREFILL_CHUNK_FRACTION of it, so its chunks never starve admission until it
+finishes prefilling. MAX_CONCURRENT_SEQUENCES bounds
 the decode batch: every running sequence gets a token every iteration, so iteration time
 grows with `running`; past the cap, demand waits in `waiting` as schedule latency.
 """
@@ -42,12 +45,16 @@ BATCH_SIZE = 8
 MAX_CONCURRENT_SEQUENCES = 64
 # Admissions that may go ahead of a head that doesn't fit before it gets the pool to itself.
 MAX_ADMISSION_SKIPS = 8
+# Share of TOKEN_BUDGET one sequence's prefill chunk may take, so the rest of an iteration's
+# budget stays available to admit other prompts.
+MAX_PREFILL_CHUNK_FRACTION = 0.5
 
 
 class Scheduler(ABC):
     def __init__(self, token_budget: int, max_running: int) -> None:
         self.token_budget = token_budget
         self.max_running = max_running
+        self.max_prefill_chunk = max(1, int(token_budget * MAX_PREFILL_CHUNK_FRACTION))
 
     @abstractmethod
     def admission_cap(self, running: list[Sequence]) -> int:
@@ -86,7 +93,7 @@ class Scheduler(ABC):
         for seq in running:
             if seq.status != "PREFILLING" or budget == 0:
                 continue
-            chunk = min(seq.num_tokens - seq.prefill_progress, budget)
+            chunk = min(seq.num_tokens - seq.prefill_progress, budget, self.max_prefill_chunk)
             if not allocator.allocate(seq, chunk):
                 return 0
             plan.add(seq, n_tokens=chunk, is_prefill_chunk=True)
@@ -111,7 +118,7 @@ class Scheduler(ABC):
                 plan.rejected.append(seq)
                 del waiting[index]
                 continue
-            chunk = min(seq.num_tokens, budget)
+            chunk = min(seq.num_tokens, budget, self.max_prefill_chunk)
             # Headroom for every running sequence's next decode block; without it this
             # admission takes the last blocks and is itself preempted next step.
             if not allocator.allocate(seq, chunk, decode_reserve=len(running)):
