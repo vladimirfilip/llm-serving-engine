@@ -1,6 +1,7 @@
 """Scheduler behaviour, run against every Scheduler implementation where the policies
-agree: decode-first planning that TOKEN_BUDGET never stalls, chunked prefill, head-of-line
-admission, recompute preemption from the tail of `running`, and result handling. Where the
+agree: decode-first planning that TOKEN_BUDGET never stalls, chunked prefill, admission that
+skips a head it can't fit until that head's skips run out, recompute preemption from the
+tail of `running`, and result handling. Where the
 policies differ (continuous interleaving vs. static batch-then-drain), per-class tests
 cover each.
 """
@@ -11,6 +12,7 @@ import pytest
 
 from llm_serving_engine.scheduling.allocator import BlockAllocator
 from llm_serving_engine.scheduling.scheduler import (
+    MAX_ADMISSION_SKIPS,
     ContinuousBatchedScheduler,
     StaticBatchedScheduler,
 )
@@ -119,19 +121,40 @@ def test_admission_moves_the_head_of_waiting_into_running(scheduler_cls):
 
 
 @pytest.mark.parametrize("scheduler_cls", SCHEDULER_CLASSES)
-def test_admission_stops_at_a_head_that_does_not_fit_without_skipping_it(scheduler_cls):
+def test_admission_skips_a_head_that_does_not_fit(scheduler_cls):
     scheduler = scheduler_cls()
     alloc = BlockAllocator(num_blocks=3, block_size=4)
     alloc.allocate(make_sequence(seq_id=99), 8)  # 1 block left
     head = make_sequence(seq_id=1, prompt_tokens=[0] * 5)  # needs 2 blocks now
-    small = make_sequence(seq_id=2, prompt_tokens=[0] * 2)  # would fit in 1
+    small = make_sequence(seq_id=2, prompt_tokens=[0] * 2)  # fits in 1
     waiting, running = deque([head, small]), []
 
     plan = scheduler.scheduler_step(running=running, waiting=waiting, allocator=alloc)
 
-    assert len(plan) == 0
-    assert list(waiting) == [head, small]
-    assert running == []
+    assert [e.seq_id for e in plan] == [small.seq_id]
+    assert running == [small]
+    assert list(waiting) == [head]
+    assert head.admission_skips == 1
+
+
+def test_admission_freezes_once_the_head_has_spent_its_skips():
+    scheduler = ContinuousBatchedScheduler()
+    alloc = BlockAllocator(num_blocks=100, block_size=4)
+    held = decoding_sequence(alloc, seq_id=99, prompt_len=40)
+    head = make_sequence(seq_id=1, prompt_tokens=[0] * 380)  # fits the pool, not the free blocks
+    running, waiting = [held], deque([head])
+
+    admitted = []
+    for seq_id in range(2, 2 + MAX_ADMISSION_SKIPS + 1):
+        waiting.append(make_sequence(seq_id=seq_id, prompt_tokens=[0] * 2))
+        plan = scheduler.scheduler_step(running, waiting, alloc)
+        admitted += [e.seq_id for e in plan if e.is_prefill_chunk]
+
+    # Every small arrival is admitted ahead of the head until its skips run out; the last
+    # one waits behind it instead.
+    assert admitted == list(range(2, 2 + MAX_ADMISSION_SKIPS))
+    assert head.admission_skips == MAX_ADMISSION_SKIPS
+    assert waiting[0] is head
 
 
 @pytest.mark.parametrize("scheduler_cls", SCHEDULER_CLASSES)

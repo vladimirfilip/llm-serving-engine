@@ -9,13 +9,15 @@ back in. Subclasses differ only in `admission_cap`.
   1. DECODING sequences, one token each. Decode tokens don't draw on TOKEN_BUDGET, so a
      client mid-stream is never stalled behind prefill work.
   2. The PREFILLING sequence continues its chunk, if its next chunk's blocks are free.
-  3. Admissions from the head of `waiting`, gated by the remaining budget, the allocator
-     and `admission_cap`. A head that doesn't fit stops admission; nothing skips it.
+  3. Admissions from `waiting` in arrival order, gated by the remaining budget, the
+     allocator and `admission_cap`. A head that doesn't fit is skipped, so a short prompt
+     doesn't wait on the blocks a long one needs, until MAX_ADMISSION_SKIPS admissions
+     have gone ahead of it; from then on nothing is admitted until the head itself fits.
 
-`running` stays in arrival order: admission only appends the head of `waiting`, and a
-preempted sequence returns to the head. So `running[-1]` is always the latest arrival,
+`running` is in admission order, so `running[-1]` is the most recently admitted sequence,
 and when a decode token finds no free block, sequences are preempted from the tail. A
-preempted sequence frees its blocks and later re-prefills prompt + generated tokens.
+preempted sequence frees its blocks, returns to the head of `waiting` and later re-prefills
+prompt + generated tokens.
 
 TOKEN_BUDGET bounds one iteration's prefill compute, so a long prompt can't spike
 inter-token latency for the sequences decoding beside it. MAX_CONCURRENT_SEQUENCES bounds
@@ -38,6 +40,8 @@ from .sequence import Sequence
 TOKEN_BUDGET = 4096
 BATCH_SIZE = 8
 MAX_CONCURRENT_SEQUENCES = 64
+# Admissions that may go ahead of a head that doesn't fit before it gets the pool to itself.
+MAX_ADMISSION_SKIPS = 8
 
 
 class Scheduler(ABC):
@@ -94,23 +98,34 @@ class Scheduler(ABC):
         self, running: list[Sequence], waiting: deque[Sequence], allocator: KVAllocator,
         plan: BatchPlan, budget: int,
     ) -> None:
+        """Walks `waiting` in arrival order, admitting whatever fits. Each admission from
+        behind the head counts as one of the head's MAX_ADMISSION_SKIPS; once they are
+        spent, only the head may be admitted, so the pool drains towards it."""
         cap = self.admission_cap(running)
-        while waiting and budget > 0 and len(running) < cap:
-            seq = waiting[0]
+        index = 0
+        while index < len(waiting) and budget > 0 and len(running) < cap:
+            if index > 0 and waiting[0].admission_skips >= MAX_ADMISSION_SKIPS:
+                return
+            seq = waiting[index]
             if not allocator.can_ever_fit(seq):
-                plan.rejected.append(waiting.popleft())
+                plan.rejected.append(seq)
+                del waiting[index]
                 continue
             chunk = min(seq.num_tokens, budget)
             # Headroom for every running sequence's next decode block; without it this
             # admission takes the last blocks and is itself preempted next step.
             if not allocator.allocate(seq, chunk, decode_reserve=len(running)):
-                break
+                index += 1
+                continue
             plan.add(seq, n_tokens=chunk, is_prefill_chunk=True)
             budget -= chunk
             _advance_prefill(seq, chunk)
             if seq.metrics.admit_time is None:
                 seq.metrics.admit_time = time.monotonic()
-            running.append(waiting.popleft())
+            del waiting[index]
+            running.append(seq)
+            if index > 0:
+                waiting[0].admission_skips += 1
 
     def handle_iteration_results(
         self,

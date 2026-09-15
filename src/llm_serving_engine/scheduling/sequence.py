@@ -28,6 +28,8 @@ class Sequence:
     block_table: BlockTable = field(default_factory=BlockTable)
     status: SequenceStatus = "WAITING"
     prefill_progress: int = 0
+    # Admissions that went ahead of this sequence while it was the head of `waiting`.
+    admission_skips: int = 0
 
     @property
     def num_tokens(self) -> int:
