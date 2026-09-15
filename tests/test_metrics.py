@@ -52,6 +52,10 @@ def test_percentile_known_values():
     assert percentile(values, 1) == 1
 
 
+def test_percentile_rank_is_exact_where_float_multiplication_is_not():
+    assert percentile(list(range(1000)), 99.9) == 998
+
+
 def test_percentile_unsorted_input():
     assert percentile([5, 1, 3, 2, 4], 50) == 3
 

@@ -46,7 +46,9 @@ def percentile(values: list[float], p: float) -> float:
     if not values:
         raise ValueError("percentile of empty sequence")
     ordered = sorted(values)
-    rank = math.ceil(p / 100 * len(ordered)) - 1
+    # Rounded before ceil: 99.9 / 100 * 1000 is 999.0000000000001 in floating point, which
+    # would push p99.9 of 1000 samples onto the maximum.
+    rank = math.ceil(round(p * len(ordered) / 100, 9)) - 1
     return ordered[max(0, min(rank, len(ordered) - 1))]
 
 
