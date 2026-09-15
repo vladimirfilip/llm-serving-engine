@@ -195,8 +195,11 @@ def build_point(
 
 
 def _satisfies(result: dict, slo: SLOThresholds) -> bool:
+    """A closed-loop result has no arrival schedule, so its TTFT measures the queue its own
+    clients hold full; only open-loop results are judged on it."""
+    open_loop = "scheduled_at" in result
     checks = (
-        (slo.ttft_ms, result.get("first_token_latency")),
+        (slo.ttft_ms if open_loop else None, result.get("first_token_latency")),
         (slo.tpot_ms, tpot(result)),
         (slo.e2e_ms, result.get("latency")),
     )

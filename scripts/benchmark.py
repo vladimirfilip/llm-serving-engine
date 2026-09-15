@@ -19,6 +19,10 @@ long prompts and outputs push KV-cache usage toward the pool's capacity.
 closed-loop maximum throughput. Each ablation measures an arm's closed-loop capacity, then
 runs that arm open loop at fractions of its own capacity.
 
+Every point reports goodput beside throughput: the requests that met the SLO (`--slo-*`,
+by default a 300 ms first token and 25 ms between tokens after it), which is what separates
+a load the engine serves well from one it merely survives.
+
 Every load point runs `--repeats` times. Repeat r of every point and every arm draws its
 arrivals and request shapes from the same seed, so arms face identical workloads. Rates are
 reported per repeat, so their spread shows; latencies pool all repeats' requests. Each
@@ -189,8 +193,9 @@ def _describe(report: RunReport, kv: KvStats) -> str:
         f" ttft_p50[{shape}]={summary.p50 * 1000:.0f}ms"
         for shape, summary in report.latency.ttft_by_shape.items()
     )
+    goodput = "" if report.goodput_req_s is None else f"goodput={report.goodput_req_s:.2f} req/s "
     return (
-        f"{offered}throughput={report.throughput_req_s:.2f} req/s "
+        f"{offered}throughput={report.throughput_req_s:.2f} req/s {goodput}"
         f"output={report.output_tokens_s:.0f} tok/s{ttft_p50} failures={report.failures} "
         f"preemptions={kv.preemptions} ttft_growth={report.ttft_growth} ({verdict})"
     )
@@ -495,6 +500,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--ready-timeout", type=float, default=120.0, help="seconds to wait for /health"
     )
     add_slo_arguments(parser)
+    # Every run reports goodput, so a load point is judged on requests served well rather
+    # than requests served: a first token within 300 ms and tokens 25 ms apart after it.
+    parser.set_defaults(slo_ttft_ms=300.0, slo_tpot_ms=25.0)
     args = parser.parse_args(argv)
     if args.duration_s is None:
         args.duration_s = 30.0 if args.quick else 100.0

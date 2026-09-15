@@ -178,6 +178,17 @@ def test_goodput_counts_only_requests_meeting_every_slo():
     assert report.slo_attainment["tpot"] is None
 
 
+def test_goodput_holds_a_closed_loop_result_to_every_slo_but_ttft():
+    slow_first_token = _request(latency=0.5, first_token_latency=5.0, output_tokens=5)
+    slo = SLOThresholds(ttft_ms=300, e2e_ms=1000)
+
+    open_loop = build_report([slow_first_token], duration_s=1.0, slo=slo)
+    closed_loop = build_report([_closed_loop(slow_first_token)], duration_s=1.0, slo=slo)
+
+    assert open_loop.goodput_req_s == 0.0
+    assert closed_loop.goodput_req_s == pytest.approx(1 / 0.75)
+
+
 def test_a_point_reports_rates_per_repeat_and_pools_latencies():
     fast, slow = _arrivals([0.1] * 40), _arrivals([0.3] * 40)
     point = build_point([fast, slow], duration_s=40.0)
