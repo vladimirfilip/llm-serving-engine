@@ -3,6 +3,7 @@ import pytest
 from llm_serving_engine.loadgen.report import (
     MIN_QUARTER_REQUESTS,
     SLOThresholds,
+    build_point,
     build_report,
     tpot,
     ttft_growth,
@@ -175,3 +176,20 @@ def test_goodput_counts_only_requests_meeting_every_slo():
     assert report.slo_attainment["ttft"] == pytest.approx(100.0)
     assert report.slo_attainment["e2e"] == pytest.approx(50.0)
     assert report.slo_attainment["tpot"] is None
+
+
+def test_a_point_reports_rates_per_repeat_and_pools_latencies():
+    fast, slow = _arrivals([0.1] * 40), _arrivals([0.3] * 40)
+    point = build_point([fast, slow], duration_s=40.0)
+    assert len(point.repeats) == 2
+    assert point.latency.ttft_by_shape["chat"].count == 80
+    assert point.latency.ttft_by_shape["chat"].max == pytest.approx(0.3)
+
+
+def test_a_point_falls_behind_if_any_repeat_did_and_is_unknown_if_none_could_tell():
+    steady, backlog = _arrivals([0.1] * 40), _arrivals([0.1 * (i + 1) for i in range(40)])
+    short = _arrivals([0.1] * 8)
+    assert build_point([steady, steady], duration_s=40.0).keeps_up is True
+    assert build_point([steady, backlog], duration_s=40.0).keeps_up is False
+    assert build_point([steady, short], duration_s=40.0).keeps_up is True
+    assert build_point([short, short], duration_s=40.0).keeps_up is None

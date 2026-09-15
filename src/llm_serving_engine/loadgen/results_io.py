@@ -14,27 +14,23 @@ from pathlib import Path
 
 from .report import LatencyReport, RunReport, tpot
 
+RAW_FIELDS = [
+    "shape", "success", "error", "scheduled_at_s", "completed_at_s", "latency_s",
+    "first_token_latency_s", "tpot_s", "prompt_tokens", "output_tokens", "num_tokens_received",
+]
+
 
 def sibling(stem: Path, suffix: str) -> Path:
     return stem.with_name(stem.name + suffix)
 
 
-def write_raw(json_path: Path, csv_path: Path, run: dict) -> None:
-    """`run` is `{"target_qps", "duration_s", "results": [...], **extra}`, the shape the
-    plotting functions read. Written verbatim to JSON; flattened to one row per request
-    for CSV.
-    """
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(json.dumps(run, indent=2))
-
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = [
-        "shape", "success", "error", "scheduled_at_s", "completed_at_s", "latency_s",
-        "first_token_latency_s", "tpot_s",
-        "prompt_tokens", "output_tokens", "num_tokens_received",
-    ]
-    with csv_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+def write_run(stem: Path, run: dict, report: RunReport, **fields) -> None:
+    """`run` verbatim to <stem>.json and one row per request to <stem>.csv; `report`, with
+    run-identifying `fields` such as `target_qps`, to <stem>_summary.json/.csv."""
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    sibling(stem, ".json").write_text(json.dumps(run, indent=2))
+    with sibling(stem, ".csv").open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=RAW_FIELDS)
         writer.writeheader()
         for r in run["results"]:
             writer.writerow({
@@ -50,19 +46,19 @@ def write_raw(json_path: Path, csv_path: Path, run: dict) -> None:
                 "output_tokens": r.get("output_tokens"),
                 "num_tokens_received": r.get("num_tokens_received"),
             })
+    _write_summary(sibling(stem, "_summary"), {**fields, **_flatten_report(report)})
 
 
-def write_summary(json_path: Path, csv_path: Path, report: RunReport, **extra) -> None:
-    """Aggregate report for one run, alongside whatever run-identifying `extra` fields
-    the caller wants attached (e.g. `target_qps`, `label`)."""
-    summary = {**extra, **_flatten_report(report)}
+def write_pooled_latency(stem: Path, latency: LatencyReport, **fields) -> None:
+    """Latencies pooled over a point's repeats, to <stem>_pooled_summary.json/.csv."""
+    _write_summary(sibling(stem, "_pooled_summary"), {**fields, **_flatten_latency(latency)})
 
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(json.dumps(summary, indent=2))
 
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with csv_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(summary.keys()))
+def _write_summary(stem: Path, summary: dict) -> None:
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    sibling(stem, ".json").write_text(json.dumps(summary, indent=2))
+    with sibling(stem, ".csv").open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(summary))
         writer.writeheader()
         writer.writerow(summary)
 

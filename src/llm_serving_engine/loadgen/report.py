@@ -73,6 +73,22 @@ class RunReport:
         return self.ttft_growth <= MAX_KEEPING_UP_TTFT_GROWTH
 
 
+@dataclass(slots=True)
+class PointReport:
+    """Repeated runs of one config at one load. Rates keep one value per repeat, so their
+    spread shows; latencies pool every repeat's requests, so tails rest on more samples."""
+
+    repeats: list[RunReport]
+    latency: LatencyReport
+
+    @property
+    def keeps_up(self) -> bool | None:
+        verdicts = [r.keeps_up for r in self.repeats]
+        if False in verdicts:
+            return False
+        return True if True in verdicts else None
+
+
 def tpot(result: dict) -> float | None:
     ftl, latency, output_tokens = (
         result.get("first_token_latency"),
@@ -167,6 +183,15 @@ def build_report(
             "e2e": _attainment_pct(successes, lambda r: r.get("latency"), slo.e2e_ms),
         }
     return report
+
+
+def build_point(
+    runs: list[list[dict]], duration_s: float, slo: SLOThresholds | None = None
+) -> PointReport:
+    return PointReport(
+        repeats=[build_report(results, duration_s, slo) for results in runs],
+        latency=summarize_latencies([r for results in runs for r in results]),
+    )
 
 
 def _satisfies(result: dict, slo: SLOThresholds) -> bool:

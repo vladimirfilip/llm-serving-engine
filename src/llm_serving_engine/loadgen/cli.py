@@ -16,7 +16,7 @@ from pathlib import Path
 from ..model.sampling import SamplingParams
 from .client import WORKLOAD, RequestShape, load_client, request_sender
 from .report import SLOThresholds, build_report
-from .results_io import sibling, write_raw, write_summary
+from .results_io import write_run
 from .timing import open_loop_load_gen
 
 
@@ -97,22 +97,16 @@ def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     results = asyncio.run(_run(args))
 
-    # One run per file, tagged with its offered load: the shape plot_latency_pareto reads,
-    # so a sweep's plots regenerate from the raw files.
+    # One run per file, tagged with its offered load, so a sweep's plots regenerate from the
+    # raw files.
     run = {
         "target_qps": args.target_qps, "duration_s": args.duration_s, "seed": args.seed,
         "results": results,
     }
-    stem = _stem(args.out)
-    write_raw(sibling(stem, ".json"), sibling(stem, ".csv"), run)
-
     report = build_report(results, args.duration_s, slo_from_args(args))
-    summary_stem = stem.with_name(f"{stem.name}_summary")
-    write_summary(
-        sibling(summary_stem, ".json"), sibling(summary_stem, ".csv"), report,
-        target_qps=args.target_qps, duration_s=args.duration_s,
-    )
-    print(f"wrote {len(results)} results to {stem}.json/.csv, summary to {summary_stem}.json/.csv")
+    stem = _stem(args.out)
+    write_run(stem, run, report, target_qps=args.target_qps)
+    print(f"wrote {len(results)} results to {stem}.json/.csv, summary to {stem}_summary.json/.csv")
     if report.keeps_up is not True:
         print(f"keep-up verdict {report.keeps_up}: {report.failures} failures, "
               f"TTFT growth {report.ttft_growth}")
