@@ -42,12 +42,14 @@ from llm_serving_engine.loadgen.client import (
     RequestShape,
     load_client,
     request_sender,
+    send_request,
 )
 from llm_serving_engine.loadgen.gpu_monitor import GpuMonitor
 from llm_serving_engine.loadgen.kv_monitor import KvCacheMonitor
 from llm_serving_engine.loadgen.report import RunReport, build_report
 from llm_serving_engine.loadgen.results_io import sibling, write_raw, write_summary
 from llm_serving_engine.loadgen.timing import closed_loop_load_gen, open_loop_load_gen
+from llm_serving_engine.model.sampling import SamplingParams
 from llm_serving_engine.observability.plotting import (
     plot_ablation_bar,
     plot_ablation_sweep,
@@ -71,8 +73,8 @@ SWEEP_FRACTIONS = (0.25, 0.5, 0.75, 1.0)
 @contextlib.contextmanager
 def _running_server(env_overrides: dict[str, str], ready_timeout: float, log_path: Path):
     """Spawns `llm-serve` with `env_overrides` layered on the current environment and its
-    output in `log_path`, blocks until `/health` answers, and always tears the process down,
-    so a failed run never leaves a stray server holding the port."""
+    output in `log_path`, blocks until `/health` answers and a warm-up has run, and always
+    tears the process down, so a failed run never leaves a stray server holding the port."""
     env = {**os.environ, **env_overrides}
     base_url = f"http://127.0.0.1:{env_overrides['LLM_PORT']}"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -83,6 +85,7 @@ def _running_server(env_overrides: dict[str, str], ready_timeout: float, log_pat
         )
         try:
             _wait_until_healthy(base_url, proc, ready_timeout, log_path)
+            _warm_up(base_url, log_path)
             yield base_url
         finally:
             proc.terminate()
@@ -105,6 +108,22 @@ def _wait_until_healthy(
                 return
         time.sleep(0.5)
     raise TimeoutError(f"server did not become healthy within {timeout}s; see {log_path}")
+
+
+def _warm_up(base_url: str, log_path: Path) -> None:
+    """One short request of every shape before anything is measured: the first iteration at
+    a new prefill size can JIT-compile Triton kernels, a one-off cost that would otherwise land
+    in whichever run goes first."""
+    shapes = {shape.name: shape for shape in WORKLOAD}.values()
+
+    async def run() -> list[dict]:
+        async with load_client(base_url, timeout_s=None) as client:
+            params = SamplingParams(max_tokens=8)
+            return await asyncio.gather(*(send_request(client, s.prompt, params) for s in shapes))
+
+    failed = [r["error"] for r in asyncio.run(run()) if not r["success"]]
+    if failed:
+        raise RuntimeError(f"warm-up requests failed: {failed}; see {log_path}")
 
 
 def _logs(out_dir: Path, name: str) -> Path:
