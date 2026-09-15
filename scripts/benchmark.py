@@ -469,7 +469,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--qps", type=float, nargs="+", default=None,
-        help="pareto: QPS points to sweep (default: [1, 2, 4], or [1, 4] with --quick)",
+        help="pareto: QPS points to sweep (default: 1 2 2.5 3 3.5 4, or 1 3 with --quick)",
     )
     parser.add_argument(
         "--concurrency", type=int, default=MAX_CONCURRENT_SEQUENCES,
@@ -491,7 +491,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.repeats is None:
         args.repeats = 1 if args.quick else 3
     if args.qps is None:
-        args.qps = [1, 4] if args.quick else [1, 2, 4]
+        args.qps = [1, 3] if args.quick else [1, 2, 2.5, 3, 3.5, 4]
     return args
 
 
