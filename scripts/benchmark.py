@@ -44,7 +44,7 @@ from llm_serving_engine.loadgen.client import (
 from llm_serving_engine.loadgen.gpu_monitor import GpuMonitor
 from llm_serving_engine.loadgen.kv_monitor import KvUtilizationMonitor
 from llm_serving_engine.loadgen.report import RunReport, build_report
-from llm_serving_engine.loadgen.results_io import write_raw, write_summary
+from llm_serving_engine.loadgen.results_io import sibling, write_raw, write_summary
 from llm_serving_engine.loadgen.timing import closed_loop_load_gen, open_loop_load_gen
 from llm_serving_engine.observability.plotting import (
     plot_ablation_bar,
@@ -162,7 +162,7 @@ def bench_pareto(args: argparse.Namespace, out_dir: Path) -> None:
             run = {"target_qps": qps, "duration_s": args.duration_s, "results": results}
             report = build_report(results, slo)
             stem = out_dir / "pareto" / f"qps_{qps:g}"
-            write_raw(stem.with_suffix(".json"), stem.with_suffix(".csv"), run)
+            write_raw(sibling(stem, ".json"), sibling(stem, ".csv"), run)
             write_summary(
                 stem.with_name(f"{stem.name}_summary.json"),
                 stem.with_name(f"{stem.name}_summary.csv"),
@@ -221,7 +221,7 @@ def _measure_capacity(
             results = _closed_loop(base_url, args)
     report = build_report(results)
     run = {"concurrency": args.concurrency, "duration_s": args.duration_s, "results": results}
-    write_raw(out_stem.with_suffix(".json"), out_stem.with_suffix(".csv"), run)
+    write_raw(sibling(out_stem, ".json"), sibling(out_stem, ".csv"), run)
     write_summary(
         out_stem.with_name(f"{out_stem.name}_summary.json"),
         out_stem.with_name(f"{out_stem.name}_summary.csv"),
@@ -278,7 +278,7 @@ def _run_ablation(
                     "target_qps": qps, "duration_s": args.duration_s, env_key: arm,
                     "results": results,
                 }
-                write_raw(stem.with_suffix(".json"), stem.with_suffix(".csv"), run)
+                write_raw(sibling(stem, ".json"), sibling(stem, ".csv"), run)
                 write_summary(
                     stem.with_name(f"{stem.name}_summary.json"),
                     stem.with_name(f"{stem.name}_summary.csv"),

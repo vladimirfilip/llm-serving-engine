@@ -15,7 +15,7 @@ from pathlib import Path
 from ..model.sampling import SamplingParams
 from .client import WORKLOAD, RequestShape, load_client, request_sender
 from .report import SLOThresholds, build_report
-from .results_io import write_raw, write_summary
+from .results_io import sibling, write_raw, write_summary
 from .timing import open_loop_load_gen
 
 
@@ -73,6 +73,13 @@ async def _run(args: argparse.Namespace) -> list[dict]:
         return await open_loop_load_gen(args.target_qps, args.duration_s, send)
 
 
+def _stem(out: Path | None) -> Path:
+    """`out` without a .json or .csv suffix, which the writers add back."""
+    if out is None:
+        return Path(f"results_{int(time.time())}")
+    return out.with_suffix("") if out.suffix in (".json", ".csv") else out
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     results = asyncio.run(_run(args))
@@ -80,13 +87,13 @@ def main(argv: list[str] | None = None) -> None:
     # One run per file, tagged with its offered load: the shape plot_latency_pareto reads,
     # so a sweep's plots regenerate from the raw files.
     run = {"target_qps": args.target_qps, "duration_s": args.duration_s, "results": results}
-    stem = (args.out or Path(f"results_{int(time.time())}")).with_suffix("")
-    write_raw(stem.with_suffix(".json"), stem.with_suffix(".csv"), run)
+    stem = _stem(args.out)
+    write_raw(sibling(stem, ".json"), sibling(stem, ".csv"), run)
 
     report = build_report(results, slo_from_args(args))
     summary_stem = stem.with_name(f"{stem.name}_summary")
     write_summary(
-        summary_stem.with_suffix(".json"), summary_stem.with_suffix(".csv"), report,
+        sibling(summary_stem, ".json"), sibling(summary_stem, ".csv"), report,
         target_qps=args.target_qps, duration_s=args.duration_s,
     )
     print(f"wrote {len(results)} results to {stem}.json/.csv, summary to {summary_stem}.json/.csv")

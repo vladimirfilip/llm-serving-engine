@@ -41,6 +41,14 @@ def test_main_writes_the_run_envelope_plotting_reads(tmp_path, monkeypatch):
     assert run["target_qps"] == 3
     assert run["duration_s"] == 2
     assert run["results"] == [result]
+    assert (tmp_path / "run_summary.json").exists()
+
+
+def test_an_out_stem_with_a_fractional_rate_is_kept_whole(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "open_loop_load_gen", lambda *_: _immediate([]))
+    cli.main(["--target-qps", "0.5", "--duration-s", "2", "--out", str(tmp_path / "qps_0.5")])
+    assert (tmp_path / "qps_0.5.json").exists()
+    assert (tmp_path / "qps_0.5_summary.json").exists()
 
 
 async def _immediate(value):

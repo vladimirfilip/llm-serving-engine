@@ -1,5 +1,8 @@
 """Writes a run's raw per-request results and aggregate report to disk in both JSON
 and CSV, so plots can be regenerated from either without rerunning the benchmark.
+
+File names append to a stem rather than replace its suffix: a stem like `qps_0.03` already
+contains a dot, and `Path.with_suffix` would read ".03" as the suffix to replace.
 """
 
 from __future__ import annotations
@@ -10,6 +13,10 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .report import RunReport, tpot
+
+
+def sibling(stem: Path, suffix: str) -> Path:
+    return stem.with_name(stem.name + suffix)
 
 
 def write_raw(json_path: Path, csv_path: Path, run: dict) -> None:
