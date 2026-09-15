@@ -80,7 +80,7 @@ def test_decode_finishes_at_max_tokens(runner):
 
 def test_any_listed_eos_token_finishes_a_sequence(runner, monkeypatch):
     monkeypatch.setattr(runner, "eos_token_ids", eos_token_ids([999, 111]))
-    monkeypatch.setattr(model_runner_module, "sample_token", lambda *_: torch.tensor(111))
+    monkeypatch.setattr(model_runner_module, "sample_tokens", lambda *_: torch.tensor([111]))
     seq = _greedy(5, [1, 2], max_tokens=50)
 
     [(_, token, finished)] = _run(runner, seq, admit(seq, 2))

@@ -12,8 +12,7 @@ from llm_serving_engine.model.decode_graph import decode_graph_buckets
 from llm_serving_engine.model.model_runner import ModelRunner
 from llm_serving_engine.scheduling.allocator import BlockAllocator
 from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
-from tests.factories import admit
-from tests.test_fused_forward import greedy, load_runner
+from tests.factories import admit, greedy, load_runner
 
 pytestmark = pytest.mark.cuda
 

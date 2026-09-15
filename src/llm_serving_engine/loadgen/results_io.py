@@ -22,7 +22,8 @@ def write_raw(json_path: Path, csv_path: Path, run: dict) -> None:
 
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
-        "success", "error", "latency_s", "first_token_latency_s", "tpot_s",
+        "success", "error", "scheduled_at_s", "completed_at_s", "latency_s",
+        "first_token_latency_s", "tpot_s",
         "prompt_tokens", "output_tokens", "num_tokens_received",
     ]
     with csv_path.open("w", newline="") as f:
@@ -32,6 +33,8 @@ def write_raw(json_path: Path, csv_path: Path, run: dict) -> None:
             writer.writerow({
                 "success": r.get("success", True),
                 "error": r.get("error"),
+                "scheduled_at_s": r.get("scheduled_at"),
+                "completed_at_s": r.get("completed_at"),
                 "latency_s": r.get("latency"),
                 "first_token_latency_s": r.get("first_token_latency"),
                 "tpot_s": tpot(r),
@@ -58,6 +61,10 @@ def write_summary(json_path: Path, csv_path: Path, report: RunReport, **extra) -
 
 def _flatten_report(report: RunReport) -> dict:
     flat: dict = {
+        "wall_clock_s": report.wall_clock_s,
+        "failures": report.failures,
+        "latency_growth": report.latency_growth,
+        "keeps_up": report.keeps_up,
         "throughput_req_s": report.throughput_req_s,
         "output_tokens_s": report.output_tokens_s,
         "input_tokens_s": report.input_tokens_s,

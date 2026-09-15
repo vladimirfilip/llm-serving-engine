@@ -6,20 +6,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from llm_serving_engine.config import ModelConfig
 from llm_serving_engine.model.model_runner import ModelRunner
-from llm_serving_engine.model.sampling import SamplingParams
 from llm_serving_engine.scheduling.allocator import BlockAllocator
 from llm_serving_engine.scheduling.batch_plan import BatchEntry, BatchPlan
-from tests.factories import admit, make_sequence
+from tests.factories import admit, greedy, load_runner
 
 pytestmark = pytest.mark.cuda
-
-
-def load_runner(path, **overrides) -> ModelRunner:
-    fields = dict(model_name_or_path=str(path), device="cuda", dtype="float32")
-    fields.update(overrides)
-    return ModelRunner(ModelConfig(**fields))
 
 
 @pytest.fixture(scope="module")
@@ -32,11 +24,6 @@ def paged_runner(tiny_llama_dir) -> ModelRunner:
     runner = load_runner(tiny_llama_dir)
     runner.allocate_kv_pool(num_blocks=64, block_size=4)
     return runner
-
-
-def greedy(seq_id: int, prompt: list[int]):
-    params = SamplingParams(temperature=0.0, max_tokens=8)
-    return make_sequence(seq_id=seq_id, prompt_tokens=prompt, sampling_params=params)
 
 
 def decode_entry(seq) -> BatchEntry:

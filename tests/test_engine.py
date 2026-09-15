@@ -1,10 +1,14 @@
 import asyncio
-import time
 
 import pytest
 
-from llm_serving_engine.config import EngineConfig, KVCacheConfig, ModelConfig, ServerConfig
-from llm_serving_engine.engine import EngineUnavailable, InferenceEngine, sequence_from_ingress
+from llm_serving_engine.config import EngineConfig, ModelConfig, ServerConfig
+from llm_serving_engine.engine import (
+    EngineUnavailable,
+    InferenceEngine,
+    InvalidPrompt,
+    sequence_from_ingress,
+)
 from llm_serving_engine.model.decode_graph import decode_graph_buckets
 from llm_serving_engine.model.sampling import SamplingParams
 from llm_serving_engine.observability.metrics_export import REGISTRY
@@ -14,47 +18,14 @@ from llm_serving_engine.scheduling.scheduler import (
     ContinuousBatchedScheduler,
     StaticBatchedScheduler,
 )
-
-TOKEN = 7
-
-
-class FakeTokenizer:
-    def encode_prompt(self, text: str) -> list[int]:
-        return [ord(c) for c in text]
-
-
-class FakeModelRunner:
-    """No weights: every sequence that owes a token gets TOKEN, finishing at max_tokens."""
-
-    device = "cpu"
-
-    def __init__(self):
-        self.kv_pool_calls: list[tuple[int, int]] = []
-        self.captured_buckets: list[list[int]] = []
-        self.freed: list[int] = []
-        self.fail_next_forward = False
-
-    def forward(self, plan, seqs):
-        if self.fail_next_forward:
-            self.fail_next_forward = False
-            raise RuntimeError("injected forward failure")
-        results = []
-        for entry in plan:
-            seq = seqs[entry.seq_id]
-            if entry.is_prefill_chunk and seq.status == "PREFILLING":
-                continue
-            finished = len(seq.generated_tokens) + 1 >= seq.sampling_params.max_tokens
-            results.append((seq.seq_id, TOKEN, finished))
-        return results
-
-    def allocate_kv_pool(self, num_blocks, block_size):
-        self.kv_pool_calls.append((num_blocks, block_size))
-
-    def capture_decode_graphs(self, bucket_sizes):
-        self.captured_buckets.append(bucket_sizes)
-
-    def free(self, seq_id):
-        self.freed.append(seq_id)
+from tests.factories import (
+    TOKEN,
+    FakeModelRunner,
+    FakeTokenizer,
+    make_config,
+    read_stream,
+    wait_until,
+)
 
 
 class FailingScheduler(ContinuousBatchedScheduler):
@@ -64,30 +35,9 @@ class FailingScheduler(ContinuousBatchedScheduler):
         return super().scheduler_step(running, waiting, allocator)
 
 
-def make_config(**overrides) -> EngineConfig:
-    model = overrides.pop("model", ModelConfig())
-    kv_cache = overrides.pop("kv_cache", KVCacheConfig())
-    server = overrides.pop("server", ServerConfig())
-    return EngineConfig(model=model, kv_cache=kv_cache, server=server, **overrides)
-
-
 def make_engine(config: EngineConfig | None = None, **kwargs) -> InferenceEngine:
     kwargs.setdefault("model_runner", FakeModelRunner())
     return InferenceEngine(config=config or make_config(), tokenizer=FakeTokenizer(), **kwargs)
-
-
-async def read_stream(q: asyncio.Queue) -> list:
-    items = []
-    while not items or items[-1] not in (DONE, ABORTED):
-        items.append(await asyncio.wait_for(q.get(), timeout=5))
-    return items
-
-
-def wait_until(condition, timeout: float = 5) -> None:
-    deadline = time.monotonic() + timeout
-    while not condition():
-        assert time.monotonic() < deadline, "condition never held"
-        time.sleep(0.005)
 
 
 def test_submit_tokenizes_and_hands_off_to_the_scheduler_thread():
@@ -110,6 +60,14 @@ def test_seq_ids_are_never_reused_across_engines():
     first = make_engine().submit("a", SamplingParams()).seq_id
     second = make_engine().submit("a", SamplingParams()).seq_id
     assert first != second
+
+
+@pytest.mark.parametrize("prompt", ["", "\u0100"])  # no tokens; token id 256 == vocab_size
+def test_a_prompt_the_model_cannot_run_is_rejected_at_submit(prompt):
+    engine = make_engine()
+    with pytest.raises(InvalidPrompt):
+        engine.submit(prompt, SamplingParams())
+    assert engine.ingress.empty()
 
 
 def test_a_closed_engine_rejects_submissions():
@@ -159,6 +117,24 @@ async def test_a_failed_forward_aborts_its_batch_and_the_engine_keeps_serving():
         await asyncio.to_thread(wait_until, lambda: engine.is_idle)
         assert engine.healthy
         assert engine.kv_utilization == 0.0
+    finally:
+        engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_forward_failure_that_loses_the_device_fails_the_engine():
+    runner = FakeModelRunner()
+    runner.fail_next_forward = True
+    runner.device_lost = True
+    engine = make_engine(model_runner=runner)
+    engine.bind_loop(asyncio.get_running_loop())
+    engine.start()
+    try:
+        submission = engine.submit("hi", SamplingParams())
+        assert await read_stream(submission.output_queue) == [ABORTED]
+        await asyncio.to_thread(wait_until, lambda: not engine.healthy)
+        with pytest.raises(EngineUnavailable):
+            engine.submit("hi", SamplingParams())
     finally:
         engine.stop()
 
@@ -232,37 +208,38 @@ def test_contiguous_allocator_matches_the_paged_pool_capacity():
     assert contiguous.allocator.capacity_tokens == paged.allocator.num_blocks * 16
 
 
-def test_the_kv_pool_matches_the_allocator():
+def test_the_kv_pool_matches_the_allocator_and_exists_before_graph_capture():
     runner = FakeModelRunner()
     make_engine(allocator=BlockAllocator(num_blocks=10, block_size=4), model_runner=runner)
-    assert runner.kv_pool_calls == [(10, 4)]
+    captures = ["capture_decode_graphs", "capture_piecewise_graphs"]
+    assert [call[0] for call in runner.setup_calls] == ["allocate_kv_pool", *captures]
+    assert runner.setup_calls[0] == ("allocate_kv_pool", 10, 4)
 
 
 def test_contiguous_allocator_allocates_no_pool_and_captures_no_graphs():
     runner = FakeModelRunner()
     make_engine(make_config(kv_allocator="contiguous"), model_runner=runner)
-    assert runner.kv_pool_calls == []
-    assert runner.captured_buckets == []
+    assert runner.setup_calls == []
 
 
 def test_without_custom_kernels_there_is_no_pool():
     runner = FakeModelRunner()
     make_engine(make_config(model=ModelConfig(use_custom_kernels=False)), model_runner=runner)
-    assert runner.kv_pool_calls == []
+    assert runner.setup_calls == []
 
 
-def test_decode_graphs_cover_the_largest_batch_the_scheduler_can_run():
+def test_graphs_cover_the_largest_batch_and_token_count_the_scheduler_can_plan():
     runner = FakeModelRunner()
-    make_engine(make_config(max_concurrent_sequences=64), model_runner=runner)
-    assert runner.kv_pool_calls  # graphs capture into the pool, so the pool comes first
-    [buckets] = runner.captured_buckets
-    assert max(buckets) >= 64
+    make_engine(make_config(max_concurrent_sequences=64, token_budget=4096), model_runner=runner)
+    buckets = dict(runner.setup_calls[1:])
+    assert max(buckets["capture_decode_graphs"]) >= 64
+    assert max(buckets["capture_piecewise_graphs"]) >= 4096 + 64
 
 
 def test_use_cuda_graphs_off_skips_capture():
     runner = FakeModelRunner()
     make_engine(make_config(model=ModelConfig(use_cuda_graphs=False)), model_runner=runner)
-    assert runner.captured_buckets == []
+    assert [call[0] for call in runner.setup_calls] == ["allocate_kv_pool"]
 
 
 def test_decode_graph_buckets_pad_any_batch_by_under_2x():

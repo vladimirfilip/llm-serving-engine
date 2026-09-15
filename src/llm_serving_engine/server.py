@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from .config import EngineConfig, KVCacheConfig
-from .engine import EngineUnavailable, InferenceEngine, Submission
+from .engine import EngineUnavailable, InferenceEngine, InvalidPrompt, Submission
 from .model.model_runner import ModelRunner
 from .model.sampling import SamplingParams
 from .model.tokenizer import TokenizerWrapper
@@ -208,6 +208,8 @@ def create_app(engine: InferenceEngine | EngineHandle) -> FastAPI:
             submission = engine.submit(body.prompt, _sampling_params(body))
         except EngineUnavailable as e:
             raise HTTPException(status_code=503, detail=str(e)) from e
+        except InvalidPrompt as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
         async def stream() -> AsyncIterator[str]:
             seq_id, tokenizer = submission.seq_id, submission.tokenizer

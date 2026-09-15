@@ -2,14 +2,15 @@
 
 Q may be shorter than K/V for incremental decoding (a KV cache holds `query_offset`
 prior tokens). The causal mask compares each query's true position, `query_offset + row`,
-against each key position, so Q and K/V need not match in length. The backward pass
-assumes query_offset=0: this engine never trains against a cache.
+against each key position, so Q and K/V need not match in length. Forward only: this
+engine never trains.
 
-Notation follows the FlashAttention-2 paper: Q, K, V, O for the tensors, L for
-the saved log-sum-exp, m and l for the running max and denominator.
+Notation follows the FlashAttention-2 paper: Q, K, V, O for the tensors, m and l for the
+running max and denominator. Under grouped-query attention, N_GROUPS query heads share
+each K/V head; both kernels read the shared head in place.
 
     from llm_serving_engine.kernels.flash_attention import flash_attention_forward
-    out, L = flash_attention_forward(Q, K, V, is_causal=True, query_offset=0)
+    O = flash_attention_forward(Q, K, V, is_causal=True, query_offset=0)
 
 `paged_attention_2`/`paged_attention_forward` is the batched, inference-only sibling:
 one launch covers every entry in a BatchPlan against a shared per-layer K/V pool,
@@ -23,24 +24,11 @@ import triton
 import triton.language as tl
 
 
-def naive_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
-                    is_causal: bool = False, query_offset: int = 0) -> torch.Tensor:
-    """Q: (batch, n_heads, seq_q, head_dim); K, V: (batch, n_heads, seq_k, head_dim)."""
-    d = Q.shape[-1]
-    S = (Q @ K.transpose(-1, -2)) / math.sqrt(d)
-    if is_causal:
-        nq, nk = Q.shape[-2], K.shape[-2]
-        row = torch.arange(nq, device=Q.device)[:, None] + query_offset
-        col = torch.arange(nk, device=Q.device)[None, :]
-        S = S.masked_fill(row < col, float('-inf'))
-    return torch.softmax(S, dim=-1) @ V
-
 # Grid: (N_Q // BLOCK_M, Z * H). Z=batches, H=heads, N_Q=query positions,
 # N_K=key/value positions (cache + new).
 @triton.jit
 def flash_attention_2(
     Q, K, V, O,
-    L,
     stride_qz, stride_qh, stride_qm, stride_qd,
     stride_kz, stride_kh, stride_kn, stride_kd,
     stride_vz, stride_vh, stride_vn, stride_vd,
@@ -54,6 +42,7 @@ def flash_attention_2(
     BLOCK_D: tl.constexpr,   # head dim, rounded up to a power of 2
     IS_CAUSAL: tl.constexpr,
     PRECISION: tl.constexpr, # "ieee" for true fp32, "tf32" for tensor cores
+    N_GROUPS: tl.constexpr,  # query heads per K/V head
 ):
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -62,8 +51,9 @@ def flash_attention_2(
     off_h = off_hz % H
 
     q_offset = off_z * stride_qz + off_h * stride_qh
-    k_offset = off_z * stride_kz + off_h * stride_kh
-    v_offset = off_z * stride_vz + off_h * stride_vh
+    off_kv_h = off_h // N_GROUPS
+    k_offset = off_z * stride_kz + off_kv_h * stride_kh
+    v_offset = off_z * stride_vz + off_kv_h * stride_vh
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
 
@@ -124,9 +114,6 @@ def flash_attention_2(
 
     acc = acc / running_denom[:, None]
 
-    L_ptrs = L + off_hz * N_Q + offs_m
-    tl.store(L_ptrs, running_max + tl.log(running_denom), mask=m_mask)
-
     o_ptrs = O + off_z * stride_oz + off_h * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
     tl.store(o_ptrs, acc, mask=m_mask[:, None] & d_mask[None, :])
 
@@ -162,13 +149,15 @@ def _oom_hint(
 
 def flash_attention_forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                             is_causal: bool = False, query_offset: int = 0):
-    """Q: (Z, H, N_Q, D); K, V: (Z, H, N_K, D). N_Q and N_K may differ: a decode step
-    passes N_Q=1 against the sequence's full cached N_K, with query_offset=N_K-N_Q so the
-    causal mask compares true sequence positions.
+    """Q: (Z, H, N_Q, D); K, V: (Z, H_KV, N_K, D) with H a multiple of H_KV. Returns O,
+    shaped like Q. N_Q and N_K may differ: a decode step passes N_Q=1 against the
+    sequence's full cached N_K, with query_offset=N_K-N_Q so the causal mask compares true
+    sequence positions.
     """
     Z, H, N_Q, D = q.shape
-    Zk, Hk, N_K, Dk = k.shape
-    assert (Z, H, D) == (Zk, Hk, Dk), "Q and K/V must share batch, heads, and head_dim"
+    Zk, H_KV, N_K, Dk = k.shape
+    assert (Z, D) == (Zk, Dk), "Q and K/V must share batch and head_dim"
+    assert H % H_KV == 0, f"query heads ({H}) must be a multiple of KV heads ({H_KV})"
     assert k.shape == v.shape, "K, V shapes don't match"
     assert q.dtype == k.dtype == v.dtype, "Q, K, V must share a dtype"
     assert q.dtype in _TILES, (
@@ -181,16 +170,13 @@ def flash_attention_forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     )
 
     o = torch.empty_like(q)
-    L = torch.empty((Z, H, N_Q), device=q.device, dtype=torch.float32)
-
     BLOCK_M, BLOCK_N = _TILES[q.dtype]
     BLOCK_D = triton.next_power_of_2(D)
-
     grid = (triton.cdiv(N_Q, BLOCK_M), Z * H)
 
     try:
         flash_attention_2[grid](
-            q, k, v, o, L,
+            q, k, v, o,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
@@ -204,11 +190,12 @@ def flash_attention_forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
             BLOCK_D=BLOCK_D,
             IS_CAUSAL=is_causal,
             PRECISION=_softmax_precision(q.dtype),
+            N_GROUPS=H // H_KV,
         )
     except triton.runtime.errors.OutOfResources as e:
         raise _oom_hint(e, D, q.dtype, BLOCK_M, BLOCK_N) from None
 
-    return o, L
+    return o
 
 
 @triton.jit
@@ -343,37 +330,3 @@ def paged_attention_forward(
         raise _oom_hint(e, D, q.dtype, BLOCK_M, BLOCK_N) from None
 
     return o
-
-
-def flash_attention_backward(Q, K, V, O, L, dO, is_causal, scale):
-    """Training has no KV cache, so query_offset is always 0 here."""
-    S = (Q @ K.transpose(-1, -2)) * scale
-    if is_causal:
-        nq, nk = Q.shape[-2], K.shape[-2]
-        mask = torch.tril(torch.ones(nq, nk, dtype=torch.bool, device=Q.device))
-        S = S.masked_fill(~mask, -1e6)
-    P = torch.exp(S - L.unsqueeze(-1))
-    dV = P.transpose(-1, -2) @ dO
-    dP = dO @ V.transpose(-1, -2)
-    Dv = (dO * O).sum(dim=-1, keepdim=True)
-    dS = P * (dP - Dv)
-    dQ = (dS @ K) * scale
-    dK = (dS.transpose(-1, -2) @ Q) * scale
-    return dQ, dK, dV
-
-
-class FlashAttentionTriton(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, Q, K, V, is_causal=False):
-        O, L = flash_attention_forward(Q, K, V, is_causal)
-        ctx.save_for_backward(Q, K, V, O, L)
-        ctx.is_causal = is_causal
-        ctx.scale = 1.0 / math.sqrt(Q.shape[-1])
-        return O
-
-    @staticmethod
-    def backward(ctx, dO):
-        Q, K, V, O, L = ctx.saved_tensors
-        dQ, dK, dV = flash_attention_backward(Q, K, V, O, L, dO.contiguous(),
-                                              ctx.is_causal, ctx.scale)
-        return dQ, dK, dV, None

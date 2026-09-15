@@ -23,10 +23,6 @@ def test_encode_decode_roundtrip(wrapper):
     assert wrapper.decode(ids) == "Hello, world!"
 
 
-def test_eos_token_id_is_int(wrapper):
-    assert isinstance(wrapper.eos_token_id, int)
-
-
 def test_streamed_pieces_join_to_the_full_decode(wrapper):
     ids = wrapper.encode("The quick brown fox jumps over the lazy dog")
     assert "".join(stream(wrapper, 1, ids)) == wrapper.decode(ids)

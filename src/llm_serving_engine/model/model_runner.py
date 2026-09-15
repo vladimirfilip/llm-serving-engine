@@ -1,16 +1,20 @@
 """Model loading and the GPU worker's per-iteration forward pass.
 
-`forward` takes one of three paths:
+`forward` takes one of four paths:
 - Without custom kernels, one HF call per plan entry, against that sequence's own
   `past_key_values`.
-- `forward_fused` flattens the plan into one (1, total_tokens) batch and runs the decoder
-  layer by layer on Triton attention. With a paged pool, one attention launch per layer
-  covers every entry; with the contiguous allocator, each entry attends over its own buffer.
-- A pure-decode plan that fits a captured bucket replays that bucket's CUDA graph.
+- A pure-decode plan that fits a decode bucket replays that bucket's full CUDA graph.
+- Any other plan whose token count fits a piecewise bucket replays that bucket's graph
+  segments, with paged attention launched eagerly between them.
+- `forward_fused` runs the rest eagerly: it flattens the plan into one (1, total_tokens)
+  batch and runs the decoder layer by layer on Triton attention. With a paged pool, one
+  attention launch per layer covers every entry; with the contiguous allocator, each entry
+  attends over its own buffer.
 """
 
 from __future__ import annotations
 
+import gc
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -23,8 +27,9 @@ from ..kernels.flash_attention import flash_attention_forward, paged_attention_f
 from ..scheduling.batch_plan import BatchEntry, BatchPlan
 from ..scheduling.sequence import Sequence
 from .decode_graph import DecodeGraphRunner
-from .paged_batch import PagedBatch, pinned
-from .sampling import sample_token
+from .paged_batch import PagedBatch, PagingRows, pinned
+from .piecewise_graph import PiecewiseGraphRunner
+from .sampling import sample_tokens
 
 if TYPE_CHECKING:
     from transformers import PreTrainedModel
@@ -52,6 +57,7 @@ class ModelRunner:
         self.n_kv_heads = getattr(cfg, "num_key_value_heads", self.n_heads)
         self.head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // self.n_heads
         self.eos_token_ids = eos_token_ids(self.model.generation_config.eos_token_id)
+        self.vocab_size = self.model.get_input_embeddings().num_embeddings
 
         self._past_key_values: dict[int, Any] = {}
         # layer_idx -> seq_id -> (K, V, filled); K and V are (1, n_kv_heads, capacity, head_dim).
@@ -62,6 +68,8 @@ class ModelRunner:
         self._block_size: int | None = None
         self._scratch_block_id: int | None = None
         self._decode_graphs = DecodeGraphRunner(self)
+        self._piecewise_graphs = PiecewiseGraphRunner(self)
+        self._graph_warmup_stream: torch.cuda.Stream | None = None
 
         if config.use_custom_kernels:
             self.check_custom_kernel_support()
@@ -85,6 +93,17 @@ class ModelRunner:
                 f"custom kernels need head_dim >= 16 in {dtype}, got {self.head_dim}"
             )
 
+    def device_usable(self) -> bool:
+        """False once a CUDA error has poisoned this process's context: every later CUDA
+        call, this synchronize included, raises again."""
+        if not self.device.startswith("cuda"):
+            return True
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError:
+            return False
+        return True
+
     def allocate_kv_pool(self, num_blocks: int, block_size: int) -> None:
         """One K and one V pool per layer, addressed by the block ids BlockAllocator hands
         out. Row `num_blocks` is never handed out: it is the write target for a graphed
@@ -96,8 +115,57 @@ class ModelRunner:
         self._k_pool = [torch.empty(shape, device=self.device, dtype=dtype) for _ in self._layers]
         self._v_pool = [torch.empty(shape, device=self.device, dtype=dtype) for _ in self._layers]
 
+    def graph_warmup_stream(self) -> torch.cuda.Stream:
+        """The one side stream every capture warms up on. PyTorch keeps a cuBLAS workspace
+        per stream for the life of the process, so a stream per capture leaks one each."""
+        if self._graph_warmup_stream is None:
+            self._graph_warmup_stream = torch.cuda.Stream()
+        return self._graph_warmup_stream
+
     def capture_decode_graphs(self, bucket_sizes: list[int]) -> None:
         self._decode_graphs.capture(bucket_sizes)
+
+    def capture_piecewise_graphs(self, bucket_sizes: list[int]) -> None:
+        self._piecewise_graphs.capture(bucket_sizes)
+
+    def bytes_beyond_kv_pool(
+        self,
+        block_size: int,
+        max_tokens: int,
+        decode_buckets: list[int],
+        piecewise_buckets: list[int],
+    ) -> int:
+        """GPU memory a KV pool must leave free: what the CUDA graphs keep reserved once
+        captured, plus the peak an eager `max_tokens` iteration allocates on top. Measured
+        against a pool of one block, all of which is released before returning."""
+        gc.collect()
+        torch.cuda.empty_cache()
+        before = torch.cuda.memory_reserved()
+        self.allocate_kv_pool(1, block_size)
+        if decode_buckets:
+            self.capture_decode_graphs(decode_buckets)
+        if piecewise_buckets:
+            self.capture_piecewise_graphs(piecewise_buckets)
+        torch.cuda.empty_cache()
+        graphs = torch.cuda.memory_reserved() - before
+
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        allocated = torch.cuda.memory_allocated()
+        self._piecewise_graphs.run_eager_dummy(max_tokens)
+        torch.cuda.synchronize()
+        activations = torch.cuda.max_memory_allocated() - allocated
+        self.release_kv_pool()
+        return graphs + activations
+
+    def release_kv_pool(self) -> None:
+        """Drops the pool and every graph captured against it."""
+        self._k_pool = self._v_pool = None
+        self._block_size = self._scratch_block_id = None
+        self._decode_graphs = DecodeGraphRunner(self)
+        self._piecewise_graphs = PiecewiseGraphRunner(self)
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def forward(self, plan: BatchPlan, seqs: dict[int, Sequence]) -> IterationResults:
         """One GPU-worker iteration. A prefill chunk that leaves its sequence PREFILLING
@@ -108,6 +176,9 @@ class ModelRunner:
             bucket = self._decode_graphs.bucket_for(len(plan))
             if bucket is not None:
                 return self._decode_graphs.replay(plan, seqs, bucket)
+        bucket = self._piecewise_graphs.bucket_for(sum(entry.n_tokens for entry in plan))
+        if bucket is not None:
+            return self._piecewise_graphs.replay(plan, seqs, bucket)
         return self.forward_fused(plan, seqs)
 
     @torch.no_grad()
@@ -132,22 +203,12 @@ class ModelRunner:
     def forward_fused(self, plan: BatchPlan, seqs: dict[int, Sequence]) -> IterationResults:
         input_ids, position_ids, offsets = self._flatten_plan(plan, seqs)
         if self._k_pool is not None:
-            paging = self._prepare_paging(plan, seqs, offsets)
+            paging = self._paging_rows(plan, seqs, offsets).to_device(self.device)
             attend = partial(self.paged_attention, paging=paging)
         else:
             attend = partial(self.contiguous_attention, plan=plan, seqs=seqs, offsets=offsets)
         hidden = self.decoder_hidden(input_ids, position_ids, attend)
-
-        owed = [
-            (seqs[entry.seq_id], end - 1)
-            for entry, (_start, end) in zip(plan, offsets, strict=True)
-            if _owes_token(entry, seqs[entry.seq_id])
-        ]
-        if not owed:
-            return []
-        last_rows = torch.tensor([row for _seq, row in owed], device=self.device)
-        logits = self.model.get_output_embeddings()(hidden[0, last_rows])
-        return self.emit_tokens(logits, [seq for seq, _row in owed])
+        return self.emit_owed(hidden, plan, seqs, offsets)
 
     def decoder_hidden(
         self, input_ids: torch.Tensor, position_ids: torch.Tensor, attend: Attend
@@ -163,10 +224,10 @@ class ModelRunner:
         return self.model.model.norm(hidden)
 
     def emit_tokens(self, logits: torch.Tensor, owed: list[Sequence]) -> IterationResults:
-        """Samples row i of `logits` for owed[i], with one host sync for the whole batch."""
-        tokens = torch.stack(
-            [sample_token(logits[i], seq.sampling_params) for i, seq in enumerate(owed)]
-        ).tolist()
+        """Samples row i of `logits` for owed[i], with one host sync for the whole batch.
+        Rows past len(owed) are a graph bucket's padding."""
+        params = [seq.sampling_params for seq in owed]
+        tokens = sample_tokens(logits[: len(owed)], params).tolist()
         return [
             (
                 seq.seq_id,
@@ -177,11 +238,11 @@ class ModelRunner:
             for seq, token in zip(owed, tokens, strict=True)
         ]
 
-    def _flatten_plan(
+    def _flat_rows(
         self, plan: BatchPlan, seqs: dict[int, Sequence]
-    ) -> tuple[torch.Tensor, torch.Tensor, list[tuple[int, int]]]:
-        """input_ids and position_ids, each (1, total_tokens): every entry's tokens in plan
-        order. offsets[i] is entry i's [start, end) span."""
+    ) -> tuple[list[int], list[int], list[tuple[int, int]]]:
+        """Token ids and positions of every entry in plan order, and offsets[i], entry i's
+        [start, end) span of them."""
         token_ids: list[int] = []
         positions: list[int] = []
         offsets: list[tuple[int, int]] = []
@@ -194,51 +255,57 @@ class ModelRunner:
             offsets.append((len(token_ids), len(token_ids) + entry.n_tokens))
             token_ids.extend(_entry_token_ids(entry, seq))
             positions.extend(range(start_pos, start_pos + entry.n_tokens))
+        return token_ids, positions, offsets
+
+    def _flatten_plan(
+        self, plan: BatchPlan, seqs: dict[int, Sequence]
+    ) -> tuple[torch.Tensor, torch.Tensor, list[tuple[int, int]]]:
+        """input_ids and position_ids, each (1, total_tokens), and entry offsets."""
+        token_ids, positions, offsets = self._flat_rows(plan, seqs)
         ids = pinned([token_ids, positions], torch.int64).to(self.device, non_blocking=True)
         return ids[0:1], ids[1:2], offsets
 
-    def _prepare_paging(
+    def _paging_rows(
         self, plan: BatchPlan, seqs: dict[int, Sequence], offsets: list[tuple[int, int]]
-    ) -> PagedBatch:
+    ) -> PagingRows:
         """Reads each BlockTable after scheduler_step grew it, so num_tokens already
         counts this call's tokens."""
         block_size = self._block_size
         tables = [seqs[entry.seq_id].block_table for entry in plan]
         max_blocks = max(len(table.physical_blocks) for table in tables)
-
-        block_table: list[list[int]] = []
-        context_len: list[int] = []
-        query_offset: list[int] = []
-        q_start: list[int] = []
-        q_len: list[int] = []
-        dest_block_id: list[int] = []
-        dest_within: list[int] = []
+        rows = PagingRows([], [], [], [], [], [], [])
         for table, (start, end) in zip(tables, offsets, strict=True):
             physical = table.physical_blocks
             cached = table.num_tokens - (end - start)
-            block_table.append(physical + [0] * (max_blocks - len(physical)))
-            context_len.append(table.num_tokens)
-            query_offset.append(cached)
-            q_start.append(start)
-            q_len.append(end - start)
+            rows.block_table.append(physical + [0] * (max_blocks - len(physical)))
+            rows.context_len.append(table.num_tokens)
+            rows.query_offset.append(cached)
+            rows.q_start.append(start)
+            rows.q_len.append(end - start)
             for pos in range(cached, table.num_tokens):
-                dest_block_id.append(physical[pos // block_size])
-                dest_within.append(pos % block_size)
+                rows.dest_block_id.append(physical[pos // block_size])
+                rows.dest_within.append(pos % block_size)
+        return rows
 
-        d = self.device
-        per_entry = pinned([context_len, query_offset, q_start, q_len], torch.int32)
-        per_entry = per_entry.to(d, non_blocking=True)
-        dest = pinned([dest_block_id, dest_within], torch.int64).to(d, non_blocking=True)
-        return PagedBatch(
-            block_table=pinned(block_table, torch.int32).to(d, non_blocking=True),
-            context_len=per_entry[0],
-            query_offset=per_entry[1],
-            q_start=per_entry[2],
-            q_len=per_entry[3],
-            max_q_len=max(q_len),
-            dest_block_id=dest[0],
-            dest_within=dest[1],
-        )
+    def emit_owed(
+        self,
+        hidden: torch.Tensor,
+        plan: BatchPlan,
+        seqs: dict[int, Sequence],
+        offsets: list[tuple[int, int]],
+    ) -> IterationResults:
+        """lm_head and sampling over the last token of every entry that owes one.
+        `hidden` is final-norm output, (1, >= total_tokens, hidden_size)."""
+        owed = [
+            (seqs[entry.seq_id], end - 1)
+            for entry, (_start, end) in zip(plan, offsets, strict=True)
+            if _owes_token(entry, seqs[entry.seq_id])
+        ]
+        if not owed:
+            return []
+        last_rows = torch.tensor([row for _seq, row in owed], device=self.device)
+        logits = self.model.get_output_embeddings()(hidden[0, last_rows])
+        return self.emit_tokens(logits, [seq for seq, _row in owed])
 
     def _project_qkv(
         self,
@@ -265,17 +332,40 @@ class ModelRunner:
         layer_idx: int,
         paging: PagedBatch,
     ) -> torch.Tensor:
-        """Writes this call's K/V into the pool slots `paging` resolved, then one kernel
-        launch attends every entry through its own block table."""
+        """The three halves below in order: K/V write and q, one kernel launch over every
+        entry's block table, o_proj."""
+        q = self.write_kv_and_project_q(
+            normed, position_embeddings, layer_idx, paging.dest_block_id, paging.dest_within
+        )
+        return self.attention_output(self.attend_paged(q, layer_idx, paging), layer_idx)
+
+    def write_kv_and_project_q(
+        self,
+        normed: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        layer_idx: int,
+        dest_block_id: torch.Tensor,
+        dest_within: torch.Tensor,
+    ) -> torch.Tensor:
+        """Writes this layer's new K/V into the pool slots `dest_*` name; returns q as
+        (n_heads, total_tokens, head_dim)."""
         q, k, v = self._project_qkv(normed, position_embeddings, layer_idx)
-        k_pool, v_pool = self._k_pool[layer_idx], self._v_pool[layer_idx]
-        k_pool[paging.dest_block_id, paging.dest_within] = k[0].transpose(0, 1)
-        v_pool[paging.dest_block_id, paging.dest_within] = v[0].transpose(0, 1)
-        out = paged_attention_forward(
-            q[0], k_pool, v_pool, paging.block_table, paging.context_len, paging.query_offset,
-            paging.q_start, paging.q_len, self._block_size, paging.max_q_len,
-        )  # (n_heads, total_tokens, head_dim)
-        out = out.transpose(0, 1).reshape(1, normed.shape[1], self.n_heads * self.head_dim)
+        self._k_pool[layer_idx][dest_block_id, dest_within] = k[0].transpose(0, 1)
+        self._v_pool[layer_idx][dest_block_id, dest_within] = v[0].transpose(0, 1)
+        return q[0]
+
+    def attend_paged(self, q: torch.Tensor, layer_idx: int, paging: PagedBatch) -> torch.Tensor:
+        """(n_heads, total_tokens, head_dim) q -> attention output of the same shape."""
+        return paged_attention_forward(
+            q, self._k_pool[layer_idx], self._v_pool[layer_idx], paging.block_table,
+            paging.context_len, paging.query_offset, paging.q_start, paging.q_len,
+            self._block_size, paging.max_q_len,
+        )
+
+    def attention_output(self, attn: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        """(n_heads, total_tokens, head_dim) -> o_proj output, (1, total_tokens, hidden_size)."""
+        total_tokens = attn.shape[1]
+        out = attn.transpose(0, 1).reshape(1, total_tokens, self.n_heads * self.head_dim)
         return self._layers[layer_idx].self_attn.o_proj(out)
 
     def contiguous_attention(
@@ -295,7 +385,6 @@ class ModelRunner:
         out = torch.empty(
             1, total_tokens, self.n_heads, self.head_dim, device=normed.device, dtype=normed.dtype
         )
-        n_groups = self.n_heads // self.n_kv_heads
 
         for entry, (start, end) in zip(plan, offsets, strict=True):
             n_new = end - start
@@ -319,10 +408,9 @@ class ModelRunner:
             cache[entry.seq_id] = (k_buf, v_buf, filled)
 
             # The kernel's causal mask places query row r at position query_offset + r.
-            seq_k = k_buf[:, :, :filled].repeat_interleave(n_groups, dim=1)
-            seq_v = v_buf[:, :, :filled].repeat_interleave(n_groups, dim=1)
-            entry_out, _ = flash_attention_forward(
-                q[:, :, start:end], seq_k, seq_v, is_causal=True, query_offset=filled - n_new
+            entry_out = flash_attention_forward(
+                q[:, :, start:end], k_buf[:, :, :filled], v_buf[:, :, :filled],
+                is_causal=True, query_offset=filled - n_new,
             )
             out[:, start:end] = entry_out.transpose(1, 2)
 

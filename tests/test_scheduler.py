@@ -19,6 +19,16 @@ from tests.factories import decoding_sequence, make_sequence
 SCHEDULER_CLASSES = [ContinuousBatchedScheduler, StaticBatchedScheduler]
 
 
+class RecordingLoop:
+    """Stands in for the event loop: records the delivery callbacks it is handed."""
+
+    def __init__(self):
+        self.callbacks = []
+
+    def call_soon_threadsafe(self, callback, *args):
+        self.callbacks.append((callback, args))
+
+
 @pytest.mark.parametrize("scheduler_cls", SCHEDULER_CLASSES)
 def test_every_decoding_sequence_gets_a_token_even_past_the_token_budget(scheduler_cls):
     scheduler = scheduler_cls(token_budget=2)
@@ -224,7 +234,7 @@ def test_handle_iteration_results_frees_and_returns_only_finished_sequences(sche
     running = [seq_a, seq_b]
 
     finished = scheduler.handle_iteration_results(
-        [(1, 99, True), (2, 100, False)], running=running, allocator=alloc, loop=None
+        [(1, 99, True), (2, 100, False)], running=running, allocator=alloc, loop=RecordingLoop()
     )
 
     assert finished == [seq_a]
@@ -241,8 +251,8 @@ def test_handle_iteration_results_stamps_token_and_completion_times():
     seq = make_sequence(status="DECODING")
     running = [seq]
 
-    scheduler.handle_iteration_results([(1, 7, False)], running, alloc, loop=None)
-    scheduler.handle_iteration_results([(1, 8, True)], running, alloc, loop=None)
+    scheduler.handle_iteration_results([(1, 7, False)], running, alloc, loop=RecordingLoop())
+    scheduler.handle_iteration_results([(1, 8, True)], running, alloc, loop=RecordingLoop())
 
     metrics = seq.metrics
     assert metrics.first_token_time == metrics.token_times[0]
@@ -257,7 +267,7 @@ def test_abort_frees_blocks_and_drops_sequences_from_running():
     drop = decoding_sequence(alloc, seq_id=2, prompt_len=4)
     running = [keep, drop]
 
-    scheduler.abort([drop], running, alloc, loop=None)
+    scheduler.abort([drop], running, alloc, loop=RecordingLoop())
 
     assert running == [keep]
     assert len(alloc.free_blocks) == 3

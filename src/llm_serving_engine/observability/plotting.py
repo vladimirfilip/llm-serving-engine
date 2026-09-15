@@ -1,14 +1,9 @@
-"""Benchmark plots.
-
-Reads the raw per-request result dicts the load generator writes and plots them. matplotlib is imported lazily inside each function so importing
-this module never forces a matplotlib install.
-
-Latency stats reuse llm_serving_engine.observability.metrics.summarize/percentile; nothing here
-recomputes percentile math.
-"""
+"""Benchmark plots, drawn from the raw per-request results the load generator writes.
+matplotlib is a dev dependency, so each function imports it lazily."""
 
 from __future__ import annotations
 
+from ..loadgen.report import wall_clock_s
 from .metrics import LatencySummary, percentile, summarize
 
 
@@ -34,8 +29,8 @@ def plot_latency_pareto(results: list[dict], out_path: str) -> None:
 
     `results` is one run per QPS setting: [{"target_qps", "duration_s", "results": [...]}],
     where each inner "results" entry is a per-request dict with a "latency" key and an
-    optional "success" flag. Achieved throughput is completed requests per second of
-    wall-clock run time. Latency axis is milliseconds.
+    optional "success" flag. Achieved throughput is completed requests over the run's
+    wall clock, start to last completion. Latency axis is milliseconds.
     """
     import matplotlib
 
@@ -47,7 +42,7 @@ def plot_latency_pareto(results: list[dict], out_path: str) -> None:
         latencies = _successful_latencies(run["results"])
         if not latencies:
             continue
-        throughputs.append(len(latencies) / run["duration_s"])
+        throughputs.append(len(latencies) / wall_clock_s(run["results"]))
         summary = summarize(latencies)
         p50s.append(summary.p50 * 1000)
         p95s.append(summary.p95 * 1000)
@@ -73,10 +68,9 @@ def _plot_percentiles_by_load(
     title: str,
     xlabel: str = "offered request rate (req/s)",
 ) -> None:
-    """Shared renderer for the *_by_qps percentile plots: p50/p95/p99 (already in the
-    unit `summaries` carries, converted to ms by the caller) against an offered-load
-    axis. Points whose summary is None (e.g. a QPS point with no successful requests
-    for that stage) are dropped.
+    """Shared renderer for the *_by_qps percentile plots: p50/p95/p99 of summaries in
+    seconds, drawn in milliseconds, against an offered-load axis. Points whose summary is
+    None (a QPS point with no successful requests for that stage, say) are dropped.
     """
     import matplotlib
 
@@ -248,10 +242,7 @@ def plot_latency_cdf_or_histogram(
 
 
 def plot_ablation_bar(labels: list[str], values: list[float], out_path: str, ylabel: str) -> None:
-    """Generic labeled bar chart for an ablation (e.g. static vs. continuous batching,
-    contiguous vs. paged KV, fp16 vs. int8, with/without custom kernels): one bar per
-    condition, comparing a single scalar such as throughput, p99, or decode-step time.
-    """
+    """One bar per ablation arm for a single scalar, such as closed-loop capacity."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -260,5 +251,38 @@ def plot_ablation_bar(labels: list[str], values: list[float], out_path: str, yla
     fig, ax = plt.subplots()
     ax.bar(labels, values)
     ax.set_ylabel(ylabel)
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def plot_ablation_sweep(
+    qps_values: list[float],
+    values_by_arm: dict[str, list[float | None]],
+    kept_up_by_arm: dict[str, list[bool]],
+    out_path: str,
+    ylabel: str,
+) -> None:
+    """One line per ablation arm against offered QPS. Filled markers are points where the
+    arm kept up with arrivals; hollow ones are points where its backlog grew, so their
+    values depend on run length. None values are dropped."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots()
+    for arm, values in values_by_arm.items():
+        points = [
+            (qps, value, kept_up)
+            for qps, value, kept_up in zip(qps_values, values, kept_up_by_arm[arm], strict=True)
+            if value is not None
+        ]
+        (line,) = ax.plot([p[0] for p in points], [p[1] for p in points], label=arm)
+        for qps, value, kept_up in points:
+            face = line.get_color() if kept_up else "none"
+            ax.plot(qps, value, marker="o", color=line.get_color(), markerfacecolor=face)
+    ax.set_xlabel("offered request rate (req/s)")
+    ax.set_ylabel(ylabel)
+    ax.legend()
     fig.savefig(out_path)
     plt.close(fig)

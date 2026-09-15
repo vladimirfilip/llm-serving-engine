@@ -33,7 +33,3 @@ class BatchPlan:
 
     def __len__(self) -> int:
         return len(self.entries)
-
-    @property
-    def total_tokens(self) -> int:
-        return sum(e.n_tokens for e in self.entries)

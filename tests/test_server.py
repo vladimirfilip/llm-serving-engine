@@ -9,7 +9,12 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from llm_serving_engine.engine import EngineUnavailable, InferenceEngine, Submission
+from llm_serving_engine.engine import (
+    EngineUnavailable,
+    InferenceEngine,
+    InvalidPrompt,
+    Submission,
+)
 from llm_serving_engine.model.sampling import SamplingParams
 from llm_serving_engine.scheduling.dispatch import (
     ABORTED,
@@ -18,7 +23,7 @@ from llm_serving_engine.scheduling.dispatch import (
     output_channels,
 )
 from llm_serving_engine.server import EngineHandle, create_app
-from tests.test_engine import TOKEN, FakeModelRunner, FakeTokenizer, make_config, read_stream
+from tests.factories import TOKEN, FakeModelRunner, FakeTokenizer, make_config, read_stream
 
 
 class FakeStreamTokenizer:
@@ -45,6 +50,8 @@ class FakeEngine:
     def submit(self, prompt: str, sampling_params: SamplingParams) -> Submission:
         if not self.accepting:
             raise EngineUnavailable("closed")
+        if not prompt:
+            raise InvalidPrompt("empty")
         self.submitted.append((prompt, sampling_params))
         seq_id, q = new_output_channel(maxsize=64)
         self.on_submit(q)
@@ -114,6 +121,11 @@ def test_generate_is_503_while_the_engine_accepts_nothing():
         assert client.post("/v1/generate", json={"prompt": "hi"}).status_code == 503
 
 
+def test_generate_is_400_for_a_prompt_the_model_cannot_run():
+    with TestClient(create_app(FakeEngine())) as client:
+        assert client.post("/v1/generate", json={"prompt": ""}).status_code == 400
+
+
 def test_generate_builds_sampling_params_from_the_body():
     engine = FakeEngine()
     with TestClient(create_app(engine)) as client:
@@ -130,10 +142,11 @@ def test_generate_builds_sampling_params_from_the_body():
 @pytest.mark.asyncio
 async def test_loadgen_client_parses_this_server_s_sse_stream():
     """The only test where the server's SSE events and the load generator's parser meet."""
-    from llm_serving_engine.loadgen.client import send_request
+    from llm_serving_engine.loadgen.client import load_client, send_request
 
     app = create_app(FakeEngine(on_submit=put_all(1, 2, 3, DONE)))
-    result = await send_request("http://test", "hello", transport=httpx.ASGITransport(app=app))
+    async with load_client("http://test", transport=httpx.ASGITransport(app=app)) as client:
+        result = await send_request(client, "hello")
 
     assert result["success"] is True
     assert result["num_tokens_received"] == 3

@@ -1,21 +1,18 @@
-"""Per-request sampling configuration and the sampling math itself."""
+"""Per-request sampling configuration and batched sampling."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
 
-if TYPE_CHECKING:
-    import torch
+import torch
 
 
 @dataclass(slots=True)
 class SamplingParams:
-    temperature: float = 1.0
+    temperature: float = 1.0  # 0 is greedy
     top_p: float = 1.0
     top_k: int = -1  # -1 disables top-k
     max_tokens: int = 256
-    stop: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.temperature < 0:
@@ -26,30 +23,39 @@ class SamplingParams:
             raise ValueError(f"max_tokens must be > 0, got {self.max_tokens}")
 
 
-def sample_token(logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
-    """Returns a 0-dim device tensor, so a caller sampling a whole batch pays one host
-    sync (`torch.stack(...).tolist()`) for all of it."""
-    import torch
+def sample_tokens(logits: torch.Tensor, params: list[SamplingParams]) -> torch.Tensor:
+    """(batch, vocab) logits -> (batch,) token ids on the same device, row i sampled under
+    params[i]. The whole batch shares one softmax, at most one sort and one multinomial
+    draw, and no host sync.
 
-    if params.temperature == 0:
-        return torch.argmax(logits)
+    Top-k keeps the k highest-probability tokens; top-p then keeps, within those, each
+    token whose preceding probability mass is at most top_p of what top-k kept.
+    """
+    greedy = torch.argmax(logits, dim=-1)
+    if all(p.temperature == 0 for p in params):
+        return greedy
 
-    logits = logits / params.temperature
-    if params.top_k > 0:
-        top_k = min(params.top_k, logits.size(-1))
-        kth_value = torch.topk(logits, top_k).values[..., -1]
-        logits = torch.where(logits < kth_value, torch.full_like(logits, float("-inf")), logits)
+    vocab = logits.shape[-1]
+    knobs = torch.tensor(
+        [
+            [p.temperature or 1.0, p.top_p, p.top_k if 0 < p.top_k < vocab else vocab]
+            for p in params
+        ],
+        device=logits.device,
+    )
+    temperature, top_p, top_k = knobs[:, 0:1], knobs[:, 1:2], knobs[:, 2:3]
+    probs = torch.softmax(logits.float() / temperature, dim=-1)
 
-    probs = torch.softmax(logits, dim=-1)
-    if params.top_p < 1.0:
-        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
-        cumulative = torch.cumsum(sorted_probs, dim=-1)
-        drop = cumulative > params.top_p
-        drop[..., 1:] = drop[..., :-1].clone()
-        drop[..., 0] = False
-        sorted_probs[drop] = 0.0
-        probs = torch.zeros_like(probs).scatter(-1, sorted_idx, sorted_probs)
-        probs = probs / probs.sum()
+    if all(p.top_p == 1.0 and not 0 < p.top_k < vocab for p in params):
+        sampled = torch.multinomial(probs, 1).squeeze(-1)
+    else:
+        sorted_probs, sorted_ids = torch.sort(probs, dim=-1, descending=True)
+        rank = torch.arange(vocab, device=logits.device)
+        sorted_probs = sorted_probs.masked_fill(rank >= top_k, 0.0)
+        kept_mass = sorted_probs.sum(dim=-1, keepdim=True)
+        mass_before = torch.cumsum(sorted_probs, dim=-1) - sorted_probs
+        sorted_probs = sorted_probs.masked_fill(mass_before > top_p * kept_mass, 0.0)
+        sampled = sorted_ids.gather(-1, torch.multinomial(sorted_probs, 1)).squeeze(-1)
 
-    return torch.multinomial(probs, 1).squeeze(0)
-
+    is_greedy = torch.tensor([p.temperature == 0 for p in params], device=logits.device)
+    return torch.where(is_greedy, greedy, sampled)

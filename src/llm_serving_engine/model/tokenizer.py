@@ -49,7 +49,3 @@ class TokenizerWrapper:
 
     def forget(self, seq_id: int) -> None:
         self._decode_windows.pop(seq_id, None)
-
-    @property
-    def eos_token_id(self) -> int | None:
-        return self._tokenizer.eos_token_id

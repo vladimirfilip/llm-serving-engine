@@ -96,7 +96,7 @@ class DecodeGraphRunner:
             for bucket in sorted(bucket_sizes):
                 dg = self._alloc(bucket, num_blocks=runner._scratch_block_id)
                 self._fill_dummy(dg)
-                warmup = torch.cuda.Stream()
+                warmup = runner.graph_warmup_stream()
                 warmup.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(warmup):
                     for _ in range(3):
@@ -126,9 +126,9 @@ class DecodeGraphRunner:
         """Embedding through lm_head into dg.logits: the region capture() records, also run
         eagerly for warmup and the self-check.
 
-        Sampling stays outside the graph. sample_token branches in Python on each row's
+        Sampling stays outside the graph. sample_tokens branches in Python on the batch's
         SamplingParams, and a graph freezes which kernels ran, so a captured sampler would
-        replay one request's sampling algorithm onto whichever request holds that row later.
+        replay one batch's sampling algorithm onto whichever requests fill the rows later.
         """
         runner = self._runner
         with torch.no_grad():

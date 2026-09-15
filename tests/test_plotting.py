@@ -3,6 +3,7 @@ import random
 from llm_serving_engine.observability.metrics import summarize
 from llm_serving_engine.observability.plotting import (
     plot_ablation_bar,
+    plot_ablation_sweep,
     plot_e2e_latency_by_qps,
     plot_goodput_by_qps,
     plot_gpu_memory_by_load,
@@ -19,7 +20,10 @@ from llm_serving_engine.observability.plotting import (
 
 def _synthetic_requests(n: int, base_latency: float) -> list[dict]:
     rng = random.Random(0)
-    return [{"latency": base_latency + rng.random() * 0.05, "success": True} for _ in range(n)]
+    return [
+        {"latency": base_latency + rng.random() * 0.05, "completed_at": i * 0.2, "success": True}
+        for i in range(n)
+    ]
 
 
 def _synthetic_staged_requests(n: int, queue_and_prefill: float, decode: float) -> list[dict]:
@@ -77,8 +81,20 @@ def test_plot_stage_latency_by_qps_writes_nonempty_file(tmp_path):
 
 def test_plot_ablation_bar_writes_nonempty_file(tmp_path):
     out = tmp_path / "ablation.png"
-    plot_ablation_bar(["static", "continuous"], [120.0, 340.0], str(out), ylabel="throughput (tok/s)")
+    plot_ablation_bar(["static", "continuous"], [120.0, 340.0], str(out), ylabel="capacity (req/s)")
     assert out.exists()
+    assert out.stat().st_size > 0
+
+
+def test_plot_ablation_sweep_draws_every_arm_and_drops_none_values(tmp_path):
+    out = tmp_path / "sweep.png"
+    plot_ablation_sweep(
+        [1.0, 2.0, 4.0],
+        {"paged": [100.0, 120.0, 180.0], "contiguous": [150.0, None, 9000.0]},
+        {"paged": [True, True, True], "contiguous": [True, False, False]},
+        str(out),
+        ylabel="e2e p99 (ms)",
+    )
     assert out.stat().st_size > 0
 
 

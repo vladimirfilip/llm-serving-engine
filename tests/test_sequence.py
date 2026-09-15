@@ -1,4 +1,3 @@
-from llm_serving_engine.scheduling.sequence import Sequence
 from tests.factories import make_sequence
 
 
@@ -21,10 +20,6 @@ def test_prefill_token_ids_continue_from_the_prompt_into_generated_tokens():
     seq = make_sequence(prompt_tokens=[1, 2, 3], generated_tokens=[4, 5])
     assert seq.prefill_token_ids(0, 2) == [1, 2]
     assert seq.prefill_token_ids(2, 5) == [3, 4, 5]
-
-
-def test_sequence_carries_no_output_channel():
-    assert "output_channel" not in Sequence.__slots__
 
 
 def test_block_tables_are_independent_per_sequence():

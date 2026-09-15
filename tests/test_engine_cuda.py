@@ -13,7 +13,7 @@ from llm_serving_engine.model.model_runner import ModelRunner
 from llm_serving_engine.model.sampling import SamplingParams
 from llm_serving_engine.observability.metrics_export import REGISTRY
 from llm_serving_engine.scheduling.allocator import BlockAllocator
-from tests.test_engine import make_config, read_stream
+from tests.factories import make_config, read_stream
 
 pytestmark = pytest.mark.cuda
 
@@ -60,3 +60,48 @@ async def test_preemption_under_kv_pressure_changes_no_output(tiny_llama_dir):
     assert REGISTRY.get_sample_value("llm_preemptions_total") > before
     assert constrained == unconstrained
     assert all(len(stream) == 21 for stream in constrained)  # 20 tokens + DONE
+
+
+# Runs in a subprocess: the device-side assert it triggers poisons CUDA for the whole process.
+_DEVICE_ASSERT_SCRIPT = """
+import asyncio, sys, time
+from llm_serving_engine.config import KVCacheConfig, ModelConfig
+from llm_serving_engine.engine import IngressRequest, InferenceEngine
+from llm_serving_engine.model.model_runner import ModelRunner
+from llm_serving_engine.model.sampling import SamplingParams
+from llm_serving_engine.scheduling.allocator import BlockAllocator
+from llm_serving_engine.scheduling.dispatch import ABORTED, new_output_channel
+from tests.factories import make_config
+
+async def main():
+    config = make_config(model=ModelConfig(model_name_or_path=sys.argv[1], dtype="float32"))
+    runner = ModelRunner(config.model)
+    engine = InferenceEngine(config, None, runner, allocator=BlockAllocator(16, 4))
+    engine.bind_loop(asyncio.get_running_loop())
+    engine.start()
+    # Past submit's vocabulary check, as a tokenizer/model mismatch would be.
+    seq_id, q = new_output_channel(maxsize=8)
+    engine._submitted += 1
+    request = IngressRequest(seq_id, [runner.vocab_size], SamplingParams(), time.monotonic())
+    engine.ingress.put(request)
+    assert await asyncio.wait_for(q.get(), timeout=30) is ABORTED
+    deadline = time.monotonic() + 10
+    while engine.healthy and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    assert not engine.healthy
+    print("engine unhealthy after device loss")
+
+asyncio.run(main())
+"""
+
+
+def test_a_device_side_assert_fails_the_engine(tiny_llama_dir):
+    import subprocess
+    import sys
+
+    completed = subprocess.run(
+        [sys.executable, "-c", _DEVICE_ASSERT_SCRIPT, str(tiny_llama_dir)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr[-3000:]
+    assert "engine unhealthy after device loss" in completed.stdout

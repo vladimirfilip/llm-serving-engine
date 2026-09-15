@@ -1,7 +1,6 @@
-"""open_loop_load_gen correctness: fixed arrival schedule independent of response time,
-latency measured from the intended send time, and every started request's result
-returned even if it's still in flight when the schedule ends.
-"""
+"""Timing loops. Open loop: a fixed arrival schedule independent of response time, latency
+from the intended send time, and every started request returned even if still in flight
+when the schedule ends. Closed loop: a constant number of requests in flight."""
 
 import asyncio
 import time
@@ -9,7 +8,7 @@ from itertools import pairwise
 
 import pytest
 
-from llm_serving_engine.loadgen.timing import open_loop_load_gen
+from llm_serving_engine.loadgen.timing import closed_loop_load_gen, open_loop_load_gen
 
 
 @pytest.mark.asyncio
@@ -76,3 +75,38 @@ async def test_a_request_still_in_flight_when_the_schedule_ends_is_still_returne
 
     results = await open_loop_load_gen(target_qps=20.0, duration_s=0.05, send_fn=send_fn)
     assert len(results) == 1
+
+
+@pytest.mark.asyncio
+async def test_open_loop_results_record_schedule_and_completion_offsets(monkeypatch):
+    monkeypatch.setattr("llm_serving_engine.loadgen.timing.random.expovariate", lambda qps: 0.05)
+
+    async def send_fn() -> dict:
+        await asyncio.sleep(0.02)
+        return {}
+
+    results = await open_loop_load_gen(target_qps=20.0, duration_s=0.12, send_fn=send_fn)
+
+    scheduled = sorted(r["scheduled_at"] for r in results)
+    assert scheduled == pytest.approx([0.0, 0.05, 0.10], abs=0.01)
+    assert all(r["completed_at"] >= r["scheduled_at"] + 0.02 for r in results)
+
+
+@pytest.mark.asyncio
+async def test_closed_loop_keeps_exactly_concurrency_requests_in_flight():
+    in_flight = 0
+    peak = 0
+
+    async def send_fn() -> dict:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        return {}
+
+    results = await closed_loop_load_gen(concurrency=3, duration_s=0.1, send_fn=send_fn)
+
+    assert peak == 3
+    assert len(results) >= 3 * 8  # each client sends back to back for the whole run
+    assert all("scheduled_at" not in r and r["completed_at"] > 0 for r in results)

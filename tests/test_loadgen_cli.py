@@ -17,14 +17,15 @@ def test_sampling_params_built_from_given_overrides_only():
 
 def test_main_writes_the_run_envelope_plotting_reads(tmp_path, monkeypatch):
     out = tmp_path / "run.json"
-    monkeypatch.setattr(cli, "_run", lambda config: _immediate([{"latency": 0.5, "success": True}]))
+    result = {"latency": 0.5, "scheduled_at": 0.0, "completed_at": 0.5, "success": True}
+    monkeypatch.setattr(cli, "open_loop_load_gen", lambda *_: _immediate([result]))
 
     cli.main(["--target-qps", "3", "--duration-s", "2", "--out", str(out)])
 
     run = json.loads(out.read_text())
     assert run["target_qps"] == 3
     assert run["duration_s"] == 2
-    assert run["results"] == [{"latency": 0.5, "success": True}]
+    assert run["results"] == [result]
 
 
 async def _immediate(value):

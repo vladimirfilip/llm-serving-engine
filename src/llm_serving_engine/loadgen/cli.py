@@ -1,6 +1,6 @@
 """CLI entrypoint for the load generator (`llm-loadgen` console script).
 
-Parses arguments, runs the load, and writes raw per-request results and a summary to
+Runs open-loop load against a server and writes raw per-request results and a summary to
 disk.
 """
 
@@ -12,10 +12,24 @@ import time
 from pathlib import Path
 
 from ..model.sampling import SamplingParams
-from .client import LoadGenConfig, send_request
+from .client import load_client, request_sender
 from .report import SLOThresholds, build_report
 from .results_io import write_raw, write_summary
 from .timing import open_loop_load_gen
+
+
+def add_slo_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--slo-ttft-ms", type=float, default=None, help="goodput: TTFT SLO, ms")
+    parser.add_argument("--slo-tpot-ms", type=float, default=None, help="goodput: TPOT SLO, ms")
+    parser.add_argument(
+        "--slo-e2e-ms", type=float, default=None, help="goodput: end-to-end SLO, ms"
+    )
+
+
+def slo_from_args(args: argparse.Namespace) -> SLOThresholds | None:
+    if args.slo_ttft_ms is None and args.slo_tpot_ms is None and args.slo_e2e_ms is None:
+        return None
+    return SLOThresholds(ttft_ms=args.slo_ttft_ms, tpot_ms=args.slo_tpot_ms, e2e_ms=args.slo_e2e_ms)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -34,9 +48,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--out", type=Path, default=None, help="output path stem (default: results_<ts>); "
         "writes <stem>.json/.csv raw and <stem>_summary.json/.csv aggregate"
     )
-    parser.add_argument("--slo-ttft-ms", type=float, default=None, help="goodput: TTFT SLO, ms")
-    parser.add_argument("--slo-tpot-ms", type=float, default=None, help="goodput: TPOT SLO, ms")
-    parser.add_argument("--slo-e2e-ms", type=float, default=None, help="goodput: end-to-end SLO, ms")
+    add_slo_arguments(parser)
     return parser.parse_args(argv)
 
 
@@ -46,42 +58,32 @@ def _sampling_params_from_args(args: argparse.Namespace) -> SamplingParams | Non
     return SamplingParams(**given) if given else None
 
 
-def _slo_from_args(args: argparse.Namespace) -> SLOThresholds | None:
-    if args.slo_ttft_ms is None and args.slo_tpot_ms is None and args.slo_e2e_ms is None:
-        return None
-    return SLOThresholds(ttft_ms=args.slo_ttft_ms, tpot_ms=args.slo_tpot_ms, e2e_ms=args.slo_e2e_ms)
-
-
-async def _run(config: LoadGenConfig) -> list[dict]:
-    async def send_fn() -> dict:
-        return await send_request(config.base_url, config.sample_prompt(), config.sampling_params)
-
-    return await open_loop_load_gen(config.target_qps, config.duration_s, send_fn)
+async def _run(args: argparse.Namespace) -> list[dict]:
+    async with load_client(args.base_url) as client:
+        send = request_sender(client, _sampling_params_from_args(args))
+        return await open_loop_load_gen(args.target_qps, args.duration_s, send)
 
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
-    config = LoadGenConfig(
-        target_qps=args.target_qps,
-        duration_s=args.duration_s,
-        base_url=args.base_url,
-        sampling_params=_sampling_params_from_args(args),
-    )
-    results = asyncio.run(_run(config))
+    results = asyncio.run(_run(args))
 
     # One run per file, tagged with its offered load: the shape plot_latency_pareto reads,
     # so a sweep's plots regenerate from the raw files.
-    run = {"target_qps": config.target_qps, "duration_s": config.duration_s, "results": results}
+    run = {"target_qps": args.target_qps, "duration_s": args.duration_s, "results": results}
     stem = (args.out or Path(f"results_{int(time.time())}")).with_suffix("")
     write_raw(stem.with_suffix(".json"), stem.with_suffix(".csv"), run)
 
-    report = build_report(results, config.duration_s, _slo_from_args(args))
+    report = build_report(results, slo_from_args(args))
     summary_stem = stem.with_name(f"{stem.name}_summary")
     write_summary(
         summary_stem.with_suffix(".json"), summary_stem.with_suffix(".csv"), report,
-        target_qps=config.target_qps, duration_s=config.duration_s,
+        target_qps=args.target_qps, duration_s=args.duration_s,
     )
     print(f"wrote {len(results)} results to {stem}.json/.csv, summary to {summary_stem}.json/.csv")
+    if not report.keeps_up:
+        print(f"server did not keep up: {report.failures} failures, latency growth "
+              f"{report.latency_growth}")
 
 
 if __name__ == "__main__":
