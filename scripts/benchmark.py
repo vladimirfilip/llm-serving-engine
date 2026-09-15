@@ -171,15 +171,16 @@ def _base_env(args: argparse.Namespace) -> dict[str, str]:
 
 
 def _describe(report: RunReport) -> str:
-    e2e_p99 = report.e2e_latency.p99 * 1000 if report.e2e_latency else float("nan")
+    e2e = report.latency.e2e_latency
+    e2e_p99 = e2e.p99 * 1000 if e2e else float("nan")
     ttft_p50 = "".join(
         f" ttft_p50[{shape}]={summary.p50 * 1000:.0f}ms"
-        for shape, summary in report.ttft_by_shape.items()
+        for shape, summary in report.latency.ttft_by_shape.items()
     )
-    verdict = "kept up" if report.keeps_up else "did NOT keep up"
+    verdict = {True: "kept up", False: "did NOT keep up", None: "keep-up unknown"}[report.keeps_up]
     return (
         f"throughput={report.throughput_req_s:.2f} req/s e2e_p99={e2e_p99:.0f}ms{ttft_p50} "
-        f"failures={report.failures} latency_growth={report.latency_growth} ({verdict})"
+        f"failures={report.failures} ttft_growth={report.ttft_growth} ({verdict})"
     )
 
 
@@ -194,7 +195,7 @@ def bench_pareto(args: argparse.Namespace, out_dir: Path) -> None:
             with GpuMonitor() as gpu, KvCacheMonitor(base_url) as kv:
                 results = _open_loop(base_url, qps, args)
             run = {"target_qps": qps, "duration_s": args.duration_s, "results": results}
-            report = build_report(results, slo)
+            report = build_report(results, args.duration_s, slo)
             stem = out_dir / "pareto" / f"qps_{qps:g}"
             write_raw(sibling(stem, ".json"), sibling(stem, ".csv"), run)
             write_summary(
@@ -221,11 +222,12 @@ def bench_pareto(args: argparse.Namespace, out_dir: Path) -> None:
     plot_latency_pareto(runs, str(plot_dir / "pareto.png"))
     plot_stage_latency_by_qps(runs, str(plot_dir / "pareto_stage_latency.png"))
     plot_ttft_by_qps(
-        args.qps, [r.ttft_by_shape for r in reports], str(plot_dir / "pareto_ttft.png")
+        args.qps, [r.latency.ttft_by_shape for r in reports], str(plot_dir / "pareto_ttft.png")
     )
-    plot_tpot_by_qps(args.qps, [r.tpot for r in reports], str(plot_dir / "pareto_tpot.png"))
+    plot_tpot_by_qps(args.qps, [r.latency.tpot for r in reports], str(plot_dir / "pareto_tpot.png"))
     plot_e2e_latency_by_qps(
-        args.qps, [r.e2e_latency for r in reports], str(plot_dir / "pareto_e2e_latency.png")
+        args.qps, [r.latency.e2e_latency for r in reports],
+        str(plot_dir / "pareto_e2e_latency.png"),
     )
     plot_throughput_by_qps(
         args.qps, [r.throughput_req_s for r in reports], str(plot_dir / "pareto_throughput.png")
@@ -257,7 +259,7 @@ def _measure_capacity(
     with _running_server(env, args.ready_timeout, log_path) as base_url:
         with GpuMonitor() as gpu, KvCacheMonitor(base_url) as kv:
             results = _closed_loop(base_url, args)
-    report = build_report(results)
+    report = build_report(results, args.duration_s)
     run = {"concurrency": args.concurrency, "duration_s": args.duration_s, "results": results}
     write_raw(sibling(out_stem, ".json"), sibling(out_stem, ".csv"), run)
     write_summary(
@@ -320,7 +322,7 @@ def _run_ablation(
         with _running_server(envs[arm], args.ready_timeout, log_path) as base_url:
             for qps in qps_values:
                 results = _open_loop(base_url, qps, args)
-                report = build_report(results, slo)
+                report = build_report(results, args.duration_s, slo)
                 stem = out_dir / name / arm / f"qps_{qps:g}"
                 run = {
                     "target_qps": qps, "duration_s": args.duration_s, env_key: arm,
@@ -347,13 +349,16 @@ def _run_ablation(
         "closed-loop capacity (req/s)",
     )
     plot_ablation_sweep(
-        qps_values, {arm: [ms(r.e2e_latency) for r in reports[arm]] for arm in arms}, kept_up,
+        qps_values,
+        {arm: [ms(r.latency.e2e_latency) for r in reports[arm]] for arm in arms},
+        kept_up,
         str(plot_dir / f"{name}_e2e_p99.png"), "end-to-end latency p99 (ms)",
     )
-    for shape in sorted({shape for arm in arms for r in reports[arm] for shape in r.ttft_by_shape}):
+    shapes = {shape for arm in arms for r in reports[arm] for shape in r.latency.ttft_by_shape}
+    for shape in sorted(shapes):
         plot_ablation_sweep(
             qps_values,
-            {arm: [ms(r.ttft_by_shape.get(shape)) for r in reports[arm]] for arm in arms},
+            {arm: [ms(r.latency.ttft_by_shape.get(shape)) for r in reports[arm]] for arm in arms},
             kept_up,
             str(plot_dir / f"{name}_ttft_p99_{shape}.png"),
             f"{shape} TTFT p99 (ms)",

@@ -12,7 +12,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from .report import RunReport, tpot
+from .report import LatencyReport, RunReport, tpot
 
 
 def sibling(stem: Path, suffix: str) -> Path:
@@ -69,24 +69,32 @@ def write_summary(json_path: Path, csv_path: Path, report: RunReport, **extra) -
 
 def _flatten_report(report: RunReport) -> dict:
     flat: dict = {
+        "duration_s": report.duration_s,
         "wall_clock_s": report.wall_clock_s,
+        "requests": report.requests,
         "failures": report.failures,
-        "latency_growth": report.latency_growth,
+        "offered_req_s": report.offered_req_s,
+        "ttft_growth": report.ttft_growth,
         "keeps_up": report.keeps_up,
         "throughput_req_s": report.throughput_req_s,
         "output_tokens_s": report.output_tokens_s,
         "input_tokens_s": report.input_tokens_s,
         "total_tokens_s": report.total_tokens_s,
         "goodput_req_s": report.goodput_req_s,
+        **_flatten_latency(report.latency),
     }
-    stages = {f"ttft_{shape}": summary for shape, summary in report.ttft_by_shape.items()}
-    stages |= {"tpot": report.tpot, "e2e_latency": report.e2e_latency, "itl": report.itl}
-    for stage, summary in stages.items():
-        if summary is None:
-            continue
-        for field_name, value in asdict(summary).items():
-            flat[f"{stage}_{field_name}"] = value
     if report.slo_attainment is not None:
         for name, pct in report.slo_attainment.items():
             flat[f"slo_attainment_{name}_pct"] = pct
     return flat
+
+
+def _flatten_latency(latency: LatencyReport) -> dict:
+    stages = {f"ttft_{shape}": summary for shape, summary in latency.ttft_by_shape.items()}
+    stages |= {f"e2e_{shape}": summary for shape, summary in latency.e2e_by_shape.items()}
+    stages |= {"tpot": latency.tpot, "e2e_latency": latency.e2e_latency, "itl": latency.itl}
+    return {
+        f"{stage}_{field_name}": value
+        for stage, summary in stages.items() if summary is not None
+        for field_name, value in asdict(summary).items()
+    }

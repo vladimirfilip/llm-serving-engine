@@ -1,10 +1,11 @@
 import pytest
 
 from llm_serving_engine.loadgen.report import (
+    MIN_QUARTER_REQUESTS,
     SLOThresholds,
     build_report,
-    latency_growth,
     tpot,
+    ttft_growth,
     wall_clock_s,
 )
 
@@ -25,6 +26,19 @@ def _request(latency, first_token_latency, output_tokens, completed_at=1.0, **fi
     }
 
 
+def _closed_loop(result: dict) -> dict:
+    return {k: v for k, v in result.items() if k != "scheduled_at"}
+
+
+def _arrivals(ttfts: list[float], shape: str = "chat") -> list[dict]:
+    """One open-loop request per second, with the given TTFTs in arrival order."""
+    return [
+        _request(ttft + 0.5, ttft, 3, scheduled_at=float(i), completed_at=i + ttft + 0.5,
+                 shape=shape)
+        for i, ttft in enumerate(ttfts)
+    ]
+
+
 def test_tpot_needs_at_least_two_output_tokens():
     assert tpot(_request(1.0, 0.2, output_tokens=1)) is None
     assert tpot(_request(1.0, 0.2, output_tokens=0)) is None
@@ -35,45 +49,64 @@ def test_tpot_is_decode_time_per_additional_token():
     assert tpot(_request(1.0, 0.2, output_tokens=5)) == pytest.approx(0.2)
 
 
-def test_throughput_divides_by_the_wall_clock_to_the_last_completion():
-    results = [_request(1.0, 0.1, output_tokens=3, completed_at=t) for t in (1.0, 2.0, 5.0)]
-    report = build_report(results)
+@pytest.mark.parametrize("loop", ["open", "closed"])
+def test_rates_count_only_completions_in_the_steady_window(loop):
+    # duration 4s: the steady window is [1s, 4s], so the 0.5s ramp-up and 5s drain are excluded
+    results = [
+        _request(1.0, 0.1, output_tokens=3, completed_at=t) for t in (0.5, 1.0, 2.0, 4.0, 5.0)
+    ]
+    if loop == "closed":
+        results = [_closed_loop(r) for r in results]
+    report = build_report(results, duration_s=4.0)
     assert report.wall_clock_s == 5.0
-    assert report.throughput_req_s == pytest.approx(3 / 5.0)
-    assert report.output_tokens_s == pytest.approx(9 / 5.0)
-    assert report.total_tokens_s == pytest.approx(39 / 5.0)
+    assert report.throughput_req_s == pytest.approx(3 / 3.0)
+    assert report.output_tokens_s == pytest.approx(9 / 3.0)
+    assert report.total_tokens_s == pytest.approx(39 / 3.0)
+
+
+def test_open_loop_offered_rate_is_the_arrivals_actually_drawn():
+    results = [_request(1.0, 0.1, output_tokens=3) for _ in range(9)]
+    assert build_report(results, duration_s=3.0).offered_req_s == pytest.approx(3.0)
+
+
+def test_closed_loop_results_have_no_offered_rate():
+    results = [_closed_loop(_request(1.0, 0.1, output_tokens=3))]
+    assert build_report(results, duration_s=4.0).offered_req_s is None
 
 
 def test_failed_requests_count_toward_the_wall_clock_but_not_throughput():
     results = [
         _request(1.0, 0.1, output_tokens=3, completed_at=1.0),
-        {"success": False, "error": "timeout", "latency": 60.0, "completed_at": 4.0},
+        {"scheduled_at": 0.5, "success": False, "error": "timeout", "latency": 0.5,
+         "completed_at": 1.0},
     ]
-    report = build_report(results)
+    report = build_report(results, duration_s=2.0)
     assert report.failures == 1
-    assert report.throughput_req_s == pytest.approx(1 / 4.0)
-    assert report.ttft_by_shape["chat"].count == 1
-    assert not report.keeps_up
+    assert report.wall_clock_s == 1.0
+    assert report.throughput_req_s == pytest.approx(1 / 1.5)
+    assert report.latency.ttft_by_shape["chat"].count == 1
+    assert report.keeps_up is False
 
 
 def test_latency_summaries_reflect_named_metrics():
     results = [_request(1.0, 0.1, output_tokens=5), _request(2.0, 0.3, output_tokens=5)]
-    report = build_report(results)
-    assert report.ttft_by_shape["chat"].mean == pytest.approx((0.1 + 0.3) / 2)
-    assert report.e2e_latency.mean == pytest.approx((1.0 + 2.0) / 2)
-    assert report.tpot.mean == pytest.approx(((1.0 - 0.1) / 4 + (2.0 - 0.3) / 4) / 2)
+    latency = build_report(results, duration_s=1.0).latency
+    assert latency.ttft_by_shape["chat"].mean == pytest.approx((0.1 + 0.3) / 2)
+    assert latency.e2e_latency.mean == pytest.approx((1.0 + 2.0) / 2)
+    assert latency.tpot.mean == pytest.approx(((1.0 - 0.1) / 4 + (2.0 - 0.3) / 4) / 2)
 
 
-def test_ttft_is_summarized_separately_for_each_request_shape():
+def test_ttft_and_e2e_are_summarized_separately_for_each_request_shape():
     results = [
         _request(1.0, 0.05, output_tokens=3),
-        _request(1.0, 0.07, output_tokens=3),
+        _request(1.2, 0.07, output_tokens=3),
         _request(9.0, 4.0, output_tokens=3, shape="chunked_document"),
     ]
-    report = build_report(results)
-    assert set(report.ttft_by_shape) == {"chat", "chunked_document"}
-    assert report.ttft_by_shape["chat"].max == pytest.approx(0.07)
-    assert report.ttft_by_shape["chunked_document"].p50 == pytest.approx(4.0)
+    latency = build_report(results, duration_s=1.0).latency
+    assert set(latency.ttft_by_shape) == set(latency.e2e_by_shape) == {"chat", "chunked_document"}
+    assert latency.ttft_by_shape["chat"].max == pytest.approx(0.07)
+    assert latency.e2e_by_shape["chat"].max == pytest.approx(1.2)
+    assert latency.ttft_by_shape["chunked_document"].p50 == pytest.approx(4.0)
 
 
 def test_itl_flattens_token_gaps_across_requests():
@@ -81,40 +114,53 @@ def test_itl_flattens_token_gaps_across_requests():
         _request(1.0, 0.1, output_tokens=3, token_times=[0.1, 0.2, 0.35]),
         _request(1.0, 0.1, output_tokens=2, token_times=[0.1, 0.3]),
     ]
-    assert build_report(results).itl.count == 3
+    assert build_report(results, duration_s=1.0).latency.itl.count == 3
 
 
 def test_a_steady_open_loop_run_keeps_up():
-    results = [_request(0.5, 0.1, 3, scheduled_at=float(i), completed_at=i + 0.5) for i in range(8)]
-    report = build_report(results)
-    assert report.latency_growth == pytest.approx(1.0)
-    assert report.keeps_up
+    report = build_report(_arrivals([0.1] * 40), duration_s=40.0)
+    assert report.ttft_growth == pytest.approx(1.0)
+    assert report.keeps_up is True
 
 
 def test_a_growing_backlog_does_not_keep_up():
-    results = [
-        _request(0.5 * (i + 1), 0.1, 3, scheduled_at=float(i), completed_at=1.5 * i + 0.5)
-        for i in range(8)
+    report = build_report(_arrivals([0.1 * (i + 1) for i in range(40)]), duration_s=40.0)
+    assert report.ttft_growth > 2
+    assert report.keeps_up is False
+
+
+def test_too_few_requests_leave_the_keep_up_verdict_unknown():
+    results = _arrivals([0.1, 5.0, 0.1, 5.0] * (MIN_QUARTER_REQUESTS - 1))
+    assert ttft_growth(results) is None
+    assert build_report(results, duration_s=40.0).keeps_up is None
+
+
+def test_ttft_growth_follows_the_most_common_shape_only():
+    steady_chat = _arrivals([0.1] * 40)
+    late_documents = [
+        _request(9.0, 8.0, 3, shape="document", scheduled_at=39.0 + i / 10, completed_at=48.0)
+        for i in range(5)
     ]
-    assert latency_growth(results) > 2
-    assert not build_report(results).keeps_up
+    report = build_report(steady_chat + late_documents, duration_s=40.0)
+    assert report.ttft_growth == pytest.approx(1.0)
+    assert report.keeps_up is True
 
 
-def test_closed_loop_results_have_no_latency_growth_and_no_ttft():
-    closed_loop = [_request(0.5, 0.1, 3) for _ in range(8)]
-    for result in closed_loop:
-        del result["scheduled_at"]
-    assert latency_growth(closed_loop) is None
-    assert build_report(closed_loop).ttft_by_shape == {}
+def test_closed_loop_results_have_no_keep_up_verdict_and_no_ttft():
+    closed_loop = [_closed_loop(r) for r in _arrivals([0.1] * 40)]
+    report = build_report(closed_loop, duration_s=40.0)
+    assert report.ttft_growth is None
+    assert report.keeps_up is None
+    assert report.latency.ttft_by_shape == {}
 
 
 def test_wall_clock_of_no_results_is_zero():
     assert wall_clock_s([]) == 0.0
-    assert build_report([]).throughput_req_s == 0.0
+    assert build_report([], duration_s=1.0).throughput_req_s == 0.0
 
 
 def test_no_slo_leaves_goodput_and_attainment_unset():
-    report = build_report([_request(1.0, 0.1, output_tokens=3)])
+    report = build_report([_request(1.0, 0.1, output_tokens=3)], duration_s=1.0)
     assert report.goodput_req_s is None
     assert report.slo_attainment is None
 
@@ -124,8 +170,8 @@ def test_goodput_counts_only_requests_meeting_every_slo():
         _request(latency=0.5, first_token_latency=0.05, output_tokens=5, completed_at=1.0),
         _request(latency=2.0, first_token_latency=0.05, output_tokens=5, completed_at=2.0),
     ]
-    report = build_report(results, slo=SLOThresholds(ttft_ms=100, e2e_ms=1000))
-    assert report.goodput_req_s == pytest.approx(0.5)
+    report = build_report(results, duration_s=2.0, slo=SLOThresholds(ttft_ms=100, e2e_ms=1000))
+    assert report.goodput_req_s == pytest.approx(1 / 1.5)
     assert report.slo_attainment["ttft"] == pytest.approx(100.0)
     assert report.slo_attainment["e2e"] == pytest.approx(50.0)
     assert report.slo_attainment["tpot"] is None

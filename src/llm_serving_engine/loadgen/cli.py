@@ -106,16 +106,16 @@ def main(argv: list[str] | None = None) -> None:
     stem = _stem(args.out)
     write_raw(sibling(stem, ".json"), sibling(stem, ".csv"), run)
 
-    report = build_report(results, slo_from_args(args))
+    report = build_report(results, args.duration_s, slo_from_args(args))
     summary_stem = stem.with_name(f"{stem.name}_summary")
     write_summary(
         sibling(summary_stem, ".json"), sibling(summary_stem, ".csv"), report,
         target_qps=args.target_qps, duration_s=args.duration_s,
     )
     print(f"wrote {len(results)} results to {stem}.json/.csv, summary to {summary_stem}.json/.csv")
-    if not report.keeps_up:
-        print(f"server did not keep up: {report.failures} failures, latency growth "
-              f"{report.latency_growth}")
+    if report.keeps_up is not True:
+        print(f"keep-up verdict {report.keeps_up}: {report.failures} failures, "
+              f"TTFT growth {report.ttft_growth}")
 
 
 if __name__ == "__main__":
