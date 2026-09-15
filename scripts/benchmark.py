@@ -29,6 +29,7 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import replace
 from pathlib import Path
 
@@ -223,8 +224,8 @@ def bench_pareto(args: argparse.Namespace, out_dir: Path) -> None:
 def _measure_capacity(
     args: argparse.Namespace, env: dict[str, str], out_stem: Path, log_path: Path
 ) -> RunReport:
-    """Closed-loop maximum throughput. Raises if any request failed: the client has no
-    timeout, so a failure is the server's."""
+    """Closed-loop maximum throughput. The client has no timeout, so any failure is the
+    server's: it is reported with the run, and the server log records why."""
     with _running_server(env, args.ready_timeout, log_path) as base_url:
         with GpuMonitor() as gpu, KvUtilizationMonitor(base_url) as kv:
             results = _closed_loop(base_url, args)
@@ -239,7 +240,7 @@ def _measure_capacity(
         peak_kv_utilization=kv.stats.peak_utilization,
     )
     if report.failures:
-        raise RuntimeError(f"{report.failures} closed-loop requests failed; see {out_stem}.json")
+        print(f"{report.failures} closed-loop requests failed; see {log_path}")
     return report
 
 
@@ -258,7 +259,10 @@ def bench_offline(args: argparse.Namespace, out_dir: Path) -> None:
 
 
 def _sweep_qps(capacities: list[float]) -> list[float]:
-    points = {round(f * capacity, 2) for capacity in capacities for f in SWEEP_FRACTIONS}
+    # An arm that completed nothing has no range to sweep; its capacity bar shows why.
+    points = {
+        round(f * capacity, 2) for capacity in capacities if capacity > 0 for f in SWEEP_FRACTIONS
+    }
     return sorted(points)
 
 
@@ -353,13 +357,20 @@ def bench_kernels(args: argparse.Namespace, out_dir: Path) -> None:
     _run_ablation(args, out_dir, "kernel_ablation", "LLM_USE_CUSTOM_KERNELS", ["true", "false"])
 
 
+BENCHES = {
+    "pareto": bench_pareto,
+    "offline": bench_offline,
+    "scheduler": bench_scheduler,
+    "allocator": bench_allocator,
+    "kernels": bench_kernels,
+}
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Launch llm-serve under different configs and benchmark each."
     )
-    parser.add_argument(
-        "bench", choices=["pareto", "offline", "scheduler", "allocator", "kernels", "all"]
-    )
+    parser.add_argument("bench", choices=[*BENCHES, "all"])
     parser.add_argument(
         "--model", default="unsloth/Llama-3.2-3B-Instruct",
         help="model for every server run; matches ModelConfig's own default",
@@ -411,16 +422,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
-    if args.bench in ("pareto", "all"):
-        bench_pareto(args, args.out_dir)
-    if args.bench in ("offline", "all"):
-        bench_offline(args, args.out_dir)
-    if args.bench in ("scheduler", "all"):
-        bench_scheduler(args, args.out_dir)
-    if args.bench in ("allocator", "all"):
-        bench_allocator(args, args.out_dir)
-    if args.bench in ("kernels", "all"):
-        bench_kernels(args, args.out_dir)
+    failed = []
+    for name, bench in BENCHES.items():
+        if args.bench not in (name, "all"):
+            continue
+        try:
+            bench(args, args.out_dir)
+        except Exception:
+            traceback.print_exc()
+            failed.append(name)
+    if failed:
+        sys.exit(f"failed: {', '.join(failed)}; server logs are in {args.out_dir / 'logs'}")
 
 
 if __name__ == "__main__":
