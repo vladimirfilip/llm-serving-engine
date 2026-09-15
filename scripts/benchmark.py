@@ -44,7 +44,7 @@ from llm_serving_engine.loadgen.client import (
     request_sender,
 )
 from llm_serving_engine.loadgen.gpu_monitor import GpuMonitor
-from llm_serving_engine.loadgen.kv_monitor import KvUtilizationMonitor
+from llm_serving_engine.loadgen.kv_monitor import KvCacheMonitor
 from llm_serving_engine.loadgen.report import RunReport, build_report
 from llm_serving_engine.loadgen.results_io import sibling, write_raw, write_summary
 from llm_serving_engine.loadgen.timing import closed_loop_load_gen, open_loop_load_gen
@@ -172,7 +172,7 @@ def bench_pareto(args: argparse.Namespace, out_dir: Path) -> None:
     log_path = _logs(out_dir, "pareto")
     with _running_server(_base_env(args), args.ready_timeout, log_path) as base_url:
         for qps in args.qps:
-            with GpuMonitor() as gpu, KvUtilizationMonitor(base_url) as kv:
+            with GpuMonitor() as gpu, KvCacheMonitor(base_url) as kv:
                 results = _open_loop(base_url, qps, args)
             run = {"target_qps": qps, "duration_s": args.duration_s, "results": results}
             report = build_report(results, slo)
@@ -186,12 +186,16 @@ def bench_pareto(args: argparse.Namespace, out_dir: Path) -> None:
                 mean_gpu_utilization_pct=gpu.stats.mean_utilization_pct,
                 peak_kv_utilization=kv.stats.peak_utilization,
                 mean_kv_utilization=kv.stats.mean_utilization,
+                preemptions=kv.stats.preemptions,
             )
             runs.append(run)
             reports.append(report)
             gpu_stats.append(gpu.stats)
             kv_stats.append(kv.stats)
-            print(f"[pareto] qps={qps:g}: {len(results)} requests, {_describe(report)}")
+            print(
+                f"[pareto] qps={qps:g}: {len(results)} requests, {_describe(report)} "
+                f"preemptions={kv.stats.preemptions}"
+            )
 
     plot_dir = out_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
@@ -232,7 +236,7 @@ def _measure_capacity(
     """Closed-loop maximum throughput. The client has no timeout, so any failure is the
     server's: it is reported with the run, and the server log records why."""
     with _running_server(env, args.ready_timeout, log_path) as base_url:
-        with GpuMonitor() as gpu, KvUtilizationMonitor(base_url) as kv:
+        with GpuMonitor() as gpu, KvCacheMonitor(base_url) as kv:
             results = _closed_loop(base_url, args)
     report = build_report(results)
     run = {"concurrency": args.concurrency, "duration_s": args.duration_s, "results": results}
@@ -243,6 +247,7 @@ def _measure_capacity(
         report, concurrency=args.concurrency, duration_s=args.duration_s,
         peak_gpu_memory_mb=gpu.stats.peak_memory_used_mb,
         peak_kv_utilization=kv.stats.peak_utilization,
+        preemptions=kv.stats.preemptions,
     )
     if report.failures:
         print(f"{report.failures} closed-loop requests failed; see {log_path}")
