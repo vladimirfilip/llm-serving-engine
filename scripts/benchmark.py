@@ -67,38 +67,46 @@ SWEEP_FRACTIONS = (0.25, 0.5, 0.75, 1.0)
 
 
 @contextlib.contextmanager
-def _running_server(env_overrides: dict[str, str], ready_timeout: float):
-    """Spawns `llm-serve` with `env_overrides` layered on the current environment, blocks
-    until `/health` answers, and always tears the process down, so a failed run never
-    leaves a stray server holding the port."""
+def _running_server(env_overrides: dict[str, str], ready_timeout: float, log_path: Path):
+    """Spawns `llm-serve` with `env_overrides` layered on the current environment and its
+    output in `log_path`, blocks until `/health` answers, and always tears the process down,
+    so a failed run never leaves a stray server holding the port."""
     env = {**os.environ, **env_overrides}
     base_url = f"http://127.0.0.1:{env_overrides['LLM_PORT']}"
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "llm_serving_engine.server"],
-        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    try:
-        _wait_until_healthy(base_url, proc, ready_timeout)
-        yield base_url
-    finally:
-        proc.terminate()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w") as log:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "llm_serving_engine.server"],
+            env=env, stdout=log, stderr=subprocess.STDOUT,
+        )
         try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            _wait_until_healthy(base_url, proc, ready_timeout, log_path)
+            yield base_url
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
 
 
-def _wait_until_healthy(base_url: str, proc: subprocess.Popen, timeout: float) -> None:
+def _wait_until_healthy(
+    base_url: str, proc: subprocess.Popen, timeout: float, log_path: Path
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            raise RuntimeError(f"server process exited early with code {proc.returncode}")
+            raise RuntimeError(f"server exited early with code {proc.returncode}; see {log_path}")
         with contextlib.suppress(httpx.TransportError):
             if httpx.get(f"{base_url}/health", timeout=1.0).status_code == 200:
                 return
         time.sleep(0.5)
-    raise TimeoutError(f"server did not become healthy within {timeout}s")
+    raise TimeoutError(f"server did not become healthy within {timeout}s; see {log_path}")
+
+
+def _logs(out_dir: Path, name: str) -> Path:
+    return out_dir / "logs" / f"{name}.log"
 
 
 def _workload(args: argparse.Namespace) -> list[RequestShape]:
@@ -155,7 +163,8 @@ def bench_pareto(args: argparse.Namespace, out_dir: Path) -> None:
     and KV utilization against offered load."""
     slo = slo_from_args(args)
     runs, reports, gpu_stats, kv_stats = [], [], [], []
-    with _running_server(_base_env(args), args.ready_timeout) as base_url:
+    log_path = _logs(out_dir, "pareto")
+    with _running_server(_base_env(args), args.ready_timeout, log_path) as base_url:
         for qps in args.qps:
             with GpuMonitor() as gpu, KvUtilizationMonitor(base_url) as kv:
                 results = _open_loop(base_url, qps, args)
@@ -212,11 +221,11 @@ def bench_pareto(args: argparse.Namespace, out_dir: Path) -> None:
 
 
 def _measure_capacity(
-    args: argparse.Namespace, env: dict[str, str], out_stem: Path
+    args: argparse.Namespace, env: dict[str, str], out_stem: Path, log_path: Path
 ) -> RunReport:
     """Closed-loop maximum throughput. Raises if any request failed: the client has no
     timeout, so a failure is the server's."""
-    with _running_server(env, args.ready_timeout) as base_url:
+    with _running_server(env, args.ready_timeout, log_path) as base_url:
         with GpuMonitor() as gpu, KvUtilizationMonitor(base_url) as kv:
             results = _closed_loop(base_url, args)
     report = build_report(results)
@@ -236,7 +245,9 @@ def _measure_capacity(
 
 def bench_offline(args: argparse.Namespace, out_dir: Path) -> None:
     """Maximum throughput: `--concurrency` clients kept busy for the whole run."""
-    report = _measure_capacity(args, _base_env(args), out_dir / "offline" / "offline")
+    report = _measure_capacity(
+        args, _base_env(args), out_dir / "offline" / "offline", _logs(out_dir, "offline")
+    )
     print(f"[offline] {_describe(report)}")
     print(
         f"[offline] concurrency={args.concurrency}: "
@@ -260,7 +271,10 @@ def _run_ablation(
     base_env = _base_env(args)
     envs = {arm: {**base_env, env_key: arm} for arm in arms}
     capacity = {
-        arm: _measure_capacity(args, envs[arm], out_dir / name / arm / "capacity").throughput_req_s
+        arm: _measure_capacity(
+            args, envs[arm], out_dir / name / arm / "capacity",
+            _logs(out_dir, f"{name}_{arm}_capacity"),
+        ).throughput_req_s
         for arm in arms
     }
     for arm in arms:
@@ -269,7 +283,8 @@ def _run_ablation(
 
     reports: dict[str, list[RunReport]] = {arm: [] for arm in arms}
     for arm in arms:
-        with _running_server(envs[arm], args.ready_timeout) as base_url:
+        log_path = _logs(out_dir, f"{name}_{arm}")
+        with _running_server(envs[arm], args.ready_timeout, log_path) as base_url:
             for qps in qps_values:
                 results = _open_loop(base_url, qps, args)
                 report = build_report(results, slo)
