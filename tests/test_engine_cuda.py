@@ -1,5 +1,5 @@
-"""The whole engine on the GPU: tiny Llama, paged KV, decode graphs and the real scheduler
-threads."""
+"""The whole engine on the GPU: tiny Llama, KV pool sizing, decode graphs and the real
+scheduler threads."""
 
 from __future__ import annotations
 
@@ -60,6 +60,32 @@ async def test_preemption_under_kv_pressure_changes_no_output(tiny_llama_dir):
     assert REGISTRY.get_sample_value("llm_preemptions_total") > before
     assert constrained == unconstrained
     assert all(len(stream) == 21 for stream in constrained)  # 20 tokens + DONE
+
+
+def test_a_contiguous_pool_leaves_the_eager_activation_peak_free(tiny_llama_dir, monkeypatch):
+    free_bytes = 64 * 1024**2
+    monkeypatch.setattr("llm_serving_engine.engine._free_memory_bytes", lambda runner: free_bytes)
+    config = make_config(
+        model=ModelConfig(model_name_or_path=str(tiny_llama_dir), dtype="float32"),
+        kv_cache=KVCacheConfig(block_size=BLOCK_SIZE),
+        kv_allocator="contiguous",
+        max_concurrent_sequences=4,
+    )
+    runner = ModelRunner(config.model)
+    reserves = []
+    measure = runner.bytes_beyond_kv_pool
+
+    def recorded_measure(*args):
+        reserves.append(measure(*args))
+        return reserves[-1]
+
+    monkeypatch.setattr(runner, "bytes_beyond_kv_pool", recorded_measure)
+    engine = InferenceEngine(config, VocabTokenizer(), runner)
+
+    [reserved] = reserves
+    assert reserved > 0
+    capacity_tokens = config.kv_cache.num_blocks(free_bytes - reserved) * BLOCK_SIZE
+    assert engine.allocator.capacity_tokens == capacity_tokens
 
 
 # Runs in a subprocess: the device-side assert it triggers poisons CUDA for the whole process.

@@ -85,12 +85,17 @@ class InferenceEngine:
         graphs = config.model.use_cuda_graphs
         decode_buckets = decode_graph_buckets(self.scheduler.max_running) if graphs else []
         piecewise_buckets = piecewise_graph_buckets(max_tokens) if graphs else []
-        paged_kernels = config.kv_allocator == "paged" and config.model.use_custom_kernels
+        paged = config.kv_allocator == "paged"
         if allocator is None:
             reserved = 0
-            if paged_kernels and model_runner.device.startswith("cuda"):
+            if config.model.use_custom_kernels and model_runner.device.startswith("cuda"):
+                # Graphs replay only against a paged pool, but every fused iteration needs its
+                # activation peak free, whichever allocator holds the KV.
                 reserved = model_runner.bytes_beyond_kv_pool(
-                    config.kv_cache.block_size, max_tokens, decode_buckets, piecewise_buckets
+                    config.kv_cache.block_size,
+                    max_tokens,
+                    decode_buckets if paged else [],
+                    piecewise_buckets if paged else [],
                 )
             allocator = _build_allocator(config, model_runner, reserved)
         self.allocator = allocator
@@ -276,9 +281,9 @@ def _build_scheduler(config: EngineConfig) -> Scheduler:
 def _build_allocator(
     config: EngineConfig, model_runner: ModelRunner, reserved_bytes: int
 ) -> KVAllocator:
-    """Sizes the pool from free memory less `reserved_bytes`, what a paged run's CUDA graphs
-    and largest eager iteration hold. A contiguous run reserves nothing and allocates each
-    sequence's buffer from the same capacity at admission."""
+    """Sizes the pool from free memory less `reserved_bytes`: the largest eager iteration's
+    activations, plus a paged run's CUDA graphs. A contiguous run allocates each sequence's
+    buffer from the resulting capacity at admission."""
     block_size = config.kv_cache.block_size
     num_blocks = config.kv_cache.num_blocks(_free_memory_bytes(model_runner) - reserved_bytes)
     if config.kv_allocator == "contiguous":
