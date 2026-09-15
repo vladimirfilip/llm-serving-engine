@@ -12,6 +12,7 @@ long prompts and outputs push KV-cache usage toward the pool's capacity.
     python scripts/benchmark.py scheduler
     python scripts/benchmark.py allocator
     python scripts/benchmark.py kernels
+    python scripts/benchmark.py token_budget
     python scripts/benchmark.py all
 
 `pareto` sweeps open-loop offered load against the reference config. `offline` measures
@@ -411,12 +412,21 @@ def bench_kernels(args: argparse.Namespace, out_dir: Path) -> None:
     _run_ablation(args, out_dir, "kernel_ablation", "LLM_USE_CUSTOM_KERNELS", ["true", "false"])
 
 
+def bench_token_budget(args: argparse.Namespace, out_dir: Path) -> None:
+    """Prefill tokens per iteration. Every sequence decoding beside a prefill chunk waits
+    out that chunk, so a smaller budget trades throughput for a shorter ITL tail."""
+    _run_ablation(
+        args, out_dir, "token_budget_ablation", "LLM_TOKEN_BUDGET", ["1024", "2048", "4096"]
+    )
+
+
 BENCHES = {
     "pareto": bench_pareto,
     "offline": bench_offline,
     "scheduler": bench_scheduler,
     "allocator": bench_allocator,
     "kernels": bench_kernels,
+    "token_budget": bench_token_budget,
 }
 
 
