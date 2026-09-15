@@ -2,7 +2,8 @@ import httpx
 import pytest
 
 from llm_serving_engine.loadgen.client import (
-    DEFAULT_PROMPTS,
+    WORKLOAD,
+    RequestShape,
     load_client,
     request_sender,
     send_request,
@@ -19,7 +20,7 @@ def _sse_client(body: str, status_code: int = 200) -> httpx.AsyncClient:
 
 
 @pytest.mark.asyncio
-async def test_send_request_counts_tokens_and_measures_first_token_latency():
+async def test_send_request_timestamps_every_token_and_leaves_latencies_to_the_timing_loop():
     body = (
         'data: {"token": "Hello"}\n\ndata: {"token": " world"}\n\n'
         'data: {"done": true, "prompt_tokens": 5, "output_tokens": 2}\n\n'
@@ -30,8 +31,7 @@ async def test_send_request_counts_tokens_and_measures_first_token_latency():
     assert result["success"] is True
     assert result["error"] is None
     assert result["num_tokens_received"] == 2
-    assert result["first_token_latency"] >= 0
-    assert "latency" not in result  # only the timing loop measures latency
+    assert "latency" not in result and "first_token_latency" not in result
     assert result["prompt_tokens"] == 5
     assert result["output_tokens"] == 2
     assert result["token_times"] == sorted(result["token_times"])
@@ -73,17 +73,46 @@ async def test_send_request_passes_sampling_params_in_the_body():
 
 
 @pytest.mark.asyncio
-async def test_request_sender_sends_one_of_its_prompts(monkeypatch):
+async def test_request_sender_draws_shapes_by_weight_and_sends_each_shape_s_max_tokens(
+    monkeypatch,
+):
     sent = []
 
     async def fake_send_request(client, prompt, sampling_params):
-        sent.append(prompt)
+        sent.append((prompt, sampling_params))
         return {"success": True}
 
     monkeypatch.setattr("llm_serving_engine.loadgen.client.send_request", fake_send_request)
+    workload = [
+        RequestShape("short", "hi", max_tokens=4, weight=1.0),
+        RequestShape("never", "unused", max_tokens=999, weight=0.0),
+    ]
     async with load_client("http://test") as client:
-        await request_sender(client)()
-        await request_sender(client, prompts=["only-one"])()
+        send = request_sender(client, workload, SamplingParams(temperature=0.5))
+        results = [await send() for _ in range(20)]
 
-    assert sent[0] in DEFAULT_PROMPTS
-    assert sent[1] == "only-one"
+    assert {r["shape"] for r in results} == {"short"}
+    assert {(prompt, params.max_tokens, params.temperature) for prompt, params in sent} == {
+        ("hi", 4, 0.5)
+    }
+
+
+def test_workload_shapes_grow_from_chat_to_a_prompt_past_two_token_budgets():
+    by_name = {}
+    for shape in WORKLOAD:
+        by_name.setdefault(shape.name, []).append(shape)
+    longest_chat = max(len(shape.prompt) for shape in by_name["chat"])
+    document, long_document = by_name["document"][0], by_name["long_document"][0]
+    chunked = by_name["chunked_document"][0]
+    assert longest_chat < len(document.prompt) < len(long_document.prompt) < len(chunked.prompt)
+    assert by_name["chat"][0].max_tokens < document.max_tokens < long_document.max_tokens
+    assert sum(shape.weight for shape in WORKLOAD) == pytest.approx(1.0)
+
+
+def test_chunked_document_prompt_spans_more_than_two_token_budgets():
+    # worker_log lines are 19 Llama-3 tokens each; the prompt must exceed 2 * TOKEN_BUDGET
+    # so its prefill takes at least three chunks.
+    from llm_serving_engine.scheduling.scheduler import TOKEN_BUDGET
+
+    chunked = next(shape for shape in WORKLOAD if shape.name == "chunked_document")
+    assert chunked.prompt.count("\n") * 19 > 2 * TOKEN_BUDGET

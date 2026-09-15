@@ -103,9 +103,15 @@ def _synthetic_summaries(n: int, base: float) -> list:
     return [summarize([base + rng.random() * 0.01 for _ in range(20)]) for _ in range(n)]
 
 
-def test_plot_ttft_by_qps_writes_nonempty_file(tmp_path):
+def test_plot_ttft_by_qps_draws_each_shape_and_drops_its_missing_points(tmp_path):
     out = tmp_path / "ttft.png"
-    plot_ttft_by_qps([1, 2, 4], _synthetic_summaries(3, 0.05), str(out))
+    chat, document = _synthetic_summaries(3, 0.05), _synthetic_summaries(3, 0.5)
+    by_shape = [
+        {"chat": chat[0], "document": document[0]},
+        {"chat": chat[1]},  # no document completed at this point
+        {"chat": chat[2], "document": document[2]},
+    ]
+    plot_ttft_by_qps([1, 2, 4], by_shape, str(out))
     assert out.exists() and out.stat().st_size > 0
 
 
@@ -122,9 +128,9 @@ def test_plot_e2e_latency_by_qps_writes_nonempty_file(tmp_path):
 
 
 def test_plot_percentile_by_qps_skips_none_points(tmp_path):
-    out = tmp_path / "ttft_partial.png"
+    out = tmp_path / "tpot_partial.png"
     summaries = _synthetic_summaries(2, 0.05)
-    plot_ttft_by_qps([1, 2, 4], [summaries[0], None, summaries[1]], str(out))
+    plot_tpot_by_qps([1, 2, 4], [summaries[0], None, summaries[1]], str(out))
     assert out.exists() and out.stat().st_size > 0
 
 

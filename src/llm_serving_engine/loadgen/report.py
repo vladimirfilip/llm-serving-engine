@@ -29,7 +29,9 @@ class RunReport:
     output_tokens_s: float
     input_tokens_s: float
     total_tokens_s: float
-    ttft: LatencySummary | None
+    # TTFT grows with prompt length, so it is summarized per request shape, never blended.
+    # Open loop only: a closed loop's TTFT measures the queue its own clients hold full.
+    ttft_by_shape: dict[str, LatencySummary]
     tpot: LatencySummary | None
     e2e_latency: LatencySummary | None
     itl: LatencySummary | None
@@ -83,7 +85,10 @@ def build_report(results: list[dict], slo: SLOThresholds | None = None) -> RunRe
     def per_second(count: float) -> float:
         return count / elapsed if elapsed else 0.0
 
-    ttfts = [r["first_token_latency"] for r in successes if r.get("first_token_latency") is not None]
+    ttfts_by_shape: dict[str, list[float]] = {}
+    for r in successes:
+        if "scheduled_at" in r and r["first_token_latency"] is not None:
+            ttfts_by_shape.setdefault(r["shape"], []).append(r["first_token_latency"])
     e2es = [r["latency"] for r in successes]
     tpots = [t for t in (tpot(r) for r in successes) if t is not None]
     itls = [b - a for r in successes for a, b in pairwise(r.get("token_times") or [])]
@@ -97,7 +102,7 @@ def build_report(results: list[dict], slo: SLOThresholds | None = None) -> RunRe
         output_tokens_s=per_second(output_tokens),
         input_tokens_s=per_second(input_tokens),
         total_tokens_s=per_second(output_tokens + input_tokens),
-        ttft=summarize(ttfts) if ttfts else None,
+        ttft_by_shape={shape: summarize(ttfts) for shape, ttfts in sorted(ttfts_by_shape.items())},
         tpot=summarize(tpots) if tpots else None,
         e2e_latency=summarize(e2es) if e2es else None,
         itl=summarize(itls) if itls else None,

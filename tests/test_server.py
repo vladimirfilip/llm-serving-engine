@@ -150,7 +150,6 @@ async def test_loadgen_client_parses_this_server_s_sse_stream():
 
     assert result["success"] is True
     assert result["num_tokens_received"] == 3
-    assert result["first_token_latency"] is not None
     assert result["prompt_tokens"] == 1
     assert result["output_tokens"] == 3
     assert len(result["token_times"]) == 3

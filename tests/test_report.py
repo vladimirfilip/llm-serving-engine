@@ -10,7 +10,10 @@ from llm_serving_engine.loadgen.report import (
 
 
 def _request(latency, first_token_latency, output_tokens, completed_at=1.0, **fields):
+    """An open-loop result; drop "scheduled_at" for a closed-loop one."""
     return {
+        "scheduled_at": 0.0,
+        "shape": "chat",
         "success": True,
         "latency": latency,
         "first_token_latency": first_token_latency,
@@ -49,16 +52,28 @@ def test_failed_requests_count_toward_the_wall_clock_but_not_throughput():
     report = build_report(results)
     assert report.failures == 1
     assert report.throughput_req_s == pytest.approx(1 / 4.0)
-    assert report.ttft.count == 1
+    assert report.ttft_by_shape["chat"].count == 1
     assert not report.keeps_up
 
 
 def test_latency_summaries_reflect_named_metrics():
     results = [_request(1.0, 0.1, output_tokens=5), _request(2.0, 0.3, output_tokens=5)]
     report = build_report(results)
-    assert report.ttft.mean == pytest.approx((0.1 + 0.3) / 2)
+    assert report.ttft_by_shape["chat"].mean == pytest.approx((0.1 + 0.3) / 2)
     assert report.e2e_latency.mean == pytest.approx((1.0 + 2.0) / 2)
     assert report.tpot.mean == pytest.approx(((1.0 - 0.1) / 4 + (2.0 - 0.3) / 4) / 2)
+
+
+def test_ttft_is_summarized_separately_for_each_request_shape():
+    results = [
+        _request(1.0, 0.05, output_tokens=3),
+        _request(1.0, 0.07, output_tokens=3),
+        _request(9.0, 4.0, output_tokens=3, shape="chunked_document"),
+    ]
+    report = build_report(results)
+    assert set(report.ttft_by_shape) == {"chat", "chunked_document"}
+    assert report.ttft_by_shape["chat"].max == pytest.approx(0.07)
+    assert report.ttft_by_shape["chunked_document"].p50 == pytest.approx(4.0)
 
 
 def test_itl_flattens_token_gaps_across_requests():
@@ -85,8 +100,12 @@ def test_a_growing_backlog_does_not_keep_up():
     assert not build_report(results).keeps_up
 
 
-def test_closed_loop_results_have_no_latency_growth():
-    assert latency_growth([_request(0.5, 0.1, 3) for _ in range(8)]) is None
+def test_closed_loop_results_have_no_latency_growth_and_no_ttft():
+    closed_loop = [_request(0.5, 0.1, 3) for _ in range(8)]
+    for result in closed_loop:
+        del result["scheduled_at"]
+    assert latency_growth(closed_loop) is None
+    assert build_report(closed_loop).ttft_by_shape == {}
 
 
 def test_wall_clock_of_no_results_is_zero():

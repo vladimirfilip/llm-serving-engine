@@ -110,3 +110,33 @@ async def test_closed_loop_keeps_exactly_concurrency_requests_in_flight():
     assert peak == 3
     assert len(results) >= 3 * 8  # each client sends back to back for the whole run
     assert all("scheduled_at" not in r and r["completed_at"] > 0 for r in results)
+
+
+@pytest.mark.asyncio
+async def test_first_token_latency_counts_from_the_intended_send_time(monkeypatch):
+    monkeypatch.setattr("llm_serving_engine.loadgen.timing.random.expovariate", lambda qps: 0.05)
+    calls = 0
+
+    async def send_fn() -> dict:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            time.sleep(0.12)  # blocks the loop: the next arrivals go out late
+        return {"token_times": [time.monotonic()]}
+
+    results = await open_loop_load_gen(target_qps=20.0, duration_s=0.12, send_fn=send_fn)
+
+    late = [r for r in results if r["scheduled_at"] > 0]
+    assert late
+    assert all(
+        r["first_token_latency"] >= 0.12 - r["scheduled_at"] - 0.005 for r in late
+    )  # the stall counts, though each send got its token instantly
+
+
+@pytest.mark.asyncio
+async def test_a_request_with_no_tokens_has_no_first_token_latency():
+    async def send_fn() -> dict:
+        return {"token_times": []}
+
+    results = await closed_loop_load_gen(concurrency=1, duration_s=0.01, send_fn=send_fn)
+    assert all(r["first_token_latency"] is None for r in results)

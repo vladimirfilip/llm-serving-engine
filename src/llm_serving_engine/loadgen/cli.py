@@ -9,10 +9,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from ..model.sampling import SamplingParams
-from .client import load_client, request_sender
+from .client import WORKLOAD, RequestShape, load_client, request_sender
 from .report import SLOThresholds, build_report
 from .results_io import write_raw, write_summary
 from .timing import open_loop_load_gen
@@ -41,7 +42,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "since p99 on a handful of samples is just max()",
     )
     parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="engine base URL")
-    parser.add_argument("--max-tokens", type=int, default=None, help="override SamplingParams")
+    parser.add_argument(
+        "--max-tokens", type=int, default=None, help="override every request shape's max_tokens"
+    )
     parser.add_argument("--temperature", type=float, default=None, help="override SamplingParams")
     parser.add_argument("--top-p", type=float, default=None, help="override SamplingParams")
     parser.add_argument(
@@ -52,15 +55,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _workload_from_args(args: argparse.Namespace) -> list[RequestShape]:
+    if args.max_tokens is None:
+        return WORKLOAD
+    return [replace(shape, max_tokens=args.max_tokens) for shape in WORKLOAD]
+
+
 def _sampling_params_from_args(args: argparse.Namespace) -> SamplingParams | None:
-    overrides = {"max_tokens": args.max_tokens, "temperature": args.temperature, "top_p": args.top_p}
+    overrides = {"temperature": args.temperature, "top_p": args.top_p}
     given = {k: v for k, v in overrides.items() if v is not None}
     return SamplingParams(**given) if given else None
 
 
 async def _run(args: argparse.Namespace) -> list[dict]:
     async with load_client(args.base_url) as client:
-        send = request_sender(client, _sampling_params_from_args(args))
+        send = request_sender(client, _workload_from_args(args), _sampling_params_from_args(args))
         return await open_loop_load_gen(args.target_qps, args.duration_s, send)
 
 

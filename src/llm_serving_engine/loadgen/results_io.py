@@ -22,7 +22,7 @@ def write_raw(json_path: Path, csv_path: Path, run: dict) -> None:
 
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
-        "success", "error", "scheduled_at_s", "completed_at_s", "latency_s",
+        "shape", "success", "error", "scheduled_at_s", "completed_at_s", "latency_s",
         "first_token_latency_s", "tpot_s",
         "prompt_tokens", "output_tokens", "num_tokens_received",
     ]
@@ -31,6 +31,7 @@ def write_raw(json_path: Path, csv_path: Path, run: dict) -> None:
         writer.writeheader()
         for r in run["results"]:
             writer.writerow({
+                "shape": r.get("shape"),
                 "success": r.get("success", True),
                 "error": r.get("error"),
                 "scheduled_at_s": r.get("scheduled_at"),
@@ -71,8 +72,9 @@ def _flatten_report(report: RunReport) -> dict:
         "total_tokens_s": report.total_tokens_s,
         "goodput_req_s": report.goodput_req_s,
     }
-    for stage in ("ttft", "tpot", "e2e_latency", "itl"):
-        summary = getattr(report, stage)
+    stages = {f"ttft_{shape}": summary for shape, summary in report.ttft_by_shape.items()}
+    stages |= {"tpot": report.tpot, "e2e_latency": report.e2e_latency, "itl": report.itl}
+    for stage, summary in stages.items():
         if summary is None:
             continue
         for field_name, value in asdict(summary).items():

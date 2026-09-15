@@ -3,7 +3,9 @@ each with the load generator, and regenerates plots from the raw results written
 The JSON files are the source of truth: rerun this script to update a plot.
 
 Every run starts from the reference config (`_base_env`): a Llama-family model on CUDA with
-custom kernels; continuous batching and paged KV are the engine's own defaults.
+custom kernels; continuous batching and paged KV are the engine's own defaults. Every load run
+sends the load generator's WORKLOAD: mostly short chat turns, plus document requests whose
+long prompts and outputs push KV-cache usage toward the pool's capacity.
 
     python scripts/benchmark.py pareto     --qps 1 2 4
     python scripts/benchmark.py offline
@@ -27,18 +29,23 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
 
 from llm_serving_engine.loadgen.cli import add_slo_arguments, slo_from_args
-from llm_serving_engine.loadgen.client import load_client, request_sender
+from llm_serving_engine.loadgen.client import (
+    WORKLOAD,
+    RequestShape,
+    load_client,
+    request_sender,
+)
 from llm_serving_engine.loadgen.gpu_monitor import GpuMonitor
 from llm_serving_engine.loadgen.kv_monitor import KvUtilizationMonitor
 from llm_serving_engine.loadgen.report import RunReport, build_report
 from llm_serving_engine.loadgen.results_io import write_raw, write_summary
 from llm_serving_engine.loadgen.timing import closed_loop_load_gen, open_loop_load_gen
-from llm_serving_engine.model.sampling import SamplingParams
 from llm_serving_engine.observability.plotting import (
     plot_ablation_bar,
     plot_ablation_sweep,
@@ -94,14 +101,16 @@ def _wait_until_healthy(base_url: str, proc: subprocess.Popen, timeout: float) -
     raise TimeoutError(f"server did not become healthy within {timeout}s")
 
 
-def _sampling_params(args: argparse.Namespace) -> SamplingParams:
-    return SamplingParams(max_tokens=args.max_tokens)
+def _workload(args: argparse.Namespace) -> list[RequestShape]:
+    if args.max_tokens is None:
+        return WORKLOAD
+    return [replace(shape, max_tokens=args.max_tokens) for shape in WORKLOAD]
 
 
 def _open_loop(base_url: str, qps: float, args: argparse.Namespace) -> list[dict]:
     async def run() -> list[dict]:
         async with load_client(base_url) as client:
-            send = request_sender(client, _sampling_params(args))
+            send = request_sender(client, _workload(args))
             return await open_loop_load_gen(qps, args.duration_s, send)
 
     return asyncio.run(run())
@@ -110,7 +119,7 @@ def _open_loop(base_url: str, qps: float, args: argparse.Namespace) -> list[dict
 def _closed_loop(base_url: str, args: argparse.Namespace) -> list[dict]:
     async def run() -> list[dict]:
         async with load_client(base_url) as client:
-            send = request_sender(client, _sampling_params(args))
+            send = request_sender(client, _workload(args))
             return await closed_loop_load_gen(args.concurrency, args.duration_s, send)
 
     return asyncio.run(run())
@@ -130,9 +139,13 @@ def _base_env(args: argparse.Namespace) -> dict[str, str]:
 
 def _describe(report: RunReport) -> str:
     e2e_p99 = report.e2e_latency.p99 * 1000 if report.e2e_latency else float("nan")
+    ttft_p50 = "".join(
+        f" ttft_p50[{shape}]={summary.p50 * 1000:.0f}ms"
+        for shape, summary in report.ttft_by_shape.items()
+    )
     verdict = "kept up" if report.keeps_up else "did NOT keep up"
     return (
-        f"throughput={report.throughput_req_s:.2f} req/s e2e_p99={e2e_p99:.0f}ms "
+        f"throughput={report.throughput_req_s:.2f} req/s e2e_p99={e2e_p99:.0f}ms{ttft_p50} "
         f"failures={report.failures} latency_growth={report.latency_growth} ({verdict})"
     )
 
@@ -169,7 +182,9 @@ def bench_pareto(args: argparse.Namespace, out_dir: Path) -> None:
     plot_dir.mkdir(parents=True, exist_ok=True)
     plot_latency_pareto(runs, str(plot_dir / "pareto.png"))
     plot_stage_latency_by_qps(runs, str(plot_dir / "pareto_stage_latency.png"))
-    plot_ttft_by_qps(args.qps, [r.ttft for r in reports], str(plot_dir / "pareto_ttft.png"))
+    plot_ttft_by_qps(
+        args.qps, [r.ttft_by_shape for r in reports], str(plot_dir / "pareto_ttft.png")
+    )
     plot_tpot_by_qps(args.qps, [r.tpot for r in reports], str(plot_dir / "pareto_tpot.png"))
     plot_e2e_latency_by_qps(
         args.qps, [r.e2e_latency for r in reports], str(plot_dir / "pareto_e2e_latency.png")
@@ -222,6 +237,7 @@ def _measure_capacity(
 def bench_offline(args: argparse.Namespace, out_dir: Path) -> None:
     """Maximum throughput: `--concurrency` clients kept busy for the whole run."""
     report = _measure_capacity(args, _base_env(args), out_dir / "offline" / "offline")
+    print(f"[offline] {_describe(report)}")
     print(
         f"[offline] concurrency={args.concurrency}: "
         f"throughput={report.throughput_req_s:.2f} req/s, "
@@ -286,10 +302,14 @@ def _run_ablation(
         qps_values, {arm: [ms(r.e2e_latency) for r in reports[arm]] for arm in arms}, kept_up,
         str(plot_dir / f"{name}_e2e_p99.png"), "end-to-end latency p99 (ms)",
     )
-    plot_ablation_sweep(
-        qps_values, {arm: [ms(r.ttft) for r in reports[arm]] for arm in arms}, kept_up,
-        str(plot_dir / f"{name}_ttft_p99.png"), "TTFT p99 (ms)",
-    )
+    for shape in sorted({shape for arm in arms for r in reports[arm] for shape in r.ttft_by_shape}):
+        plot_ablation_sweep(
+            qps_values,
+            {arm: [ms(r.ttft_by_shape.get(shape)) for r in reports[arm]] for arm in arms},
+            kept_up,
+            str(plot_dir / f"{name}_ttft_p99_{shape}.png"),
+            f"{shape} TTFT p99 (ms)",
+        )
     plot_ablation_sweep(
         qps_values, {arm: [r.throughput_req_s for r in reports[arm]] for arm in arms}, kept_up,
         str(plot_dir / f"{name}_throughput.png"), "achieved throughput (req/s)",
@@ -345,8 +365,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--duration-s", type=float, default=None,
-        help="length of each load run, seconds; long enough at the lowest QPS for a few "
-        "hundred completed requests (default: 300, or 60 with --quick)",
+        help="length of each load run, seconds; long enough at the lowest QPS for about a "
+        "hundred completed requests (default: 100, or 30 with --quick)",
     )
     parser.add_argument(
         "--qps", type=float, nargs="+", default=None,
@@ -357,7 +377,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="closed-loop clients for offline and ablation capacity runs; the default "
         "matches the engine's running-sequence cap, which saturates it",
     )
-    parser.add_argument("--max-tokens", type=int, default=32, help="generated tokens per request")
+    parser.add_argument(
+        "--max-tokens", type=int, default=None,
+        help="override every request shape's max_tokens (default: each shape's own)",
+    )
     parser.add_argument("--static-batch-size", type=int, default=8)
     parser.add_argument(
         "--ready-timeout", type=float, default=120.0, help="seconds to wait for /health"
@@ -365,7 +388,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_slo_arguments(parser)
     args = parser.parse_args(argv)
     if args.duration_s is None:
-        args.duration_s = 60.0 if args.quick else 300.0
+        args.duration_s = 30.0 if args.quick else 100.0
     if args.qps is None:
         args.qps = [1, 4] if args.quick else [1, 2, 4]
     return args

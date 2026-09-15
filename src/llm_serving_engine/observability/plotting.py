@@ -92,10 +92,32 @@ def _plot_percentiles_by_load(
 
 
 def plot_ttft_by_qps(
-    qps_values: list[float], ttft_summaries: list[LatencySummary | None], out_path: str
+    qps_values: list[float], ttft_by_shape: list[dict[str, LatencySummary]], out_path: str
 ) -> None:
-    """Offered request rate vs p50/p95/p99 time-to-first-token."""
-    _plot_percentiles_by_load(qps_values, ttft_summaries, out_path, "TTFT (ms)", "TTFT vs offered rate")
+    """Offered request rate vs TTFT p50 (solid) and p99 (dashed), one color per request
+    shape, on a log axis: TTFT grows with prompt length, so shapes span orders of magnitude.
+    A shape missing at a QPS point (no successful request of it there) is dropped there."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    shapes = sorted({shape for point in ttft_by_shape for shape in point})
+    fig, ax = plt.subplots()
+    for shape in shapes:
+        points = [(qps, point[shape]) for qps, point in zip(qps_values, ttft_by_shape, strict=True)
+                  if shape in point]
+        xs = [qps for qps, _summary in points]
+        (line,) = ax.plot(xs, [s.p50 * 1000 for _q, s in points], marker="o", label=f"{shape} p50")
+        ax.plot(xs, [s.p99 * 1000 for _q, s in points], marker="o", linestyle="--",
+                color=line.get_color(), label=f"{shape} p99")
+    ax.set_yscale("log")
+    ax.set_xlabel("offered request rate (req/s)")
+    ax.set_ylabel("TTFT (ms)")
+    ax.set_title("TTFT by request shape vs offered rate")
+    ax.legend(fontsize="small")
+    fig.savefig(out_path)
+    plt.close(fig)
 
 
 def plot_tpot_by_qps(
