@@ -118,7 +118,7 @@ def _open_loop(base_url: str, qps: float, args: argparse.Namespace) -> list[dict
 
 def _closed_loop(base_url: str, args: argparse.Namespace) -> list[dict]:
     async def run() -> list[dict]:
-        async with load_client(base_url) as client:
+        async with load_client(base_url, timeout_s=None) as client:
             send = request_sender(client, _workload(args))
             return await closed_loop_load_gen(args.concurrency, args.duration_s, send)
 
@@ -214,8 +214,8 @@ def bench_pareto(args: argparse.Namespace, out_dir: Path) -> None:
 def _measure_capacity(
     args: argparse.Namespace, env: dict[str, str], out_stem: Path
 ) -> RunReport:
-    """Closed-loop maximum throughput. Raises if any request failed: with a bounded number
-    of clients in flight nothing should time out, so a failure means the run is broken."""
+    """Closed-loop maximum throughput. Raises if any request failed: the client has no
+    timeout, so a failure is the server's."""
     with _running_server(env, args.ready_timeout) as base_url:
         with GpuMonitor() as gpu, KvUtilizationMonitor(base_url) as kv:
             results = _closed_loop(base_url, args)

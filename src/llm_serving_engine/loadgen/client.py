@@ -81,15 +81,24 @@ def _parse_sse_line(line: str) -> dict | None:
     return json.loads(payload)
 
 
+OPEN_LOOP_TIMEOUT_S = 60.0
+
+
 def load_client(
-    base_url: str, transport: httpx.AsyncBaseTransport | None = None
+    base_url: str,
+    timeout_s: float | None = OPEN_LOOP_TIMEOUT_S,
+    transport: httpx.AsyncBaseTransport | None = None,
 ) -> httpx.AsyncClient:
     """One client for a whole load run. Building a client loads a CA bundle, about 100 ms of
     CPU, so one per request would saturate the load generator before the server. Connections
-    are unbounded, so no request ever waits in the client for a free one."""
+    are unbounded, so no request ever waits in the client for a free one.
+
+    An open loop needs `timeout_s`: past capacity its backlog grows without bound. A closed
+    loop passes None: its clients bound the backlog, so a request queued behind them is slow,
+    not failed."""
     return httpx.AsyncClient(
         base_url=base_url,
-        timeout=60.0,
+        timeout=timeout_s,
         limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
         transport=transport,
     )
