@@ -26,6 +26,7 @@ import argparse
 import asyncio
 import contextlib
 import os
+import random
 import subprocess
 import sys
 import time
@@ -116,11 +117,15 @@ def _workload(args: argparse.Namespace) -> list[RequestShape]:
     return [replace(shape, max_tokens=args.max_tokens) for shape in WORKLOAD]
 
 
+def _rng(args: argparse.Namespace, stream: str) -> random.Random:
+    return random.Random(f"{args.seed}:{stream}")
+
+
 def _open_loop(base_url: str, qps: float, args: argparse.Namespace) -> list[dict]:
     async def run() -> list[dict]:
         async with load_client(base_url) as client:
-            send = request_sender(client, _workload(args))
-            return await open_loop_load_gen(qps, args.duration_s, send)
+            send = request_sender(client, _rng(args, "shapes"), _workload(args))
+            return await open_loop_load_gen(qps, args.duration_s, send, _rng(args, "arrivals"))
 
     return asyncio.run(run())
 
@@ -128,7 +133,7 @@ def _open_loop(base_url: str, qps: float, args: argparse.Namespace) -> list[dict
 def _closed_loop(base_url: str, args: argparse.Namespace) -> list[dict]:
     async def run() -> list[dict]:
         async with load_client(base_url, timeout_s=None) as client:
-            send = request_sender(client, _workload(args))
+            send = request_sender(client, _rng(args, "shapes"), _workload(args))
             return await closed_loop_load_gen(args.concurrency, args.duration_s, send)
 
     return asyncio.run(run())
@@ -393,6 +398,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--duration-s", type=float, default=None,
         help="length of each load run, seconds; long enough at the lowest QPS for about a "
         "hundred completed requests (default: 100, or 30 with --quick)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0,
+        help="seeds arrivals and request shapes, so every config faces the same workload",
     )
     parser.add_argument(
         "--qps", type=float, nargs="+", default=None,

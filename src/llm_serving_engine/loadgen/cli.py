@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import random
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -51,6 +52,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--out", type=Path, default=None, help="output path stem (default: results_<ts>); "
         "writes <stem>.json/.csv raw and <stem>_summary.json/.csv aggregate"
     )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="seeds arrivals and request shapes, so a run can be replayed (default: unseeded)",
+    )
     add_slo_arguments(parser)
     return parser.parse_args(argv)
 
@@ -67,10 +72,18 @@ def _sampling_params_from_args(args: argparse.Namespace) -> SamplingParams | Non
     return SamplingParams(**given) if given else None
 
 
+def _rng(seed: int | None, stream: str) -> random.Random:
+    return random.Random() if seed is None else random.Random(f"{seed}:{stream}")
+
+
 async def _run(args: argparse.Namespace) -> list[dict]:
     async with load_client(args.base_url) as client:
-        send = request_sender(client, _workload_from_args(args), _sampling_params_from_args(args))
-        return await open_loop_load_gen(args.target_qps, args.duration_s, send)
+        send = request_sender(
+            client, _rng(args.seed, "shapes"), _workload_from_args(args),
+            _sampling_params_from_args(args),
+        )
+        arrivals = _rng(args.seed, "arrivals")
+        return await open_loop_load_gen(args.target_qps, args.duration_s, send, arrivals)
 
 
 def _stem(out: Path | None) -> Path:
@@ -86,7 +99,10 @@ def main(argv: list[str] | None = None) -> None:
 
     # One run per file, tagged with its offered load: the shape plot_latency_pareto reads,
     # so a sweep's plots regenerate from the raw files.
-    run = {"target_qps": args.target_qps, "duration_s": args.duration_s, "results": results}
+    run = {
+        "target_qps": args.target_qps, "duration_s": args.duration_s, "seed": args.seed,
+        "results": results,
+    }
     stem = _stem(args.out)
     write_raw(sibling(stem, ".json"), sibling(stem, ".csv"), run)
 

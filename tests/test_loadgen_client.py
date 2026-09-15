@@ -1,3 +1,5 @@
+import random
+
 import httpx
 import pytest
 
@@ -88,13 +90,29 @@ async def test_request_sender_draws_shapes_by_weight_and_sends_each_shape_s_max_
         RequestShape("never", "unused", max_tokens=999, weight=0.0),
     ]
     async with load_client("http://test") as client:
-        send = request_sender(client, workload, SamplingParams(temperature=0.5))
+        send = request_sender(client, random.Random(0), workload, SamplingParams(temperature=0.5))
         results = [await send() for _ in range(20)]
 
     assert {r["shape"] for r in results} == {"short"}
     assert {(prompt, params.max_tokens, params.temperature) for prompt, params in sent} == {
         ("hi", 4, 0.5)
     }
+
+
+@pytest.mark.asyncio
+async def test_request_sender_with_the_same_seed_draws_the_same_shapes(monkeypatch):
+    async def fake_send_request(client, prompt, sampling_params):
+        return {"success": True}
+
+    monkeypatch.setattr("llm_serving_engine.loadgen.client.send_request", fake_send_request)
+
+    async def shapes(seed: int) -> list[str]:
+        async with load_client("http://test") as client:
+            send = request_sender(client, random.Random(seed))
+            return [(await send())["shape"] for _ in range(50)]
+
+    assert await shapes(3) == await shapes(3)
+    assert await shapes(3) != await shapes(4)
 
 
 def test_workload_shapes_grow_from_chat_to_a_prompt_past_two_token_budgets():

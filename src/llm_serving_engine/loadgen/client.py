@@ -148,17 +148,18 @@ async def send_request(
 
 def request_sender(
     client: httpx.AsyncClient,
+    rng: random.Random,
     workload: list[RequestShape] = WORKLOAD,
     sampling_params: SamplingParams | None = None,
 ) -> SendFn:
-    """A send_fn whose every call sends one request drawn from `workload` by weight,
-    generating up to its shape's max_tokens with `sampling_params`' other settings. Each
-    result names its shape, so raw results split by request size."""
+    """A send_fn whose every call sends one request drawn from `workload` by weight with
+    `rng`, generating up to its shape's max_tokens with `sampling_params`' other settings.
+    Each result names its shape, so raw results split by request size."""
     base = sampling_params or SamplingParams()
     weights = [shape.weight for shape in workload]
 
     async def send() -> dict:
-        [shape] = random.choices(workload, weights)
+        [shape] = rng.choices(workload, weights)
         params = replace(base, max_tokens=shape.max_tokens)
         return {"shape": shape.name, **await send_request(client, shape.prompt, params)}
 

@@ -4,6 +4,7 @@ Open loop, for latency: arrivals follow a fixed Poisson schedule, and each reque
 `intended_send_time` is recorded before `send_fn` is awaited. A stall anywhere, sender side
 included, shows up as a cluster of high latencies, and a server that can't keep up shows a
 growing backlog. Latency and time to first token both count from `intended_send_time`.
+The schedule is drawn from `rng`, so a seeded run offers the same arrivals to every config.
 
 Closed loop, for maximum throughput: a fixed number of clients each send their next request
 as soon as the previous one returns, so the server always has exactly that many requests
@@ -24,7 +25,9 @@ from typing import Awaitable, Callable
 SendFn = Callable[[], Awaitable[dict]]
 
 
-async def open_loop_load_gen(target_qps: float, duration_s: float, send_fn: SendFn) -> list[dict]:
+async def open_loop_load_gen(
+    target_qps: float, duration_s: float, send_fn: SendFn, rng: random.Random
+) -> list[dict]:
     start = time.monotonic()
     next_send = start
     results: list[dict] = []
@@ -34,7 +37,7 @@ async def open_loop_load_gen(target_qps: float, duration_s: float, send_fn: Send
         if now < next_send:
             await asyncio.sleep(next_send - now)
         tasks.append(asyncio.create_task(_send_on_schedule(send_fn, start, next_send, results)))
-        next_send += random.expovariate(target_qps)
+        next_send += rng.expovariate(target_qps)
     await asyncio.gather(*tasks)  # requests still in flight at the end still count
     return results
 
