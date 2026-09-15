@@ -59,7 +59,10 @@ class KVCacheConfig:
     head_dim: int = 128
     n_layers: int = 32
     dtype_bytes: int = 2
-    gpu_memory_utilization: float = 0.85  # fraction of free memory reserved for the KV pool
+    # Fraction of free memory the KV pool takes. The caller has already subtracted what the
+    # CUDA graphs and the largest eager iteration hold, so this covers only allocator
+    # fragmentation, not activations.
+    gpu_memory_utilization: float = 0.95
 
     @classmethod
     def from_env(cls) -> "KVCacheConfig":
