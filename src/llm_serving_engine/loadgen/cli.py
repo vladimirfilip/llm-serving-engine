@@ -14,7 +14,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from ..model.sampling import SamplingParams
-from .client import WORKLOAD, RequestShape, load_client, request_sender
+from .client import WORKLOAD, RequestShape, load_client, request_sender, shape_schedule
 from .report import SLOThresholds, build_report
 from .results_io import write_run
 from .timing import open_loop_load_gen
@@ -38,9 +38,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Open-loop load generator for the serving engine")
     parser.add_argument("--target-qps", type=float, required=True, help="offered load, requests/s")
     parser.add_argument(
-        "--duration-s", type=float, required=True,
-        help="run length, seconds; pick this so target-qps * duration-s is in the hundreds, "
-        "since p99 on a handful of samples is just max()",
+        "--requests", type=int, required=True,
+        help="requests to send; pick hundreds, since p99 on a handful of samples is just "
+        "max(). Every request shape gets a floor of them, whatever its weight",
+    )
+    parser.add_argument(
+        "--max-duration-s", type=float, default=None,
+        help="stop sending after this long even if the count is unfinished (default: no cap)",
     )
     parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="engine base URL")
     parser.add_argument(
@@ -78,12 +82,14 @@ def _rng(seed: int | None, stream: str) -> random.Random:
 
 async def _run(args: argparse.Namespace) -> list[dict]:
     async with load_client(args.base_url) as client:
-        send = request_sender(
-            client, _rng(args.seed, "shapes"), _workload_from_args(args),
-            _sampling_params_from_args(args),
+        shapes = shape_schedule(
+            _workload_from_args(args), args.requests, _rng(args.seed, "shapes")
         )
+        send = request_sender(client, shapes, _sampling_params_from_args(args))
         arrivals = _rng(args.seed, "arrivals")
-        return await open_loop_load_gen(args.target_qps, args.duration_s, send, arrivals)
+        return await open_loop_load_gen(
+            args.target_qps, len(shapes), send, arrivals, args.max_duration_s
+        )
 
 
 def _stem(out: Path | None) -> Path:
@@ -100,10 +106,10 @@ def main(argv: list[str] | None = None) -> None:
     # One run per file, tagged with its offered load, so a sweep's plots regenerate from the
     # raw files.
     run = {
-        "target_qps": args.target_qps, "duration_s": args.duration_s, "seed": args.seed,
+        "target_qps": args.target_qps, "requests": args.requests, "seed": args.seed,
         "results": results,
     }
-    report = build_report(results, args.duration_s, slo_from_args(args))
+    report = build_report(results, slo_from_args(args))
     stem = _stem(args.out)
     write_run(stem, run, report, target_qps=args.target_qps)
     print(f"wrote {len(results)} results to {stem}.json/.csv, summary to {stem}_summary.json/.csv")

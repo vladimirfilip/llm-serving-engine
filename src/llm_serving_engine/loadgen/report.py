@@ -13,10 +13,10 @@ from ..observability.metrics import LatencySummary, summarize
 
 # An open-loop run keeps up when late arrivals wait no longer than this multiple of early ones.
 MAX_KEEPING_UP_TTFT_GROWTH = 2.0
-# Rates count completions from this fraction of the run to its end. Before it, requests are
-# still filling the server, so completions lag arrivals; after the run, the backlog drains
-# below the load being measured. In between, completions track arrivals when the server keeps
-# up, and its capacity when it doesn't.
+# Rates count completions from this fraction of the send window to its end. Before it,
+# requests are still filling the server, so completions lag arrivals; after the last arrival,
+# the backlog drains below the load being measured. In between, completions track arrivals
+# when the server keeps up, and its capacity when it doesn't.
 STEADY_START_FRACTION = 0.25
 # Below this many requests per quarter, a quarter's median TTFT hinges on which few requests
 # landed in it, and the growth ratio swings either way on an idle server.
@@ -44,7 +44,7 @@ class LatencyReport:
 
 @dataclass(slots=True)
 class RunReport:
-    duration_s: float
+    send_window_s: float
     wall_clock_s: float
     requests: int
     failures: int
@@ -146,28 +146,34 @@ def summarize_latencies(results: list[dict]) -> LatencyReport:
     )
 
 
-def build_report(
-    results: list[dict], duration_s: float, slo: SLOThresholds | None = None
-) -> RunReport:
-    """`duration_s` is how long the loop sent requests. Rates count the successes completed
-    in the steady window, from STEADY_START_FRACTION of `duration_s` to its end."""
+def send_window_s(results: list[dict]) -> float:
+    """How long the loop offered load: the last arrival's schedule open loop, since what
+    completes after it is the backlog draining, or the last completion closed loop."""
+    scheduled = [r["scheduled_at"] for r in results if "scheduled_at" in r]
+    return max(scheduled) if scheduled else wall_clock_s(results)
+
+
+def build_report(results: list[dict], slo: SLOThresholds | None = None) -> RunReport:
+    """Rates count the successes completed in the steady window, from STEADY_START_FRACTION
+    of the send window to its end. Before it, requests are still filling the server."""
     open_loop = any("scheduled_at" in r for r in results)
     successes = [r for r in results if r.get("success", True)]
-    steady_start = STEADY_START_FRACTION * duration_s
-    counted = [r for r in successes if steady_start <= r["completed_at"] <= duration_s]
-    elapsed = duration_s - steady_start
+    window = send_window_s(results)
+    steady_start = STEADY_START_FRACTION * window
+    counted = [r for r in successes if steady_start <= r["completed_at"] <= window]
+    elapsed = window - steady_start
 
     def per_second(count: float) -> float:
-        return count / elapsed
+        return count / elapsed if elapsed > 0 else 0.0
 
     output_tokens = sum(r.get("output_tokens") or 0 for r in counted)
     input_tokens = sum(r.get("prompt_tokens") or 0 for r in counted)
     report = RunReport(
-        duration_s=duration_s,
+        send_window_s=window,
         wall_clock_s=wall_clock_s(results),
         requests=len(results),
         failures=len(results) - len(successes),
-        offered_req_s=len(results) / duration_s if open_loop else None,
+        offered_req_s=len(results) / window if open_loop and window > 0 else None,
         throughput_req_s=per_second(len(counted)),
         output_tokens_s=per_second(output_tokens),
         input_tokens_s=per_second(input_tokens),
@@ -185,11 +191,9 @@ def build_report(
     return report
 
 
-def build_point(
-    runs: list[list[dict]], duration_s: float, slo: SLOThresholds | None = None
-) -> PointReport:
+def build_point(runs: list[list[dict]], slo: SLOThresholds | None = None) -> PointReport:
     return PointReport(
-        repeats=[build_report(results, duration_s, slo) for results in runs],
+        repeats=[build_report(results, slo) for results in runs],
         latency=summarize_latencies([r for results in runs for r in results]),
     )
 

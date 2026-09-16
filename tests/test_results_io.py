@@ -17,7 +17,7 @@ def test_fractional_qps_stems_each_keep_their_own_files(tmp_path):
     for qps in (0.03, 0.05):
         results = [_result(latency=qps)]
         stem = tmp_path / f"qps_{qps:g}"
-        write_run(stem, {"target_qps": qps, "results": results}, build_report(results, 1.0))
+        write_run(stem, {"target_qps": qps, "results": results}, build_report(results))
 
     for qps in (0.03, 0.05):
         run = json.loads((tmp_path / f"qps_{qps:g}.json").read_text())
@@ -29,7 +29,7 @@ def test_fractional_qps_stems_each_keep_their_own_files(tmp_path):
 
 def test_raw_csv_has_one_row_per_request_and_summary_carries_run_fields(tmp_path):
     results = [_result(), _result(success=False, error="ReadTimeout: ")]
-    write_run(tmp_path / "run", {"results": results}, build_report(results, 1.0), target_qps=2.0)
+    write_run(tmp_path / "run", {"results": results}, build_report(results), target_qps=2.0)
 
     with (tmp_path / "run.csv").open() as f:
         rows = list(csv.DictReader(f))
@@ -40,7 +40,7 @@ def test_raw_csv_has_one_row_per_request_and_summary_carries_run_fields(tmp_path
 
 
 def test_pooled_latency_summary_counts_every_repeat(tmp_path):
-    point = build_point([[_result()], [_result(), _result()]], duration_s=1.0)
+    point = build_point([[_result()], [_result(), _result()]])
     write_pooled_latency(tmp_path / "qps_0.5", point.latency, target_qps=0.5, repeats=2)
     pooled = json.loads((tmp_path / "qps_0.5_pooled_summary.json").read_text())
     assert pooled["ttft_chat_count"] == 3

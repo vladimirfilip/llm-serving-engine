@@ -1,4 +1,5 @@
 import random
+from collections import Counter
 
 import httpx
 import pytest
@@ -9,6 +10,7 @@ from llm_serving_engine.loadgen.client import (
     load_client,
     request_sender,
     send_request,
+    shape_schedule,
 )
 from llm_serving_engine.model.sampling import SamplingParams
 
@@ -75,7 +77,7 @@ async def test_send_request_passes_sampling_params_in_the_body():
 
 
 @pytest.mark.asyncio
-async def test_request_sender_draws_shapes_by_weight_and_sends_each_shape_s_max_tokens(
+async def test_request_sender_sends_its_shapes_in_order_with_each_shape_s_max_tokens(
     monkeypatch,
 ):
     sent = []
@@ -85,34 +87,61 @@ async def test_request_sender_draws_shapes_by_weight_and_sends_each_shape_s_max_
         return {"success": True}
 
     monkeypatch.setattr("llm_serving_engine.loadgen.client.send_request", fake_send_request)
-    workload = [
+    shapes = [
         RequestShape("short", "hi", max_tokens=4, weight=1.0),
-        RequestShape("never", "unused", max_tokens=999, weight=0.0),
+        RequestShape("long", "hello", max_tokens=999, weight=1.0),
     ]
     async with load_client("http://test") as client:
-        send = request_sender(client, random.Random(0), workload, SamplingParams(temperature=0.5))
-        results = [await send() for _ in range(20)]
+        send = request_sender(client, shapes, SamplingParams(temperature=0.5))
+        results = [await send() for _ in shapes]
 
-    assert {r["shape"] for r in results} == {"short"}
-    assert {(prompt, params.max_tokens, params.temperature) for prompt, params in sent} == {
-        ("hi", 4, 0.5)
-    }
+    assert [r["shape"] for r in results] == ["short", "long"]
+    assert [(prompt, params.max_tokens, params.temperature) for prompt, params in sent] == [
+        ("hi", 4, 0.5),
+        ("hello", 999, 0.5),
+    ]
 
 
-@pytest.mark.asyncio
-async def test_request_sender_with_the_same_seed_draws_the_same_shapes(monkeypatch):
-    async def fake_send_request(client, prompt, sampling_params):
-        return {"success": True}
+def test_shape_schedule_sends_the_asked_for_count_split_by_weight():
+    workload = [
+        RequestShape("common", "hi", max_tokens=4, weight=0.9),
+        RequestShape("rare", "yo", max_tokens=4, weight=0.1),
+    ]
+    schedule = shape_schedule(workload, 100, random.Random(0), min_per_shape=0)
 
-    monkeypatch.setattr("llm_serving_engine.loadgen.client.send_request", fake_send_request)
+    counts = Counter(shape.name for shape in schedule)
+    assert sum(counts.values()) == 100
+    assert counts == {"common": 90, "rare": 10}
 
-    async def shapes(seed: int) -> list[str]:
-        async with load_client("http://test") as client:
-            send = request_sender(client, random.Random(seed))
-            return [(await send())["shape"] for _ in range(50)]
 
-    assert await shapes(3) == await shapes(3)
-    assert await shapes(3) != await shapes(4)
+def test_shape_schedule_gives_a_rare_shape_a_floor_of_requests():
+    workload = [
+        RequestShape("common", "hi", max_tokens=4, weight=0.98),
+        RequestShape("rare", "yo", max_tokens=4, weight=0.02),
+    ]
+    schedule = shape_schedule(workload, 100, random.Random(0), min_per_shape=20)
+
+    counts = Counter(shape.name for shape in schedule)
+    assert sum(counts.values()) == 100
+    assert counts["rare"] >= 20
+
+
+def test_shape_schedule_keeps_the_workload_s_proportions_when_floors_would_dominate():
+    small = Counter(s.name for s in shape_schedule(WORKLOAD, 40, random.Random(0)))
+    large = Counter(s.name for s in shape_schedule(WORKLOAD, 400, random.Random(0)))
+
+    assert sum(small.values()) == 40
+    # Chat is 75% of the workload's weight; floors may dilute it, but not past half the run.
+    assert small["chat"] / 40 > 0.5
+    assert large["chunked_document"] >= 20  # the rare shape still reaches its floor
+
+
+def test_shape_schedule_with_the_same_seed_is_the_same_order():
+    def schedule(seed: int) -> list[str]:
+        return [shape.name for shape in shape_schedule(WORKLOAD, 60, random.Random(seed))]
+
+    assert schedule(3) == schedule(3)
+    assert schedule(3) != schedule(4)
 
 
 def test_workload_shapes_grow_from_chat_to_a_prompt_past_two_token_budgets():

@@ -70,6 +70,10 @@ WORKLOAD: list[RequestShape] = [
     ),
 ]
 
+# Requests of every shape a run sends, however small its weight: a shape seen a handful of
+# times has no p90 worth reading.
+MIN_REQUESTS_PER_SHAPE = 20
+
 
 def _parse_sse_line(line: str) -> dict | None:
     """Extract the JSON payload from one `data: {...}` SSE line, else None."""
@@ -146,20 +150,46 @@ async def send_request(
     return result
 
 
+def shape_schedule(
+    workload: list[RequestShape],
+    num_requests: int,
+    rng: random.Random,
+    min_per_shape: int = MIN_REQUESTS_PER_SHAPE,
+) -> list[RequestShape]:
+    """`num_requests` shapes in send order: each shape takes its share of the workload's
+    weight, but never fewer than `min_per_shape`, so the rarest shape's percentiles rest on
+    a sample instead of on however many a weighted draw happened to produce. Shuffled with
+    `rng`, so the shapes interleave as arrivals rather than running shape by shape.
+
+    The floors together never take more than half a run, so a run too small to hold them
+    keeps the workload's proportions rather than becoming an even split of its shapes."""
+    floor = min(min_per_shape, num_requests // (2 * len(workload)))
+    weight_total = sum(shape.weight for shape in workload)
+    by_weight = num_requests - floor * len(workload)
+    exact = [floor + shape.weight / weight_total * by_weight for shape in workload]
+    counts = [int(share) for share in exact]
+    # Largest remainder, so the counts sum to num_requests without a shape losing its floor.
+    ranked = sorted(range(len(exact)), key=lambda i: exact[i] - counts[i], reverse=True)
+    for i in ranked[: num_requests - sum(counts)]:
+        counts[i] += 1
+    schedule = [shape for shape, count in zip(workload, counts, strict=True) for _ in range(count)]
+    rng.shuffle(schedule)
+    return schedule
+
+
 def request_sender(
     client: httpx.AsyncClient,
-    rng: random.Random,
-    workload: list[RequestShape] = WORKLOAD,
+    shapes: list[RequestShape],
     sampling_params: SamplingParams | None = None,
 ) -> SendFn:
-    """A send_fn whose every call sends one request drawn from `workload` by weight with
-    `rng`, generating up to its shape's max_tokens with `sampling_params`' other settings.
-    Each result names its shape, so raw results split by request size."""
+    """A send_fn whose calls send `shapes` in order, one per call, each generating up to its
+    shape's max_tokens with `sampling_params`' other settings. Each result names its shape,
+    so raw results split by request size."""
     base = sampling_params or SamplingParams()
-    weights = [shape.weight for shape in workload]
+    queued = iter(shapes)
 
     async def send() -> dict:
-        [shape] = rng.choices(workload, weights)
+        shape = next(queued)
         params = replace(base, max_tokens=shape.max_tokens)
         return {"shape": shape.name, **await send_request(client, shape.prompt, params)}
 

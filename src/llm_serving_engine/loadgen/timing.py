@@ -1,14 +1,19 @@
 """Load generator timing loops.
 
+Both loops send a fixed `num_requests`, so a run's sample size is what it was asked for
+rather than whatever the server's speed allowed; `max_duration_s` cuts a run short when an
+arm is too slow to finish its count in reasonable time.
+
 Open loop, for latency: arrivals follow a fixed Poisson schedule, and each request's
 `intended_send_time` is recorded before `send_fn` is awaited. A stall anywhere, sender side
 included, shows up as a cluster of high latencies, and a server that can't keep up shows a
 growing backlog. Latency and time to first token both count from `intended_send_time`.
 The schedule is drawn from `rng`, so a seeded run offers the same arrivals to every config.
 
-Closed loop, for maximum throughput: a fixed number of clients each send their next request
-as soon as the previous one returns, so the server always has exactly that many requests
-in flight. Its latencies measure a queue the loop itself bounds; only throughput counts.
+Closed loop, for maximum throughput: a fixed number of clients divide `num_requests` between
+them, each sending its next as soon as the previous one returns, so the server has that many
+requests in flight until the count runs out. Its latencies measure a queue the loop itself
+bounds; only throughput counts.
 
 Each result is `send_fn`'s dict plus "latency", "first_token_latency" (None if no token
 arrived), "completed_at" and, open loop only, "scheduled_at"; both offsets are seconds since
@@ -26,13 +31,19 @@ SendFn = Callable[[], Awaitable[dict]]
 
 
 async def open_loop_load_gen(
-    target_qps: float, duration_s: float, send_fn: SendFn, rng: random.Random
+    target_qps: float,
+    num_requests: int,
+    send_fn: SendFn,
+    rng: random.Random,
+    max_duration_s: float | None = None,
 ) -> list[dict]:
     start = time.monotonic()
     next_send = start
     results: list[dict] = []
     tasks: list[asyncio.Task] = []
-    while next_send < start + duration_s:
+    for _ in range(num_requests):
+        if max_duration_s is not None and next_send - start >= max_duration_s:
+            break
         now = time.monotonic()
         if now < next_send:
             await asyncio.sleep(next_send - now)
@@ -42,12 +53,20 @@ async def open_loop_load_gen(
     return results
 
 
-async def closed_loop_load_gen(concurrency: int, duration_s: float, send_fn: SendFn) -> list[dict]:
+async def closed_loop_load_gen(
+    concurrency: int, num_requests: int, send_fn: SendFn, max_duration_s: float | None = None
+) -> list[dict]:
     start = time.monotonic()
     results: list[dict] = []
+    unsent = num_requests
 
     async def client() -> None:
-        while time.monotonic() < start + duration_s:
+        nonlocal unsent
+        while unsent > 0:
+            if max_duration_s is not None and time.monotonic() - start >= max_duration_s:
+                return
+            # Claimed before the await, so the clients divide `num_requests` between them.
+            unsent -= 1
             sent = time.monotonic()
             result = await send_fn()
             results.append(_timed(result, start, sent))

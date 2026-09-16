@@ -65,7 +65,7 @@ def _write_summary(stem: Path, summary: dict) -> None:
 
 def _flatten_report(report: RunReport) -> dict:
     flat: dict = {
-        "duration_s": report.duration_s,
+        "send_window_s": report.send_window_s,
         "wall_clock_s": report.wall_clock_s,
         "requests": report.requests,
         "failures": report.failures,

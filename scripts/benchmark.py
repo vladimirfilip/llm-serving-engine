@@ -23,6 +23,10 @@ Every point reports goodput beside throughput: the requests that met the SLO (`-
 by default a 300 ms first token and 25 ms between tokens after it), which is what separates
 a load the engine serves well from one it merely survives.
 
+Every load point sends `--requests` requests rather than running for a fixed time, so each
+shape's percentiles rest on the same sample whatever the load, and `--max-duration-s` keeps
+an arm too slow to finish them from stalling a sweep.
+
 Every load point runs `--repeats` times. Repeat r of every point and every arm draws its
 arrivals and request shapes from the same seed, so arms face identical workloads. Rates are
 reported per repeat, so their spread shows; latencies pool all repeats' requests. Each
@@ -55,6 +59,7 @@ from llm_serving_engine.loadgen.client import (
     load_client,
     request_sender,
     send_request,
+    shape_schedule,
 )
 from llm_serving_engine.loadgen.gpu_monitor import GpuMonitor, GpuStats
 from llm_serving_engine.loadgen.kv_monitor import KvCacheMonitor, KvStats
@@ -166,12 +171,17 @@ def _monitored(base_url: str, load: Callable[[], list[dict]]) -> Measured:
     return Measured(results, gpu.stats, kv.stats)
 
 
+def _shapes(args: argparse.Namespace, repeat: int) -> list[RequestShape]:
+    return shape_schedule(_workload(args), args.requests, _rng(args, repeat, "shapes"))
+
+
 def _open_loop(base_url: str, qps: float, args: argparse.Namespace, repeat: int) -> Measured:
     async def run() -> list[dict]:
         async with load_client(base_url) as client:
-            send = request_sender(client, _rng(args, repeat, "shapes"), _workload(args))
+            shapes = _shapes(args, repeat)
+            send = request_sender(client, shapes)
             return await open_loop_load_gen(
-                qps, args.duration_s, send, _rng(args, repeat, "arrivals")
+                qps, len(shapes), send, _rng(args, repeat, "arrivals"), args.max_duration_s
             )
 
     return _monitored(base_url, lambda: asyncio.run(run()))
@@ -180,8 +190,11 @@ def _open_loop(base_url: str, qps: float, args: argparse.Namespace, repeat: int)
 def _closed_loop(base_url: str, args: argparse.Namespace, repeat: int) -> Measured:
     async def run() -> list[dict]:
         async with load_client(base_url, timeout_s=None) as client:
-            send = request_sender(client, _rng(args, repeat, "shapes"), _workload(args))
-            return await closed_loop_load_gen(args.concurrency, args.duration_s, send)
+            shapes = _shapes(args, repeat)
+            send = request_sender(client, shapes)
+            return await closed_loop_load_gen(
+                args.concurrency, len(shapes), send, args.max_duration_s
+            )
 
     return _monitored(base_url, lambda: asyncio.run(run()))
 
@@ -215,9 +228,9 @@ def _measure_point(
     for repeat in range(args.repeats):
         m = run_once(repeat)
         measured.append(m)
-        report = build_report(m.results, args.duration_s, slo)
+        report = build_report(m.results, slo)
         run = {
-            **fields, "repeat": repeat, "seed": args.seed, "duration_s": args.duration_s,
+            **fields, "repeat": repeat, "seed": args.seed, "requests": args.requests,
             "results": m.results,
         }
         write_run(
@@ -229,7 +242,7 @@ def _measure_point(
             preemptions=m.kv.preemptions,
         )
         print(f"[{label}] repeat {repeat}: {_describe(report, m.kv)}", flush=True)
-    point = build_point([m.results for m in measured], args.duration_s, slo)
+    point = build_point([m.results for m in measured], slo)
     write_pooled_latency(stem, point.latency, **fields, repeats=args.repeats)
     return point, measured
 
@@ -466,12 +479,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=Path("results"))
     parser.add_argument(
         "--quick", action="store_true",
-        help="one 30 s repeat per point over fewer QPS points, for fast local iteration; "
+        help="one short repeat per point over fewer QPS points, for fast local iteration; "
         "too few requests for tail percentiles, so don't use it for numbers that go in a report",
     )
     parser.add_argument(
-        "--duration-s", type=float, default=None,
-        help="length of each load run, seconds (default: 100, or 30 with --quick)",
+        "--requests", type=int, default=None,
+        help="requests per load run, split across shapes by weight but never below each "
+        "shape's floor (default: 300, or 60 with --quick)",
+    )
+    parser.add_argument(
+        "--max-duration-s", type=float, default=None,
+        help="stop a load run after this long even if its requests are unfinished, so one "
+        "slow arm can't stall a sweep (default: 300, or 60 with --quick)",
     )
     parser.add_argument(
         "--repeats", type=int, default=None,
@@ -504,8 +523,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # than requests served: a first token within 300 ms and tokens 25 ms apart after it.
     parser.set_defaults(slo_ttft_ms=300.0, slo_tpot_ms=25.0)
     args = parser.parse_args(argv)
-    if args.duration_s is None:
-        args.duration_s = 30.0 if args.quick else 100.0
+    if args.requests is None:
+        args.requests = 60 if args.quick else 300
+    if args.max_duration_s is None:
+        args.max_duration_s = 60.0 if args.quick else 300.0
     if args.repeats is None:
         args.repeats = 1 if args.quick else 3
     if args.qps is None:
