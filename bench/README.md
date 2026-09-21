@@ -113,8 +113,8 @@ Each item is a place the real interface or hardware forced a change; metric defi
 unchanged unless stated.
 
 - **Engine edits.** The engine needed changes beyond the marked hooks (token-id submission,
-  logprobs, `ignore_eos`, `score`, the memory cap). Default behaviour is unchanged and the original
-  test suite passes unmodified apart from one test that patched a function signature.
+  logprobs, `ignore_eos`, `score`, the memory cap). Default behaviour is unchanged: the original
+  tests pass unmodified (the fake model runner in `tests/factories.py` gained `memory_bytes`).
 - **Ablation order.** Paged KV runs only on the fused kernels, and graphs replay only against a
   paged pool, so the steps are naive, +continuous batching, +fused kernels, +paged KV, +CUDA graphs.
 - **Burst check compares gaps with the mean gap, not the median.** Once most gaps are burst gaps the
@@ -138,6 +138,8 @@ unchanged unless stated.
 - **GPU idle check** runs before each GPU engine launch, waits up to 30 s for our own previous task
   to go quiet, and is recorded in `checks.json`.
 - **`max_num_seqs` and grid lengths.** Lengths above `max_model_len` are `not run`, not `failed`.
+- **Long prompts in correctness generation run one at a time.** Each 16000-token prompt is more
+  than half the ~26k-token KV pool, and two admitted together deadlock the engine (see below).
 - **Quick ablation** uses 1 capacity repeat and 2 batch-1 repeats.
 - **Precision variants and soak** run on ours only; the soak windows are fractions of the run so
   the 10-60 min / 60 min-end comparison holds at any duration.
@@ -148,3 +150,14 @@ unchanged unless stated.
 set. `bench/tests/test_all_mock.py` runs `bench all --engines mock --quick` end to end (about five
 minutes) with synthetic data. The mock engine (`engines/mock_server.py`) and null server
 (`engines/null_server.py`) exist only to test the harness.
+
+## Findings about the engine
+
+- **Scheduler deadlock with prompts larger than half the KV pool.** With `max_model_len` 16384 and
+  a ~26k-token pool, two 16000-token prompts that start prefilling together each hold part of the
+  pool and neither can finish. The scheduler preempts only to make room for a *decoding* sequence,
+  never a prefilling one, so both stay forever (the engine reports running 2, waiting 16, KV 94%,
+  GPU idle) and a client that gives up does not free them. The memory suite's overload test
+  classifies this as `hang`; the harness does not work around it except for correctness generation.
+- **Decode attention is far from bandwidth-bound**: about 31 GB/s (5% of the 637 GB/s read
+  bandwidth) at batch 1, from a grid of one program per head.
