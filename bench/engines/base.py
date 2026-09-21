@@ -18,6 +18,7 @@ class Launch:
     token_budget: int | None = None
     args_add: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
+    wrapper: list[str] = field(default_factory=list)  # command the server is launched under
 
 
 class EngineAdapter(ABC):

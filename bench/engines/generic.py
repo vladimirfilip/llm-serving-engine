@@ -81,7 +81,7 @@ class GenericAdapter(EngineAdapter):
         values = self._values(launch, self.port)
         for name, content in self.spec.files.items():
             (self.run.dir / name).write_text(yaml.safe_dump(render(content, values)))
-        self.launch_argv = expand(self.spec.launch, values) + launch.args_add
+        self.launch_argv = launch.wrapper + expand(self.spec.launch, values) + launch.args_add
         env = {k: str(rendered) for k, v in
                (self.spec.env | launch.env | (env_overrides or {})).items()
                if (rendered := render(v, values)) is not None}

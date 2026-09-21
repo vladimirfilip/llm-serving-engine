@@ -38,6 +38,10 @@ def main() -> None:
         result = {"reference-generate": reference.task_generate,
                   "reference-score": reference.task_score,
                   "reference-ppl": reference.task_ppl}[task](**args)
+    elif task == "kernels":
+        from .suites.kernels import task_kernels
+
+        result = task_kernels(**args)
     else:
         raise SystemExit(f"unknown gpu task {task}")
     print(json.dumps(result))
