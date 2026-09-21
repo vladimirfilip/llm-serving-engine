@@ -42,8 +42,9 @@ def greedy_batch(model, prompts: list[list[int]], new_tokens: int, pad_id: int) 
         output_logits=True, return_dict_in_generate=True,
     )
     tokens = out.sequences[:, width:]
-    logprobs = torch.stack([step.float().log_softmax(-1) for step in out.logits], dim=1)
-    chosen = logprobs.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
+    chosen = torch.stack(
+        [step.float().log_softmax(-1).gather(-1, tokens[:, i : i + 1]).squeeze(-1)
+         for i, step in enumerate(out.logits)], dim=1)
     return [{"token_ids": tokens[i].tolist(), "logprobs": chosen[i].tolist()}
             for i in range(len(prompts))]
 
@@ -68,10 +69,11 @@ def generate(model, prompts: list[dict], new_tokens: int, long_new_tokens: int,
 @torch.no_grad()
 def teacher_forced(model, prompt: list[int], generated: list[int]) -> dict:
     """The reference's view of `generated` given `prompt`: per generated position the logprob
-    of the token the other engine chose, the reference argmax and its top-2 logprobs."""
+    of the token the other engine chose, the reference argmax and its top-2 logprobs. Only
+    those positions go through the LM head, so a long prompt never materialises its logits."""
     ids = torch.tensor([prompt + generated], device=model.device)
-    logits = model(ids).logits[0, len(prompt) - 1 : -1].float()
-    logprobs = logits.log_softmax(-1)
+    hidden = model.model(ids).last_hidden_state[0, len(prompt) - 1 : -1]
+    logprobs = model.lm_head(hidden).float().log_softmax(-1)
     targets = ids[0, len(prompt) :]
     top2 = logprobs.topk(2, dim=-1)
     return {

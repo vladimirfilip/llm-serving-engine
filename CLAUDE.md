@@ -54,7 +54,7 @@ Check any code you touch against these.
 ## Working agreements
 
 - Python ≥3.10, `ruff` (line length 100), `pytest -q`. Run both before declaring work done.
-- Venv at `.venv/`. Install with `pip install -e '.[dev]'`.
+- Venv at `.venv/`. Install with `pip install -e '.[dev,bench]'`. Benchmarks run as `python -m bench`; see `bench/README.md`.
 - Tests assert behaviour and invariants, not implementation detail. A scheduler test that pins the
   exact call sequence is worse than none.
 - Benchmarks and ablations write raw results to disk; plots are regenerated from them, never

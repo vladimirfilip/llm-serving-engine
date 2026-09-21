@@ -39,26 +39,35 @@ def time_closure(fn, warmup: int, iters: int, flush_mib: int) -> dict[str, float
 
 
 def attention_rows(contenders, kind: str, points: list[tuple], spec: ModelSpec, cfg: dict,
-                   bw_read_gbs: float | None) -> list[dict]:
+                   bw_read_gbs: float | None, failures: dict[str, str]) -> list[dict]:
     """One row per (contender, point). `points` are (batch, ctx) for decode, (seq_len,) for
-    prefill. A contender above the numeric tolerance is kept as a dropped row."""
+    prefill. A contender above the numeric tolerance is kept as a dropped row; one that raises
+    is recorded in `failures` with the reason and skipped from then on."""
     from ..kernels.inputs import ATTENTION_TOLERANCE
 
     rows = []
     for adapter in contenders:
         for point in points:
+            if adapter.name in failures:
+                break
             build, error = ((adapter.decode_attention, adapter.decode_error) if kind == "decode"
                             else (adapter.prefill_attention, adapter.prefill_error))
-            fn = build(*point, spec)
-            if fn is None:
-                continue
-            err = error(*point, spec)
+            try:
+                fn = build(*point, spec)
+                if fn is None:
+                    continue
+                err = error(*point, spec)
+                if err is None or err <= ATTENTION_TOLERANCE:
+                    t = time_closure(fn, cfg["warmup_iters"], cfg["timed_iters"],
+                                     cfg["l2_flush_mib"])
+            except Exception as e:  # a contender that cannot run here is reported by name
+                failures[adapter.name] = f"{type(e).__name__}: {str(e).strip()[-300:]}"
+                break
             row = {"contender": adapter.name, "kind": kind, "max_abs_error": err,
                    "dropped": err is not None and err > ATTENTION_TOLERANCE}
             row |= dict(zip(("batch", "ctx") if kind == "decode" else ("seq_len",), point,
                             strict=True))
             if not row["dropped"]:
-                t = time_closure(fn, cfg["warmup_iters"], cfg["timed_iters"], cfg["l2_flush_mib"])
                 seconds = t["ms_median"] / 1000
                 if kind == "decode":
                     moved = point[0] * point[1] * spec.kv_bytes_per_tok_layer
@@ -111,18 +120,20 @@ def task_kernels(model_path: str, dtype: str, cfg: dict, bw_read_gbs: float | No
     skipped_cells = [cell for cell in grid if cell not in decode_points]
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    failures: dict[str, str] = {}
     tables = {
         "kernels_decode": attention_rows(contenders, "decode", decode_points, spec, cfg,
-                                         bw_read_gbs),
+                                         bw_read_gbs, failures),
         "kernels_prefill": attention_rows(contenders, "prefill",
                                           [(n,) for n in cfg["prefill_lengths"]], spec, cfg,
-                                          bw_read_gbs),
+                                          bw_read_gbs, failures),
         "kernels_gemm": gemm_rows(contenders, spec, cfg),
     }
     for name, rows in tables.items():
         pd.DataFrame(rows).to_csv(out / f"{name}.csv", index=False)
     dropped = sorted({r["contender"] for rows in tables.values() for r in rows if r.get("dropped")})
-    return {"contenders": {c.name: c.notes for c in contenders}, "unavailable": missing,
+    return {"contenders": {c.name: c.notes for c in contenders},
+            "unavailable": missing | {f"{n} (failed at run time)": r for n, r in failures.items()},
             "dropped_for_error": dropped, "skipped_decode_cells": skipped_cells,
             "gpu": torch.cuda.get_device_name(0)}
 

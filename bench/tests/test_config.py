@@ -68,3 +68,20 @@ def test_the_run_snapshots_the_config_directory_it_was_loaded_from(tmp_path):
     cfg = load_config(tmp_path / "cfg")
     run = Run.open(cfg, "r1", results_dir=tmp_path / "results")
     assert (run.dir / "config_snapshot" / "suite.yaml").read_text() == "seed: 7\n"
+
+
+def test_baseline_versions_skip_files_that_are_not_engines_and_ask_each_environment(tmp_path):
+    import shutil
+    import sys
+
+    import yaml
+
+    from bench.config import CONFIG_DIR
+    from bench.env import baseline_versions
+
+    shutil.copytree(CONFIG_DIR, tmp_path / "cfg")
+    engine = yaml.safe_load((tmp_path / "cfg" / "engines" / "mock.yaml").read_text())
+    engine |= {"name": "fake", "python": sys.executable, "package": "pyyaml"}
+    (tmp_path / "cfg" / "engines" / "fake.yaml").write_text(yaml.safe_dump(engine))
+    versions = baseline_versions(load_config(tmp_path / "cfg"))
+    assert versions == {"fake": yaml.__version__}

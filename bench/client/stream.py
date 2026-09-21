@@ -140,5 +140,7 @@ def _on_event(payload: bytes, rec: dict, times: list[float], now: float,
         times.append(now)
         if (lp := choices[0].get("logprobs")) and lp.get("token_logprobs"):
             rec["token_logprobs"].append(lp["token_logprobs"][0])
-            rec["token_ids"].append(int(lp["tokens"][0].removeprefix("token_id:")))
+            token = lp.get("tokens", [""])[0]
+            if token.startswith("token_id:"):  # engines that return plain text have no ids
+                rec["token_ids"].append(int(token.removeprefix("token_id:")))
     return False

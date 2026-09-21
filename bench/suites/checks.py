@@ -28,6 +28,7 @@ BURST_GAP_FRACTION = 0.2
 BURST_SHARE_MAX = 0.02
 NULL_GAP_S = 0.010
 IDLE_UTILIZATION_MAX_PCT = 5
+IDLE_SETTLE_S = 30.0
 NULL_TOKENS = 128
 NULL_SERVER_WORKERS = 4
 CLIENT_PROC_STEPS = (1, 2, 4, 8)
@@ -70,14 +71,20 @@ def _ttft(record: dict) -> float:
     return record["token_times"][0] - record["t_send"]
 
 
-def check_gpu_idle(gpu_index: int) -> CheckResult:
-    """Nothing else is using the GPU: no compute process and under 5% utilisation."""
+def check_gpu_idle(gpu_index: int, settle_s: float = IDLE_SETTLE_S) -> CheckResult:
+    """Nothing else is using the GPU: no compute process and under 5% utilisation. A GPU that
+    was busy a moment ago, with our own previous task, gets `settle_s` to go quiet."""
     from .. import env
 
-    pids = env.compute_pids()
-    utilization = env.gpu_utilization_pct(gpu_index)
-    idle = not pids and utilization < IDLE_UTILIZATION_MAX_PCT
-    return CheckResult("gpu_idle", idle, f"compute processes {pids}, utilisation {utilization}%")
+    deadline = time.perf_counter() + settle_s
+    while True:
+        pids = env.compute_pids()
+        utilization = env.gpu_utilization_pct(gpu_index)
+        idle = not pids and utilization < IDLE_UTILIZATION_MAX_PCT
+        if idle or time.perf_counter() >= deadline:
+            return CheckResult("gpu_idle", idle,
+                               f"compute processes {pids}, utilisation {utilization}%")
+        time.sleep(1.0)
 
 
 def require_idle_gpu(run, engine: str) -> None:

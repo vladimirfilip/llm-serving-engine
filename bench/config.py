@@ -45,6 +45,7 @@ class EngineSpec:
     name: str
     python: str | None
     launch: list[str]
+    package: str | None = None  # distribution whose version identifies this engine
     accepts_token_ids: bool = True
     uses_gpu: bool = True
     has_tokenizer: bool = True

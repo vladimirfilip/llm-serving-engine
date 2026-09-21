@@ -330,6 +330,28 @@ def gpu_facts(gpu_index: int) -> dict:
     }
 
 
+def baseline_versions(cfg: Config) -> dict[str, str | None]:
+    """The installed version of each engine that runs from its own environment, read by asking
+    that environment's interpreter."""
+    import yaml
+
+    from .config import expand, load_engine
+
+    versions: dict[str, str | None] = {}
+    for path in sorted((cfg.dir / "engines").glob("*.yaml")):
+        if "launch" not in yaml.safe_load(path.read_text()):
+            continue  # the ablation steps file is not an engine
+        spec = load_engine(path.stem, cfg.dir)
+        if not (spec.python and spec.package):
+            continue
+        python = expand(spec.python, {})
+        code = f"import importlib.metadata as m; print(m.version({spec.package!r}))"
+        result = (subprocess.run([python, "-c", code], capture_output=True, text=True)
+                  if Path(python).exists() else None)
+        versions[spec.name] = result.stdout.strip() if result and result.returncode == 0 else None
+    return versions
+
+
 def capture_env(cfg: Config, clock_lock: ClockLock, probe: dict | None) -> dict:
     """The resolved machine and fairness settings written to `env.json`."""
     import torch
@@ -352,6 +374,7 @@ def capture_env(cfg: Config, clock_lock: ClockLock, probe: dict | None) -> dict:
         "hardware": hw,
         "model": model | {"path": cfg.model_path, "spec": dataclasses.asdict(spec)},
         "packages": package_versions(),
+        "baselines": baseline_versions(cfg),
         "fairness": {
             "F1": {"checkpoint": cfg.model_path, "dtype": model["dtype"],
                    "gpu_clock_mhz": hw["gpu_clock_mhz"], "mem_clock_mhz": hw["mem_clock_mhz"]},

@@ -1,0 +1,35 @@
+name: sglang
+python: ~/.bench-envs/sglang/bin/python
+package: sglang
+accepts_token_ids: true
+request_model: "{served_model_name}"
+extra_body: {ignore_eos: true, skip_special_tokens: false}
+health_path: /health
+stats_api: prometheus
+score_api: sglang
+launch:
+  - "{python}"
+  - "-m"
+  - "sglang.launch_server"
+  - "--model-path={model_path}"
+  - "--served-model-name={served_model_name}"
+  - "--port={port}"
+  - "--dtype=bfloat16"
+  - "--context-length={max_model_len}"
+  - "--max-running-requests={max_num_seqs}"
+  - "--mem-fraction-static={gpu_mem_util}"
+  - "--chunked-prefill-size={token_budget}"
+  - "--disable-radix-cache"
+  - "--stream-interval=1"
+  - "--enable-metrics"
+  - "--random-seed=0"
+tuning: {token_budget: [2048, 4096, 8192, 16384], default: 4096}
+metrics:
+  path: /metrics
+  running: ["sglang:num_running_reqs"]
+  waiting: ["sglang:num_queue_reqs"]
+  kv_usage: ["sglang:token_usage"]
+  preemptions: ["sglang:num_retracted_reqs_total"]
+variants:
+  chunked_prefill_off:
+    args_add: ["--chunked-prefill-size=-1"]

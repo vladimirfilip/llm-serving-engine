@@ -53,6 +53,7 @@ def test_a_busy_gpu_aborts_the_engine_and_the_result_is_recorded(run, monkeypatc
     monkeypatch.setattr(env, "gpu_available", lambda: True)
     monkeypatch.setattr(env, "compute_pids", lambda: [4242])
     monkeypatch.setattr(env, "gpu_utilization_pct", lambda _index: 60)
+    monkeypatch.setattr(checks, "IDLE_SETTLE_S", 0.0)
     with pytest.raises(CheckFailed, match="GPU not idle"):
         checks.require_idle_gpu(run, "ours")
     saved = checks.load_checks(run)["ours"]["gpu_idle"]
@@ -101,3 +102,13 @@ def test_env_json_is_written_once_with_the_resolved_fairness_rules(run):
     assert env["model"]["spec"]["n_kv_heads"] == 8
     assert env["clocks_locked"] is False and env["gpu_prepared"] is False
     assert "bw_read_gbs" not in env
+
+
+def test_a_gpu_that_goes_quiet_within_the_settle_window_passes(monkeypatch):
+    from bench import env
+
+    readings = iter([40, 20, 3])
+    monkeypatch.setattr(env, "compute_pids", lambda: [])
+    monkeypatch.setattr(env, "gpu_utilization_pct", lambda _index: next(readings))
+    monkeypatch.setattr(checks.time, "sleep", lambda _s: None)
+    assert checks.check_gpu_idle(0, settle_s=60).passed

@@ -1,0 +1,33 @@
+name: trtllm
+python: ~/.bench-envs/trtllm/bin/python
+package: tensorrt_llm
+accepts_token_ids: true
+request_model: "{model_path}"
+extra_body: {ignore_eos: true, skip_special_tokens: false}
+health_path: /health
+stats_api: none
+score_api: none
+env:
+  # the bindings need the CUDA 13 runtime and a CUDA home; both ship inside torch's dependencies
+  CUDA_HOME: ~/.bench-envs/trtllm/lib/python3.12/site-packages/nvidia/cu13
+  LD_LIBRARY_PATH: ~/.bench-envs/trtllm/lib/python3.12/site-packages/nvidia/cu13/lib
+launch:
+  - "~/.bench-envs/trtllm/bin/trtllm-serve"
+  - "serve"
+  - "{model_path}"
+  - "--backend=pytorch"
+  - "--port={port}"
+  - "--max_batch_size={max_num_seqs}"
+  - "--max_seq_len={max_model_len}"
+  - "--max_num_tokens={token_budget}"
+  - "--extra_llm_api_options={run_dir}/trtllm_opts.yaml"
+tuning: {token_budget: [2048, 4096, 8192, 16384], default: 8192}
+files:
+  trtllm_opts.yaml:
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: "{gpu_mem_util}"
+    enable_chunked_prefill: true
+    cuda_graph_config:
+      max_batch_size: "{max_num_seqs}"
+      enable_padding: true

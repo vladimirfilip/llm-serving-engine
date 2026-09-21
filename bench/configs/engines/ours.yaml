@@ -20,3 +20,7 @@ env:
   LLM_MAX_CONCURRENT_SEQUENCES: "{max_num_seqs}"
   LLM_DEVICE_MEM_UTIL: "{gpu_mem_util}"
 tuning: {token_budget: [1024, 2048, 4096, 8192], default: 4096}
+variants:
+  # A token budget of 16384 lets one chunk cover the whole injected 8192-token prompt
+  chunked_prefill_off:
+    env: {LLM_TOKEN_BUDGET: "16384"}

@@ -1,0 +1,35 @@
+name: vllm
+python: ~/.bench-envs/vllm/bin/python
+package: vllm
+accepts_token_ids: true
+request_model: "{served_model_name}"
+# return_tokens_as_token_ids makes logprobs name each token by id, which the correctness
+# suite needs to compare generated tokens.
+extra_body: {ignore_eos: true, skip_special_tokens: false, return_tokens_as_token_ids: true}
+health_path: /health
+stats_api: prometheus
+score_api: vllm
+launch:
+  - "{python}"
+  - "-m"
+  - "vllm.entrypoints.openai.api_server"
+  - "--model={model_path}"
+  - "--served-model-name={served_model_name}"
+  - "--port={port}"
+  - "--dtype=bfloat16"
+  - "--max-model-len={max_model_len}"
+  - "--max-num-seqs={max_num_seqs}"
+  - "--gpu-memory-utilization={gpu_mem_util}"
+  - "--max-num-batched-tokens={token_budget}"
+  - "--no-enable-prefix-caching"
+  - "--seed=0"
+tuning: {token_budget: [2048, 4096, 8192, 16384], default: 8192}
+metrics:
+  path: /metrics
+  running: ["vllm:num_requests_running"]
+  waiting: ["vllm:num_requests_waiting"]
+  kv_usage: ["vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"]
+  preemptions: ["vllm:num_preemptions_total"]
+variants:
+  chunked_prefill_off:
+    args_add: ["--no-enable-chunked-prefill"]

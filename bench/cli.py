@@ -6,14 +6,15 @@ import argparse
 import dataclasses
 import json
 import sys
+from pathlib import Path
 
 from . import env
-from .config import load_config
+from .config import CONFIG_DIR, load_config, load_engine
 from .gpu_tasks import run_task
 from .modelspec import ModelSpec
 from .run import Run
 from .suites import SUITE_ORDER, suite_function
-from .suites.common import SuiteSkipped, datasets_dir
+from .suites.common import SuiteSkipped, datasets_dir, ensure_env
 from .workloads.prepare import prepare_data
 from .workloads.synthetic import write_synthetic
 
@@ -64,10 +65,11 @@ def add_run_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-unlocked", action="store_true")
     parser.add_argument("--client-procs", type=int, default=1)
     parser.add_argument("--model-path", help="override model.yaml local_path")
+    parser.add_argument("--config-dir", type=Path, help="read the YAML configs from here")
 
 
 def open_run(args: argparse.Namespace) -> Run:
-    cfg = load_config(quick=args.quick)
+    cfg = load_config(args.config_dir or CONFIG_DIR, quick=args.quick)
     if args.model_path:
         cfg = dataclasses.replace(cfg, model=cfg.model | {"local_path": args.model_path})
     run = Run.open(cfg, args.run_id, force=args.force, allow_unlocked=args.allow_unlocked,
@@ -128,6 +130,71 @@ def cmd_reference(args: argparse.Namespace) -> int:
     return 0
 
 
+def find_run(args: argparse.Namespace) -> Path:
+    from .run import RESULTS_DIR
+
+    return RESULTS_DIR / args.run_id
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    from .report import build_report
+
+    report, _ = build_report(find_run(args))
+    print(report)
+    return 0
+
+
+def cmd_publish(args: argparse.Namespace) -> int:
+    from .publish import MissingMarkers, publish
+
+    try:
+        unmet = publish(find_run(args), args.force, args.write_readme)
+    except MissingMarkers as e:
+        print(f"README not edited: {e}", file=sys.stderr)
+        return 1
+    if unmet and not args.force:
+        print("not publishing; unmet conditions:\n- " + "\n- ".join(unmet), file=sys.stderr)
+        return 1
+    print("published to bench/published/")
+    return 0
+
+
+ALL_PHASES = ["tune", "correctness", "probe", "sweep", "single_stream", "kernels", "nsys",
+              "memory", "scheduler", "ablation", "precision", "coldstart", "soak"]
+
+
+def ensure_datasets(cfg, engines: list[str]) -> None:
+    """Datasets are built once: from the real sources when any engine runs the real model, as
+    seeded random tokens (and stamped so) when only fake engines are asked for."""
+    if (datasets_dir() / "meta.json").exists():
+        return
+    real = any(load_engine(e, cfg.dir).real_model for e in engines)
+    if real:
+        prepare_data(cfg, datasets_dir())
+    else:
+        write_synthetic(datasets_dir(), cfg.suite,
+                        ModelSpec.from_dir(cfg.model_path, cfg.model["dtype"]).vocab)
+
+
+def cmd_all(args: argparse.Namespace) -> int:
+    if args.quick and args.soak:
+        print("--quick with --soak is an error", file=sys.stderr)
+        return 2
+    run = open_run(args)
+    engines = args.engines.split(",")
+    ensure_datasets(run.cfg, engines)
+    ensure_env(run, any(load_engine(e, run.cfg.dir).uses_gpu for e in engines))
+    ok = True
+    for phase in ALL_PHASES:
+        if phase == "soak" and not args.soak:
+            continue
+        ok &= run_phase(run, phase, engines)
+    from .report import build_report
+
+    print(build_report(run.dir)[0])
+    return 0 if ok else 1
+
+
 def cmd_prepare_data(args: argparse.Namespace) -> int:
     cfg = load_config()
     if args.model_path:
@@ -159,6 +226,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_run_flags(ref)
     ref.add_argument("--score", metavar="ENGINE")
     ref.set_defaults(fn=cmd_reference)
+    everything = commands.add_parser("all", help="every phase, then the report")
+    add_run_flags(everything)
+    everything.add_argument("--soak", action="store_true")
+    everything.set_defaults(fn=cmd_all)
+    report = commands.add_parser("report", help="write report.md for a run")
+    report.add_argument("--run-id", required=True)
+    report.set_defaults(fn=cmd_report)
+    publish = commands.add_parser("publish", help="curate a run into bench/published/")
+    publish.add_argument("--run-id", required=True)
+    publish.add_argument("--write-readme", action="store_true")
+    publish.add_argument("--force", action="store_true")
+    publish.set_defaults(fn=cmd_publish)
     prep = commands.add_parser("prepare-data", help="build the seeded datasets")
     prep.add_argument("--synthetic", action="store_true",
                       help="random datasets for runs with no model files or network")
