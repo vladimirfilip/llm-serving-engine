@@ -140,7 +140,10 @@ def lock_clocks(hw: dict) -> ClockLock:
         result = nvidia_smi("-i", gpu, *command)
         if result.returncode != 0:
             return ClockLock(False, (result.stdout + result.stderr).strip())
-    return ClockLock(**run_task("verify-clock", hw=hw))
+    try:
+        return ClockLock(**run_task("verify-clock", hw=hw))
+    except RuntimeError as e:
+        return ClockLock(False, f"could not verify the clock lock: {str(e)[-300:]}")
 
 
 def verify_clock_lock(hw: dict) -> ClockLock:

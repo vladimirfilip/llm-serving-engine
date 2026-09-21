@@ -117,6 +117,7 @@ def execute(run: Run, engines: list[str]) -> None:
     for engine in wanted:
         folder = run.phase_dir("soak") / engine
         folder.mkdir(exist_ok=True)
+        records = None
         with guarded(run, "soak", engine), engine_session(run, engine, "soak") as s:
             def requests_for_chunk(n: int, chunk: int):
                 return make_requests(workload, index, n, run.cfg.suite["seed"], chunk, data)
@@ -127,6 +128,8 @@ def execute(run: Run, engines: list[str]) -> None:
                                             cfg["rate_fraction"] * ref, duration_s,
                                             run.cfg.suite["seed"], t0))
             monitor = s.monitor.frame()
+        if records is None:
+            continue
         df = pd.DataFrame(records)
         tokens = windowed(df, THROUGHPUT_WINDOW_S, duration_s)
         latency = windowed(df, LATENCY_WINDOW_S, duration_s)

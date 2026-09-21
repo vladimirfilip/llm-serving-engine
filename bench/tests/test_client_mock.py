@@ -130,3 +130,11 @@ def test_logprob_tokens_that_are_plain_text_give_no_ids_and_do_not_crash():
     _on_event(b'{"choices":[{"text":" a","logprobs":{"tokens":[" a"],"token_logprobs":[-1.0]}}]}',
               rec, [], 0.1, parse_tokens=True)
     assert rec["token_ids"] == [] and rec["token_logprobs"] == [-1.0]
+
+
+def test_a_server_error_event_on_the_parsed_path_is_recorded_with_its_cause():
+    from bench.client.stream import _on_event
+
+    rec = {"token_logprobs": [], "token_ids": [], "status": "ok", "error": ""}
+    _on_event(b'{"error": "1 token(s) dropped from a logprob stream"}', rec, [], 0.1, True)
+    assert rec["status"] == "error" and "dropped from a logprob stream" in rec["error"]

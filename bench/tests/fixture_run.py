@@ -76,7 +76,8 @@ def sweep_points(invalid: bool = False) -> pd.DataFrame:
                             "workload": workload,
                             "offered_rps": rate,
                             "repeat": repeat,
-                            "valid": not (invalid and engine == "ours" and rate == 4.0),
+                            "valid": not (invalid and engine == "ours" and rate == 4.0)
+                    and not (invalid and engine == "ours" and rate == 2.0 and repeat == 1),
                             "throttled": False,
                             "attempts": 1,
                             "client_procs": 1,

@@ -40,8 +40,9 @@ def merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
 
 def busy_and_gaps(intervals: list[tuple[int, int]], window: tuple[int, int]) -> dict:
     """GPU busy fraction of `window` and statistics of the gaps between merged intervals
-    (times in seconds)."""
-    merged = merge_intervals(intervals)
+    (times in seconds). Activity is clipped to the window first, so the fraction cannot exceed 1."""
+    lo, hi = window
+    merged = merge_intervals([(max(s, lo), min(e, hi)) for s, e in intervals if e > lo and s < hi])
     busy = sum(e - s for s, e in merged)
     gaps = np.array([b_start - a_end for (_, a_end), (b_start, _) in pairwise(merged)]) / 1e9
     span = window[1] - window[0]
@@ -62,15 +63,22 @@ def read_device_intervals(db: sqlite3.Connection) -> list[tuple[int, int]]:
 
 def capture_window(db: sqlite3.Connection, intervals: list[tuple[int, int]],
                    capture_s: float) -> tuple[tuple[int, int], str]:
-    """The capture window in ns and where it came from: the start and stop Nsight recorded, or
-    `capture_s` from the first device event when the export carries no capture bounds."""
-    present = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    if "ANALYSIS_DETAILS" in present:
-        row = db.execute("SELECT startTime, stopTime FROM ANALYSIS_DETAILS LIMIT 1").fetchone()
-        if row and row[0] is not None and row[1] is not None:
-            return (row[0], row[1]), "nsight capture bounds"
+    """The capture window in ns and where it came from: the start and stop Nsight recorded when
+    they bracket the device activity and span about `capture_s`, else `capture_s` from the first
+    device event, with the reason the recorded bounds were not used."""
     first = min(s for s, _ in intervals)
-    return (first, first + int(capture_s * 1e9)), "capture_s from the first device event"
+    fallback = (first, first + int(capture_s * 1e9))
+    reason = "no capture bounds in the export"
+    try:
+        row = db.execute("SELECT startTime, stopTime FROM ANALYSIS_DETAILS LIMIT 1").fetchone()
+    except sqlite3.Error:
+        row = None
+    if row and row[0] is not None and row[1] is not None:
+        span = (row[1] - row[0]) / 1e9
+        if row[0] <= first and 0 < span <= 2 * capture_s and span >= 0.5 * capture_s:
+            return (row[0], row[1]), "nsight capture bounds"
+        reason = f"recorded bounds rejected: span {span:.1f} s for a {capture_s:.1f} s capture"
+    return fallback, f"capture_s from the first device event ({reason})"
 
 
 def read_nvtx(db: sqlite3.Connection) -> pd.DataFrame:
@@ -108,6 +116,10 @@ def analyse(db_path: Path, engine: str, batch: int,
             capture_s: float) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
     db = sqlite3.connect(db_path)
     intervals = read_device_intervals(db)
+    if not intervals:
+        return ({"engine": engine, "batch": batch,
+                 "window_source": "no device events in the capture"},
+                pd.DataFrame(columns=["engine", "batch", "gap_s"]), pd.DataFrame())
     window, source = capture_window(db, intervals, capture_s)
     stats = busy_and_gaps(intervals, window)
     gaps = pd.DataFrame({"engine": engine, "batch": batch, "gap_s": stats.pop("gaps_s")})

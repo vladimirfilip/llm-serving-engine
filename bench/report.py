@@ -93,7 +93,8 @@ def launch_commands(run_dir: Path) -> dict:
     for meta in sorted((run_dir / "sweep").glob("*/*/*.json")):
         data = json.loads(meta.read_text())
         out.setdefault(data["engine"], {"launch": data["launch"],
-                                        "token_budget": data["token_budget"]})
+                                        "token_budget": data["token_budget"],
+                                        "env": data.get("launch_env", {})})
     return out
 
 
@@ -117,8 +118,9 @@ def setup_block(env: dict, run_dir: Path, tuned: dict, suite: dict) -> str:
              "- Tuned token budgets: " + (", ".join(f"{e} {t['token_budget']}"
                                                    for e, t in tuned.items()) or "none")]
     for engine, c in launch_commands(run_dir).items():
+        env_text = " ".join(f"{k}={v}" for k, v in c["env"].items())
         lines.append(f"- Launch, {engine} (token budget {c['token_budget']}): "
-                     f"`{' '.join(c['launch'])}`")
+                     f"`{env_text + ' ' if env_text else ''}{' '.join(c['launch'])}`")
     return "\n".join(lines) + "\n"
 
 

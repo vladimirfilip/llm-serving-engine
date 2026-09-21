@@ -77,7 +77,8 @@ def run_point(session: Session, workload_name: str, rate: float, rate_index: int
     meta.write_text(json.dumps({
         "engine": session.spec.name, "workload": workload_name, "offered_rps": rate,
         "rate_index": rate_index, "repeat": repeat, "n": n, "window": window, "t0": t0,
-        "launch": session.adapter.launch_argv, "token_budget": session.launch.token_budget,
+        "launch": session.adapter.launch_argv, "launch_env": session.adapter.launch_env,
+        "token_budget": session.launch.token_budget,
         "monitor": str(session.run.monitor_path(session.spec.name, session.phase)),
         "valid": not reasons, "invalid_reasons": reasons, "throttled": throttled,
         "attempts": attempt, "client_procs": session.client_procs, "metrics": metrics,

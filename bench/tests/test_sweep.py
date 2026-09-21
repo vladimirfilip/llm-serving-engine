@@ -98,7 +98,25 @@ def test_an_engine_with_no_tuning_knob_keeps_a_fixed_launch(run):
     assert json.loads((run.dir / "tune" / "tuned.json").read_text())["mock"]["token_budget"] is None
 
 
-def test_a_probe_rerun_skips_measured_workloads_and_a_crash_keeps_what_was_taken(run):
+def test_a_probe_that_crashes_keeps_the_workloads_measured_before_the_crash(run, monkeypatch):
+    real, calls = probe.measure_capacity, []
+
+    def crash_on_third(*args, **kwargs):
+        if len(calls) == 2:
+            raise KeyboardInterrupt
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(probe, "measure_capacity", crash_on_third)
+    with pytest.raises(KeyboardInterrupt):
+        probe.execute(run, ["mock"])
+    assert len(json.loads(probe.capacity_path(run).read_text())["mock"]) == 2
+    monkeypatch.setattr(probe, "measure_capacity", real)
+    probe.execute(run, ["mock"])
+    assert len(json.loads(probe.capacity_path(run).read_text())["mock"]) == 4
+
+
+def test_a_probe_rerun_skips_measured_workloads_and_measures_only_the_missing_one(run):
     probe.execute(run, ["mock"])
     first = probe.capacity_path(run).read_text()
     probe.execute(run, ["mock"])  # nothing left to measure: no engine is launched

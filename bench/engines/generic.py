@@ -63,6 +63,7 @@ class GenericAdapter(EngineAdapter):
         self.proc: ServerProcess | None = None
         self.port = 0
         self.launch_argv: list[str] = []
+        self.launch_env: dict[str, str] = {}
 
     def _values(self, launch: Launch, port: int) -> dict:
         model = self.cfg.model
@@ -87,6 +88,9 @@ class GenericAdapter(EngineAdapter):
         env = {k: str(rendered) for k, v in
                (self.spec.env | launch.env | (env_overrides or {})).items()
                if (rendered := render(v, values)) is not None}
+        self.launch_env = dict(env)
+        if self.spec.path_prepend:
+            self.launch_env["PATH (prepended)"] = ":".join(expand(self.spec.path_prepend, values))
         if self.spec.path_prepend:
             env["PATH"] = ":".join(
                 [*expand(self.spec.path_prepend, values), os.environ.get("PATH", "")])

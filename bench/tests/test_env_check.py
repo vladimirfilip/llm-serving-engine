@@ -27,8 +27,29 @@ def test_env_check_runs_every_preflight_check_for_the_named_engines(
         shutil.rmtree(RESULTS_DIR / run_id, ignore_errors=True)
 
 
-def test_env_check_without_engines_only_reports_the_machine():
-    result = subprocess.run([sys.executable, "-m", "bench", "env-check", "--allow-unlocked"],
-                            capture_output=True, text=True, timeout=120,
-                            env={"CUDA_VISIBLE_DEVICES": "", **__import__("os").environ})
-    assert result.returncode == 0 and "numpy" in result.stdout
+def test_env_check_without_engines_reports_the_machine_and_never_touches_the_card(
+    fast_config_dir,
+):
+    import yaml
+
+    hardware = yaml.safe_load((fast_config_dir / "hardware.yaml").read_text())
+    hardware["gpu_clock_mhz"] = None  # nothing to lock, so lock_clocks leaves the card alone
+    (fast_config_dir / "hardware.yaml").write_text(yaml.safe_dump(hardware))
+    result = subprocess.run(
+        [sys.executable, "-m", "bench", "env-check", "--allow-unlocked", "--config-dir",
+         str(fast_config_dir)], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout[-800:] + result.stderr[-800:]
+    assert "numpy" in result.stdout
+    assert "clocks locked: False gpu_clock_mhz is not set" in result.stdout or (
+        "no NVIDIA driver" in result.stdout)
+
+
+def test_a_clock_lock_that_cannot_be_verified_is_reported_unlocked_not_raised(monkeypatch):
+    from bench import env
+
+    monkeypatch.setattr(env, "nvidia_smi", lambda *a: type("R", (), {"returncode": 0})())
+    monkeypatch.setattr(env, "run_task", lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError("No CUDA GPUs are available")))
+    lock = env.lock_clocks({"gpu_index": 0, "gpu_clock_mhz": 1900, "mem_clock_mhz": None,
+                            "power_limit_w": None})
+    assert not lock.locked and "No CUDA GPUs are available" in lock.error

@@ -132,6 +132,9 @@ def _on_event(payload: bytes, rec: dict, times: list[float], now: float,
             rec.update(status="error", error=payload[:200].decode(errors="replace"))
         return False
     event = orjson.loads(payload)
+    if error := event.get("error"):
+        rec.update(status="error", error=str(error)[:200])
+        return False
     if usage := event.get("usage"):
         rec["prompt_tokens_usage"] = usage["prompt_tokens"]
         rec["completion_tokens_usage"] = usage["completion_tokens"]

@@ -82,7 +82,7 @@ def test_analyse_summarises_a_capture_and_breaks_down_only_ours_steps(tmp_path):
     assert row["engine"] == "ours" and row["batch"] == 16
     # 11 ms busy in a 20 ms capture that starts with the first kernel at 3 ms
     assert row["gpu_busy_fraction"] == pytest.approx(11 / 20)
-    assert row["window_source"] == "capture_s from the first device event"
+    assert row["window_source"].startswith("capture_s from the first device event")
     assert len(gaps) == 1 and gaps.gap_s.iloc[0] == pytest.approx(0.004)
     assert isinstance(steps, pd.DataFrame) and len(steps) == 2 and (steps.batch == 16).all()
     _, _, others = nsys.analyse(tmp_path / "ours.sqlite", "vllm", 16, capture_s=0.020)
@@ -114,3 +114,38 @@ def test_the_suite_is_skipped_when_nsight_is_not_installed(fast_config, tmp_path
     run.cfg.hardware["nsys_path"] = "definitely-not-nsys"
     with pytest.raises(SuiteSkipped, match="not on the path"):
         nsys.execute(run, ["ours"])
+
+
+def test_activity_past_the_capture_window_cannot_push_the_busy_fraction_over_one():
+    out = nsys.busy_and_gaps([(0, 10_400 * MS)], (0, 10_000 * MS))
+    assert out["gpu_busy_fraction"] == pytest.approx(1.0)
+    clipped = nsys.busy_and_gaps([(0, 4 * MS), (6 * MS, 30 * MS)], (0, 10 * MS))
+    assert clipped["gpu_busy_fraction"] == pytest.approx(0.8)
+    assert sorted(clipped["gaps_s"] * 1e9) == pytest.approx([2 * MS])
+
+
+def test_recorded_bounds_that_span_the_whole_session_are_rejected_with_the_reason(tmp_path):
+    db = make_db(tmp_path / "x.sqlite", RANGES, KERNELS)
+    db.execute("CREATE TABLE ANALYSIS_DETAILS (startTime INTEGER, stopTime INTEGER)")
+    db.execute("INSERT INTO ANALYSIS_DETAILS VALUES (0, ?)", (200_000 * MS,))  # a 200 s session
+    db.commit()
+    row, _, _ = nsys.analyse(tmp_path / "x.sqlite", "ours", 1, capture_s=0.020)
+    assert "recorded bounds rejected" in row["window_source"]
+    assert row["gpu_busy_fraction"] == pytest.approx(11 / 20)
+
+
+def test_an_analysis_table_with_other_column_names_falls_back_instead_of_crashing(tmp_path):
+    db = make_db(tmp_path / "x.sqlite", RANGES, KERNELS)
+    db.execute("CREATE TABLE ANALYSIS_DETAILS (begin INTEGER, finish INTEGER)")
+    db.commit()
+    row, _, _ = nsys.analyse(tmp_path / "x.sqlite", "ours", 1, capture_s=0.020)
+    assert row["window_source"].startswith("capture_s from the first device event")
+
+
+def test_a_capture_with_no_device_events_is_reported_not_a_crash(tmp_path):
+    db = sqlite3.connect(tmp_path / "empty.sqlite")
+    db.execute("CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (start INTEGER, end INTEGER)")
+    db.commit()
+    row, gaps, steps = nsys.analyse(tmp_path / "empty.sqlite", "ours", 1, capture_s=0.020)
+    assert row["window_source"] == "no device events in the capture"
+    assert gaps.empty and steps.empty

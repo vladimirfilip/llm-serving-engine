@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from .style import color, figure, finish
+from .style import PANEL, color, finish
 
 
 def load(ctx) -> pd.DataFrame | None:
@@ -21,19 +22,19 @@ def draw(ctx):
     if data is None:
         return None
     combos = list(data[["engine", "variant"]].drop_duplicates().itertuples(index=False))
-    # top: one time-series row per engine and variant; bottom: one CDF panel per combination
-    fig, axes = figure(len(combos) + 1, max(1, len(combos)))
-    for ax in axes.flat:
-        ax.set_visible(False)
+    n = len(combos)
+    # top: one full-width time-series row per engine and variant; bottom: a CDF panel each
+    fig = plt.figure(figsize=(PANEL[0] * max(1, n), PANEL[1] * (n + 1)))
+    grid = fig.add_gridspec(n + 1, n)
     for row, (engine, variant) in enumerate(combos):
         frame = data[(data.engine == engine) & (data.variant == variant)]
-        series = axes[row][0]
-        series.set_visible(True)
+        series = fig.add_subplot(grid[row, :])
+        series.grid(True, alpha=0.3)
         series.plot(frame.t, frame.itl * 1000, ".", ms=1.5, color=color(engine), alpha=0.5)
         series.set(yscale="log", title=f"{engine} / {variant}", xlabel="time (s)",
                    ylabel="background ITL (ms, log)")
-        cdf = axes[-1][row]
-        cdf.set_visible(True)
+        cdf = fig.add_subplot(grid[n, row])
+        cdf.grid(True, alpha=0.3)
         for label, style in (("baseline", "-"), ("during_prefill", "--")):
             x = np.sort(frame[frame.label == label].itl.to_numpy() * 1000)
             if len(x):

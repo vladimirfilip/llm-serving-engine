@@ -1,4 +1,5 @@
 import dataclasses
+import json
 
 import numpy as np
 import pandas as pd
@@ -204,3 +205,26 @@ def test_a_refused_cache_drop_is_recorded_in_the_coldstart_table(run, monkeypatc
     coldstart.execute(run, ["mock"])
     table = pd.read_csv(run.dir / "tables" / "coldstart.csv")
     assert table.cache_drop_refused.tolist() == [True, False]
+
+
+def test_a_soak_engine_that_aborts_leaves_no_files_and_borrows_nothing(
+    fast_config_dir, tmp_path, synthetic_datasets, monkeypatch
+):
+    engines = fast_config_dir / "engines"
+    bad = yaml.safe_load((engines / "mock.yaml").read_text())
+    bad["name"] = "bad"
+    bad["launch"] += ["--burst=4"]
+    (engines / "bad.yaml").write_text(yaml.safe_dump(bad))
+    run = Run.open(load_config(fast_config_dir), "soak-bad", results_dir=tmp_path / "results")
+    probe.execute(run, ["mock"])
+    capacity = json.loads(probe.capacity_path(run).read_text())
+    capacity["bad"] = capacity["mock"]
+    probe.capacity_path(run).write_text(json.dumps(capacity))
+    run.cfg.suite["soak"].update(duration_h=8 / 3600, engines=["bad", "mock"], sample_s=1)
+    monkeypatch.setattr(soak, "CHUNK_S", 2.0)
+    monkeypatch.setattr(soak, "THROUGHPUT_WINDOW_S", 2.0)
+    monkeypatch.setattr(soak, "LATENCY_WINDOW_S", 4.0)
+    soak.execute(run, ["bad", "mock"])
+    assert run.aborted("soak") == ["bad"]
+    assert list(pd.read_csv(run.dir / "tables" / "soak.csv").engine) == ["mock"]
+    assert not (run.dir / "soak" / "bad" / "verdict.json").exists()

@@ -84,4 +84,5 @@ def test_baseline_versions_skip_files_that_are_not_engines_and_ask_each_environm
     engine |= {"name": "fake", "python": sys.executable, "package": "pyyaml"}
     (tmp_path / "cfg" / "engines" / "fake.yaml").write_text(yaml.safe_dump(engine))
     versions = baseline_versions(load_config(tmp_path / "cfg"))
-    assert versions == {"fake": yaml.__version__}
+    assert versions["fake"] == yaml.__version__
+    assert "ours_ablation" not in versions  # a steps file is not an engine

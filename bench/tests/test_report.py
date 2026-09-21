@@ -80,7 +80,8 @@ def test_the_headline_takes_the_median_of_repeats_and_ignores_invalid_points(tmp
     row = info["headline"].set_index("engine")
     # repeats at rate 2.0 hold 79.6 and 83.6 ms: the median, the value P01 plots
     assert row.loc["vllm", "p99_tpot_ms_at_half_ref"] == pytest.approx(81.59, abs=0.01)
-    assert row.loc["ours", "p99_tpot_ms_at_half_ref"] == pytest.approx(81.59, abs=0.01)
+    # ours has repeat 1 invalid at that rate: only the valid repeat (79.6 ms) is used
+    assert row.loc["ours", "p99_tpot_ms_at_half_ref"] == pytest.approx(79.6, abs=0.01)
 
 
 def test_the_setup_block_names_engine_versions_and_each_resolved_launch_command(full_run):
@@ -141,3 +142,28 @@ def test_the_decode_bandwidth_twin_axis_maps_the_same_range_as_the_left_axis(ful
     ax, twin = captured["fig"].axes[0], captured["fig"].axes[3]
     low, high = ax.get_ylim()
     assert tuple(twin.get_ylim()) == pytest.approx((low / 637 * 100, high / 637 * 100))
+
+
+def test_the_interference_plot_is_sized_by_its_panels_not_its_combinations(tmp_path):
+    import matplotlib.pyplot as plt
+
+    from bench.plots import p21_prefill_interference
+    from bench.plots.style import PlotContext
+
+    run = fixture_run.write(tmp_path / "r", {"scheduler"})
+    source = run / "scheduler" / "ours" / "interference_default.parquet"
+    for engine in ("vllm", "sglang", "trtllm"):
+        (run / "scheduler" / engine).mkdir(exist_ok=True)
+        for variant in ("default", "chunked_prefill_off"):
+            (run / "scheduler" / engine / f"interference_{variant}.parquet").write_bytes(
+                source.read_bytes())
+    ctx = PlotContext(run, run / "plots", fixture_run.env_json(), {})
+    captured = {}
+    original = plt.close
+    plt.close = lambda fig: captured.setdefault("fig", fig)
+    try:
+        p21_prefill_interference.draw(ctx)
+    finally:
+        plt.close = original
+    width, height = captured["fig"].get_size_inches()
+    assert len(captured["fig"].axes) == 2 * 7 and (width, height) == (7 * 7, 4.5 * 8)
