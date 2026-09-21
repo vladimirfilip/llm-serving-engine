@@ -111,7 +111,8 @@ async def _read_stream(
             if line.startswith(b"data:") and _on_event(line[5:].lstrip(), rec, times, now,
                                                        parse_tokens):
                 return
-    rec.update(status="error", error="stream ended without [DONE]")
+    if rec["status"] == "ok":  # a server error event already named the cause
+        rec.update(status="error", error="stream ended without [DONE]")
 
 
 EMPTY_TEXT = (b'"text":""', b'"text": ""')

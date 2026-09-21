@@ -138,3 +138,38 @@ def test_a_server_error_event_on_the_parsed_path_is_recorded_with_its_cause():
     rec = {"token_logprobs": [], "token_ids": [], "status": "ok", "error": ""}
     _on_event(b'{"error": "1 token(s) dropped from a logprob stream"}', rec, [], 0.1, True)
     assert rec["status"] == "error" and "dropped from a logprob stream" in rec["error"]
+
+
+class StubResponse:
+    """Just enough of an aiohttp response: a body that yields the given chunks."""
+
+    def __init__(self, *chunks: bytes):
+        self.content = self
+
+        async def gen():
+            for chunk in chunks:
+                yield chunk
+
+        self.iter_any = gen
+
+
+@pytest.mark.parametrize("parse_tokens", [True, False])
+def test_a_stream_the_server_cut_short_keeps_the_servers_error_as_its_cause(parse_tokens):
+    from bench.client.stream import _read_stream
+
+    token = b'data: {"choices":[{"text":" a"}]}\n\n'
+    error = b'data: {"error": "1 token(s) dropped from a logprob stream"}\n\n'
+    rec = {"token_logprobs": [], "token_ids": [], "status": "ok", "error": ""}
+    times: list[float] = []
+    asyncio.run(_read_stream(StubResponse(token, error), rec, times, 0.0, parse_tokens))
+    assert rec["status"] == "error" and "dropped from a logprob stream" in rec["error"]
+    assert len(times) == 1
+
+
+def test_a_stream_that_just_ends_is_an_error_without_a_named_cause():
+    from bench.client.stream import _read_stream
+
+    rec = {"token_logprobs": [], "token_ids": [], "status": "ok", "error": ""}
+    asyncio.run(_read_stream(StubResponse(b'data: {"choices":[{"text":" a"}]}\n\n'), rec, [],
+                             0.0, True))
+    assert rec["status"] == "error" and rec["error"] == "stream ended without [DONE]"
