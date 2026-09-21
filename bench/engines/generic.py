@@ -4,6 +4,7 @@ needs, and where its stats and prompt-scoring endpoints are."""
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import time
@@ -13,7 +14,7 @@ import urllib.request
 import yaml
 
 from .. import env as bench_env
-from ..config import Config, EngineSpec, expand
+from ..config import BENCH_DIR, Config, EngineSpec, expand
 from ..run import Run
 from .base import CheckFailed, EngineAdapter, Launch, request_body
 from .server_proc import ServerProcess, free_port
@@ -72,6 +73,7 @@ class GenericAdapter(EngineAdapter):
             "max_num_seqs": model["max_num_seqs"], "gpu_mem_util": model["gpu_mem_util"],
             "dtype": model["dtype"],
             "token_budget": launch.token_budget, "run_dir": str(self.run.dir),
+            "bench_dir": str(BENCH_DIR),
         }
 
     def launch(self, launch: Launch, phase: str, env_overrides: dict | None = None) -> None:
@@ -85,6 +87,9 @@ class GenericAdapter(EngineAdapter):
         env = {k: str(rendered) for k, v in
                (self.spec.env | launch.env | (env_overrides or {})).items()
                if (rendered := render(v, values)) is not None}
+        if self.spec.path_prepend:
+            env["PATH"] = ":".join(
+                [*expand(self.spec.path_prepend, values), os.environ.get("PATH", "")])
         self.proc = ServerProcess(self.launch_argv, env, self.run.log_path(self.name, phase),
                                   self.cfg.hardware["cpu_affinity"]["server"],
                                   wait_gpu_free=self.spec.uses_gpu)

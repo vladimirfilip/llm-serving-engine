@@ -7,6 +7,9 @@ request_model: "{served_model_name}"
 # suite needs to compare generated tokens.
 extra_body: {ignore_eos: true, skip_special_tokens: false, return_tokens_as_token_ids: true}
 health_path: /health
+env:
+  # FlashInfer's sampler JIT-compiles kernels, which do not build with this machine's toolchain
+  VLLM_USE_FLASHINFER_SAMPLER: "0"
 stats_api: prometheus
 score_api: vllm
 launch:

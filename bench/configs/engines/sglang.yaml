@@ -5,6 +5,10 @@ accepts_token_ids: true
 request_model: "{served_model_name}"
 extra_body: {ignore_eos: true, skip_special_tokens: false}
 health_path: /health
+path_prepend: ["~/.bench-envs/sglang/lib/python3.12/site-packages/nvidia/cu13/bin"]
+env:
+  # deep_gemm insists on a CUDA home at import; the CUDA 13 tree torch depends on serves
+  CUDA_HOME: ~/.bench-envs/sglang/lib/python3.12/site-packages/nvidia/cu13
 stats_api: prometheus
 score_api: sglang
 launch:
@@ -23,6 +27,10 @@ launch:
   - "--stream-interval=1"
   - "--enable-metrics"
   - "--random-seed=0"
+  # FlashInfer's JIT kernels do not compile with this machine's CUDA toolchain, so the
+  # kernels that need no JIT are used instead
+  - "--attention-backend=triton"
+  - "--sampling-backend=pytorch"
 tuning: {token_budget: [2048, 4096, 8192, 16384], default: 4096}
 metrics:
   path: /metrics

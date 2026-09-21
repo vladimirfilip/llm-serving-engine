@@ -54,6 +54,7 @@ class EngineSpec:
     extra_body: dict = field(default_factory=dict)
     health_path: str = "/health"
     env: dict = field(default_factory=dict)
+    path_prepend: list[str] = field(default_factory=list)  # directories put ahead of PATH
     tuning: dict = field(default_factory=dict)
     metrics: dict | None = None
     stats_api: str = "none"  # "internal" (/internal/stats), "prometheus" or "none"

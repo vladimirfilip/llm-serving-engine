@@ -38,9 +38,19 @@ whose engine failed a MUST check is `partial`, not done.
 2. **Baselines.** `bench/scripts/setup_baselines.sh` creates `~/.bench-envs/{vllm,sglang,trtllm}`
    with `uv` and installs the versions in `bench/baselines.lock` (vllm 0.29.0, sglang 0.5.20,
    tensorrt_llm 1.2.1). Every launch flag in the engine YAMLs was checked against `--help` of the
-   pinned versions. TensorRT-LLM additionally needs the system MPI library
-   (`apt install libopenmpi3`), torch and torchvision at their `+cu130` builds, and `CUDA_HOME` and
-   `LD_LIBRARY_PATH` pointing into the environment's `nvidia/cu13` tree; `trtllm.yaml` sets both.
+   pinned versions, and each engine was launched and queried on this machine (all three return the
+   same greedy completion as ours). What it took on an RTX 5070 (sm_120, driver 580):
+   - **vLLM:** `VLLM_USE_FLASHINFER_SAMPLER=0`; its FlashInfer sampler JIT-compiles kernels,
+     which do not build here.
+   - **SGLang:** `--attention-backend=triton --sampling-backend=pytorch` (FlashInfer's JIT does not
+     build here), `CUDA_HOME` and `PATH` into its `nvidia/cu13` tree, plus the `lib64` and
+     `libcudart.so` links the script creates. It returns no token ids through the OpenAI
+     endpoint, so its token-level correctness metrics are n/a.
+   - **TensorRT-LLM:** system `libopenmpi3`; torch and torchvision `+cu130`; nvcc, nvvm, crt and
+     cccl 13.0 matching that torch; the same two links; and a `sitecustomize` shim
+     (`configs/shims/trtllm`) because its startup probe calls a `pynvml` confidential-compute
+     query that segfaults on this driver. It rejects the OpenAI `logprobs` field and has no stats
+     endpoint, so its token-level correctness metrics and KV/queue plots are n/a.
 3. **Model and data.** `hf download unsloth/Llama-3.2-3B-Instruct --local-dir /models/Llama-3.2-3B-Instruct`,
    then `bench prepare-data`. `--synthetic` builds random datasets for CPU-only runs and stamps
    every report.

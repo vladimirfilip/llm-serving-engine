@@ -7,10 +7,13 @@ extra_body: {ignore_eos: true, skip_special_tokens: false}
 health_path: /health
 stats_api: none
 score_api: none
+path_prepend: ["~/.bench-envs/trtllm/lib/python3.12/site-packages/nvidia/cu13/bin"]
 env:
   # the bindings need the CUDA 13 runtime and a CUDA home; both ship inside torch's dependencies
   CUDA_HOME: ~/.bench-envs/trtllm/lib/python3.12/site-packages/nvidia/cu13
   LD_LIBRARY_PATH: ~/.bench-envs/trtllm/lib/python3.12/site-packages/nvidia/cu13/lib
+  # see the shim: TensorRT-LLM's confidential-compute probe segfaults through pynvml here
+  PYTHONPATH: "{bench_dir}/configs/shims/trtllm"
 launch:
   - "~/.bench-envs/trtllm/bin/trtllm-serve"
   - "serve"
