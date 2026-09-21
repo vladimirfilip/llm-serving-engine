@@ -108,6 +108,10 @@ class FakeModelRunner:
     def free(self, seq_id):
         self.freed.append(seq_id)
 
+    def memory_bytes(self):
+        return {"weights": 10, "kv_cache": 20, "activations": 3, "workspace": 0,
+                "cuda_graph_pool": 4, "other": 1}
+
 
 async def read_stream(q: asyncio.Queue) -> list:
     items = []

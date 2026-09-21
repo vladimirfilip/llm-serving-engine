@@ -13,6 +13,7 @@ class SamplingParams:
     top_p: float = 1.0
     top_k: int = -1  # -1 disables top-k
     max_tokens: int = 256
+    ignore_eos: bool = False  # generate exactly max_tokens, past any stop token
 
     def __post_init__(self) -> None:
         if self.temperature < 0:

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ..observability.nvtx import nvtx_range
 from .paged_batch import PagedBatch, pinned
 
 if TYPE_CHECKING:
@@ -118,8 +119,10 @@ class DecodeGraphRunner:
     def replay(self, plan: BatchPlan, seqs: dict[int, Sequence], bucket: int) -> IterationResults:
         dg = self.graphs[bucket]
         owed = [seqs[entry.seq_id] for entry in plan]
-        self._fill_real(dg, owed)
-        dg.graph.replay()
+        with nvtx_range("prepare_inputs"):
+            self._fill_real(dg, owed)
+        with nvtx_range("forward"):
+            dg.graph.replay()
         return self._runner.emit_tokens(dg.logits, owed)
 
     def _step_core(self, dg: DecodeGraph) -> None:

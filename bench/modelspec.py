@@ -63,7 +63,7 @@ class ModelSpec:
         return self.n_layers * self.kv_bytes_per_tok_layer
 
     def bound_tok_s(self, ctx: float, bw_read_gbs: float) -> float:
-        """Bandwidth-bound decode rate at batch 1: one pass over the weights and the context's KV."""
+        """Bandwidth-bound decode rate at batch 1: a pass over the weights and the context's KV."""
         return bw_read_gbs * 1e9 / (self.weight_bytes_decode + ctx * self.kv_bytes_per_token)
 
     def prefill_flops(self, prompt: int) -> float:

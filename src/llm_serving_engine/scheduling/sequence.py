@@ -30,6 +30,9 @@ class Sequence:
     prefill_progress: int = 0
     # Admissions that went ahead of this sequence while it was the head of `waiting`.
     admission_skips: int = 0
+    # Logprob of each generated token, appended by the GPU worker before the token is
+    # dispatched; None unless the request asked for them.
+    logprobs: list[float] | None = None
 
     @property
     def num_tokens(self) -> int:

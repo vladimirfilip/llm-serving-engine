@@ -20,6 +20,10 @@ def _env_float(name: str, default: float) -> float:
     return float(os.environ.get(name, default))
 
 
+def _env_optional_float(name: str) -> float | None:
+    return float(os.environ[name]) if name in os.environ else None
+
+
 def _env_bool(name: str, default: bool) -> bool:
     return os.environ.get(name, str(default)).lower() in ("1", "true", "yes")
 
@@ -63,6 +67,9 @@ class KVCacheConfig:
     # CUDA graphs and the largest eager iteration hold, so this covers only allocator
     # fragmentation, not activations.
     gpu_memory_utilization: float = 0.95
+    # Ceiling on the share of the device's memory that weights, graphs, activations and the
+    # pool may take together. None sizes the pool from whatever is free.
+    device_memory_fraction: float | None = None
 
     @classmethod
     def from_env(cls) -> "KVCacheConfig":
@@ -75,6 +82,7 @@ class KVCacheConfig:
             gpu_memory_utilization=_env_float(
                 "LLM_GPU_MEM_UTIL", cls.gpu_memory_utilization
             ),
+            device_memory_fraction=_env_optional_float("LLM_DEVICE_MEM_UTIL"),
         )
 
     def bytes_per_token(self) -> int:
@@ -107,6 +115,7 @@ class KVCacheConfig:
                 "LLM_DTYPE_BYTES", dtype_bytes if dtype_bytes is not None else d.dtype_bytes
             ),
             gpu_memory_utilization=_env_float("LLM_GPU_MEM_UTIL", d.gpu_memory_utilization),
+            device_memory_fraction=_env_optional_float("LLM_DEVICE_MEM_UTIL"),
         )
 
 

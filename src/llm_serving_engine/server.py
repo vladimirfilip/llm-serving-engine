@@ -73,6 +73,20 @@ class EngineHandle:
             raise EngineUnavailable("switching models")
         return engine.submit(prompt, sampling_params)
 
+    def submit_tokens(
+        self, prompt_tokens: list[int], sampling_params: SamplingParams, logprobs: bool = False
+    ) -> Submission:
+        engine = self._engine
+        if engine is None:
+            raise EngineUnavailable("switching models")
+        return engine.submit_tokens(prompt_tokens, sampling_params, logprobs)
+
+    @property
+    def engine(self) -> InferenceEngine:
+        if self._engine is None:
+            raise EngineUnavailable("switching models")
+        return self._engine
+
     @property
     def config(self) -> EngineConfig:
         return self._config

@@ -1,0 +1,22 @@
+name: ours
+python: null                      # the harness interpreter: ours runs in the engine's own environment
+accepts_token_ids: true
+request_model: "{served_model_name}"
+extra_body: {ignore_eos: true, skip_special_tokens: false}
+health_path: /health
+stats_api: internal
+score_api: internal
+launch:
+  - "{python}"
+  - "-m"
+  - "bench.engines.ours_server"
+  - "--port={port}"
+  - "--max-model-len={max_model_len}"
+env:
+  LLM_MODEL: "{model_path}"
+  LLM_DTYPE: "{dtype}"
+  LLM_DEVICE: "cuda"
+  LLM_TOKEN_BUDGET: "{token_budget}"
+  LLM_MAX_CONCURRENT_SEQUENCES: "{max_num_seqs}"
+  LLM_DEVICE_MEM_UTIL: "{gpu_mem_util}"
+tuning: {token_budget: [1024, 2048, 4096, 8192], default: 4096}

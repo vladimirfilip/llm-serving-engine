@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ..observability.nvtx import nvtx_range
 from .paged_batch import PagedBatch, pinned
 
 if TYPE_CHECKING:
@@ -117,17 +118,22 @@ class PiecewiseGraphRunner:
 
     def replay(self, plan: BatchPlan, seqs: dict[int, Sequence], bucket: int) -> IterationResults:
         runner, buffers = self._runner, self._buffers
-        token_ids, positions, offsets = runner._flat_rows(plan, seqs)
-        rows = runner._paging_rows(plan, seqs, offsets)
-        pad = bucket - len(token_ids)
-        index_rows = [
-            token_ids + [0] * pad,
-            positions + [0] * pad,
-            rows.dest_block_id + [runner._scratch_block_id] * pad,
-            rows.dest_within + [0] * pad,
-        ]
-        buffers.index_rows[:, :bucket].copy_(pinned(index_rows, torch.int64), non_blocking=True)
-        self._run(bucket, rows.to_device(runner.device), replay=True)
+        with nvtx_range("prepare_inputs"):
+            token_ids, positions, offsets = runner._flat_rows(plan, seqs)
+            rows = runner._paging_rows(plan, seqs, offsets)
+            pad = bucket - len(token_ids)
+            index_rows = [
+                token_ids + [0] * pad,
+                positions + [0] * pad,
+                rows.dest_block_id + [runner._scratch_block_id] * pad,
+                rows.dest_within + [0] * pad,
+            ]
+            buffers.index_rows[:, :bucket].copy_(
+                pinned(index_rows, torch.int64), non_blocking=True
+            )
+            paging = rows.to_device(runner.device)
+        with nvtx_range("forward"):
+            self._run(bucket, paging, replay=True)
         return runner.emit_owed(buffers.hidden, plan, seqs, offsets)
 
     @torch.no_grad()

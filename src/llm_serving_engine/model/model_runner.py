@@ -24,6 +24,7 @@ from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
 from ..config import ModelConfig
 from ..kernels.flash_attention import flash_attention_forward, paged_attention_forward
+from ..observability.nvtx import nvtx_range
 from ..scheduling.batch_plan import BatchEntry, BatchPlan
 from ..scheduling.sequence import Sequence
 from .decode_graph import DecodeGraphRunner
@@ -36,6 +37,8 @@ if TYPE_CHECKING:
 
 # (seq_id, token, finished) for each sequence that owes a token this iteration.
 IterationResults = list[tuple[int, int, bool]]
+# Positions whose logits `score` materialises at once: 512 x vocab in float32.
+SCORE_CHUNK = 512
 # One layer's attention: (normed hidden, rotary (cos, sin), layer_idx) -> attention output.
 Attend = Callable[[torch.Tensor, tuple[torch.Tensor, torch.Tensor], int], torch.Tensor]
 
@@ -70,6 +73,10 @@ class ModelRunner:
         self._decode_graphs = DecodeGraphRunner(self)
         self._piecewise_graphs = PiecewiseGraphRunner(self)
         self._graph_warmup_stream: torch.cuda.Stream | None = None
+        # Measured by `bytes_beyond_kv_pool`: what captured graphs keep reserved, and the
+        # activation peak of the largest eager iteration.
+        self._graph_pool_bytes = 0
+        self._activation_bytes = 0
 
         if config.use_custom_kernels:
             self.check_custom_kernel_support()
@@ -155,8 +162,26 @@ class ModelRunner:
         self._piecewise_graphs.run_eager_dummy(max_tokens)
         torch.cuda.synchronize()
         activations = torch.cuda.max_memory_allocated() - allocated
+        self._graph_pool_bytes, self._activation_bytes = graphs, activations
         self.release_kv_pool()
         return graphs + activations
+
+    def memory_bytes(self) -> dict[str, int]:
+        """Where this process's allocator memory went. `other` is what the caching allocator
+        holds beyond the parts accounted for (fragmentation, cuBLAS workspaces, the context)."""
+        weights = sum(p.numel() * p.element_size() for p in self.model.parameters())
+        pools = [*(self._k_pool or []), *(self._v_pool or [])]
+        kv_cache = sum(t.numel() * t.element_size() for t in pools)
+        reserved = torch.cuda.memory_reserved() if self.device.startswith("cuda") else 0
+        accounted = weights + kv_cache + self._graph_pool_bytes + self._activation_bytes
+        return {
+            "weights": weights,
+            "kv_cache": kv_cache,
+            "activations": self._activation_bytes,
+            "workspace": 0,
+            "cuda_graph_pool": self._graph_pool_bytes,
+            "other": max(0, reserved - accounted),
+        }
 
     def release_kv_pool(self) -> None:
         """Drops the pool and every graph captured against it."""
@@ -201,13 +226,15 @@ class ModelRunner:
 
     @torch.no_grad()
     def forward_fused(self, plan: BatchPlan, seqs: dict[int, Sequence]) -> IterationResults:
-        input_ids, position_ids, offsets = self._flatten_plan(plan, seqs)
-        if self._k_pool is not None:
-            paging = self._paging_rows(plan, seqs, offsets).to_device(self.device)
-            attend = partial(self.paged_attention, paging=paging)
-        else:
-            attend = partial(self.contiguous_attention, plan=plan, seqs=seqs, offsets=offsets)
-        hidden = self.decoder_hidden(input_ids, position_ids, attend)
+        with nvtx_range("prepare_inputs"):
+            input_ids, position_ids, offsets = self._flatten_plan(plan, seqs)
+            if self._k_pool is not None:
+                paging = self._paging_rows(plan, seqs, offsets).to_device(self.device)
+                attend = partial(self.paged_attention, paging=paging)
+            else:
+                attend = partial(self.contiguous_attention, plan=plan, seqs=seqs, offsets=offsets)
+        with nvtx_range("forward"):
+            hidden = self.decoder_hidden(input_ids, position_ids, attend)
         return self.emit_owed(hidden, plan, seqs, offsets)
 
     def decoder_hidden(
@@ -223,20 +250,59 @@ class ModelRunner:
             hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
         return self.model.model.norm(hidden)
 
+    @torch.no_grad()
+    def score(self, token_ids: list[int]) -> list[float]:
+        """Teacher-forced logprob of each token given its prefix: `len(token_ids) - 1` values.
+        One causal pass over the whole sequence through the engine's own layers and Triton
+        attention with no KV cache, projecting to the vocabulary in chunks."""
+        total = len(token_ids)
+        ids = torch.tensor([token_ids], device=self.device)
+        positions = torch.arange(total, device=self.device)[None]
+
+        def attend(normed, position_embeddings, layer_idx):
+            q, k, v = self._project_qkv(normed, position_embeddings, layer_idx)
+            out = flash_attention_forward(q, k, v, is_causal=True)
+            return self._layers[layer_idx].self_attn.o_proj(
+                out.transpose(1, 2).reshape(1, total, self.n_heads * self.head_dim)
+            )
+
+        hidden = self.decoder_hidden(ids, positions, attend)[0]
+        logprobs = []
+        for start in range(0, total - 1, SCORE_CHUNK):
+            rows = hidden[start : min(start + SCORE_CHUNK, total - 1)]
+            logits = self.model.get_output_embeddings()(rows).float()
+            targets = ids[0, start + 1 : start + 1 + len(rows)].unsqueeze(-1)
+            logprobs.append(logits.gather(-1, targets).squeeze(-1) - logits.logsumexp(-1))
+        return torch.cat(logprobs).tolist()
+
     def emit_tokens(self, logits: torch.Tensor, owed: list[Sequence]) -> IterationResults:
         """Samples row i of `logits` for owed[i], with one host sync for the whole batch.
-        Rows past len(owed) are a graph bucket's padding."""
-        params = [seq.sampling_params for seq in owed]
-        tokens = sample_tokens(logits[: len(owed)], params).tolist()
+        Rows past len(owed) are a graph bucket's padding. A sequence that asked for logprobs
+        gets its chosen token's logprob appended before the token is returned."""
+        with nvtx_range("sample"):
+            params = [seq.sampling_params for seq in owed]
+            sampled = sample_tokens(logits[: len(owed)], params)
+            self._record_logprobs(logits, sampled, owed)
+            tokens = sampled.tolist()
         return [
             (
                 seq.seq_id,
                 token,
-                token in self.eos_token_ids
+                (token in self.eos_token_ids and not seq.sampling_params.ignore_eos)
                 or len(seq.generated_tokens) + 1 >= seq.sampling_params.max_tokens,
             )
             for seq, token in zip(owed, tokens, strict=True)
         ]
+
+    @staticmethod
+    def _record_logprobs(logits: torch.Tensor, sampled: torch.Tensor, owed: list[Sequence]) -> None:
+        wanted = [i for i, seq in enumerate(owed) if seq.logprobs is not None]
+        if not wanted:
+            return
+        rows = logits[wanted].float()
+        chosen = rows.gather(-1, sampled[wanted].unsqueeze(-1)).squeeze(-1) - rows.logsumexp(-1)
+        for i, logprob in zip(wanted, chosen.tolist(), strict=True):
+            owed[i].logprobs.append(logprob)
 
     def _flat_rows(
         self, plan: BatchPlan, seqs: dict[int, Sequence]
@@ -304,7 +370,8 @@ class ModelRunner:
         if not owed:
             return []
         last_rows = torch.tensor([row for _seq, row in owed], device=self.device)
-        logits = self.model.get_output_embeddings()(hidden[0, last_rows])
+        with nvtx_range("forward"):
+            logits = self.model.get_output_embeddings()(hidden[0, last_rows])
         return self.emit_tokens(logits, [seq for seq, _row in owed])
 
     def _project_qkv(

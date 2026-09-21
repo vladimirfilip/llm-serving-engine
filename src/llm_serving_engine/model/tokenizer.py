@@ -29,10 +29,12 @@ class TokenizerWrapper:
             return_dict=False,
         )
 
-    def decode(self, token_ids: list[int]) -> str:
-        return self._tokenizer.decode(token_ids, skip_special_tokens=True)
+    def decode(self, token_ids: list[int], skip_special_tokens: bool = True) -> str:
+        return self._tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
 
-    def decode_incremental(self, seq_id: int, generated_tokens: list[int]) -> str:
+    def decode_incremental(
+        self, seq_id: int, generated_tokens: list[int], skip_special_tokens: bool = True
+    ) -> str:
         """Text completed since the last call for this seq_id.
 
         Decodes only a window: tokens[prefix_offset:read_offset] were already emitted and
@@ -40,8 +42,8 @@ class TokenizerWrapper:
         in an incomplete character is held back until the tokens that complete it arrive.
         """
         prefix_offset, read_offset = self._decode_windows.get(seq_id, (0, 0))
-        prefix_text = self.decode(generated_tokens[prefix_offset:read_offset])
-        text = self.decode(generated_tokens[prefix_offset:])
+        prefix_text = self.decode(generated_tokens[prefix_offset:read_offset], skip_special_tokens)
+        text = self.decode(generated_tokens[prefix_offset:], skip_special_tokens)
         if len(text) <= len(prefix_text) or text.endswith(_INCOMPLETE_CHAR):
             return ""
         self._decode_windows[seq_id] = (read_offset, len(generated_tokens))

@@ -60,6 +60,8 @@ def test_prepare_data_writes_every_dataset_file_and_the_bos_id(tmp_path, fake_hu
     assert len(pool) == 100 and all(r["prompt_token_ids"][0] == 9 for r in pool)
     train = np.load(tmp_path / "wikitext2_train_ids.npy")
     assert train.dtype == np.int32 and 9 not in train.tolist()  # no BOS in the raw WikiText ids
+    test = np.load(tmp_path / "wikitext2_test_ids.npy")
+    assert test.dtype == np.int32 and 0 < len(test) < len(train)
     prompts = [json.loads(line) for line in
                (tmp_path / "correctness_prompts.jsonl").read_text().splitlines()]
     assert len(prompts) == 22 and [p["kind"] for p in prompts].count("long") == 2

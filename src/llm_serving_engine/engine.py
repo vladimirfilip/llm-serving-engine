@@ -27,6 +27,7 @@ from .model.sampling import SamplingParams
 from .model.tokenizer import TokenizerWrapper
 from .observability.metrics import RequestMetrics
 from .observability.metrics_export import PREEMPTIONS_TOTAL, REQUESTS_IN_FLIGHT, record_request
+from .observability.nvtx import nvtx_range
 from .scheduling.allocator import BlockAllocator, ContiguousAllocator, KVAllocator
 from .scheduling.batch_plan import BatchPlan
 from .scheduling.dispatch import new_output_channel
@@ -57,6 +58,7 @@ class IngressRequest:
     prompt_tokens: list[int]
     sampling_params: SamplingParams
     arrival_time: float
+    logprobs: list[float] | None = None
 
 
 @dataclass(slots=True)
@@ -65,6 +67,7 @@ class Submission:
     output_queue: asyncio.Queue
     prompt_len: int
     tokenizer: TokenizerWrapper  # the tokenizer that encoded the prompt decodes its tokens
+    logprobs: list[float] | None = None  # grows one entry per token before that token is queued
 
 
 class InferenceEngine:
@@ -122,6 +125,7 @@ class InferenceEngine:
         # Each written by one thread only; the engine is idle when they are equal.
         self._submitted = 0
         self._ended = 0
+        self._preemptions = 0
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Called once from the IO thread at startup; every token callback targets `loop`."""
@@ -131,7 +135,12 @@ class InferenceEngine:
         """IO thread: tokenize, open the output channel, hand off to the scheduler thread.
         The caller streams from `output_queue` until DONE or ABORTED, and pops its
         `output_channels` entry when it stops reading."""
-        prompt_tokens = self.tokenizer.encode_prompt(prompt)
+        return self.submit_tokens(self.tokenizer.encode_prompt(prompt), sampling_params)
+
+    def submit_tokens(
+        self, prompt_tokens: list[int], sampling_params: SamplingParams, logprobs: bool = False
+    ) -> Submission:
+        """`submit` for a caller that has already tokenized, chat template and BOS included."""
         # An out-of-vocabulary id faults the embedding lookup on the device, which takes the
         # whole engine down with it.
         if not prompt_tokens or max(prompt_tokens) >= self.model_runner.vocab_size:
@@ -139,15 +148,20 @@ class InferenceEngine:
                 f"prompt encodes to no tokens or to ids outside the model's "
                 f"{self.model_runner.vocab_size}-token vocabulary"
             )
+        token_logprobs = [] if logprobs else None
         with self._ingress_lock:
             if not self._accepting:
                 raise EngineUnavailable("engine is not accepting requests")
             seq_id, output_queue = new_output_channel(self.config.server.output_queue_maxsize)
             self._submitted += 1
             self.ingress.put(
-                IngressRequest(seq_id, prompt_tokens, sampling_params, time.monotonic())
+                IngressRequest(
+                    seq_id, prompt_tokens, sampling_params, time.monotonic(), token_logprobs
+                )
             )
-        return Submission(seq_id, output_queue, len(prompt_tokens), self.tokenizer)
+        return Submission(
+            seq_id, output_queue, len(prompt_tokens), self.tokenizer, token_logprobs
+        )
 
     def close_ingress(self) -> None:
         with self._ingress_lock:
@@ -157,6 +171,29 @@ class InferenceEngine:
     def is_idle(self) -> bool:
         """Every submitted request has ended."""
         return self._ended == self._submitted
+
+    def stats(self) -> dict:
+        """Cheap snapshot for a 20 Hz poller: scheduler occupancy, KV blocks and where device
+        memory went. Read from another thread, so counts may lag a step."""
+        running, waiting = list(self.running), len(self.waiting)
+        allocator = self.allocator
+        block_size = self.config.kv_cache.block_size
+        blocks_total = getattr(allocator, "num_blocks", None) or (
+            allocator.capacity_tokens // block_size
+        )
+        blocks_used = round(allocator.utilization * blocks_total)
+        return {
+            "running": len(running),
+            "waiting": waiting,
+            "preemptions_total": self._preemptions,
+            "kv": {
+                "block_size": block_size,
+                "blocks_total": blocks_total,
+                "blocks_used": blocks_used,
+                "tokens_used": sum(seq.block_table.num_tokens for seq in running),
+            },
+            "memory_bytes": self.model_runner.memory_bytes(),
+        }
 
     @property
     def healthy(self) -> bool:
@@ -197,26 +234,31 @@ class InferenceEngine:
         previous iteration produced, which exists only once its results are applied."""
         in_flight: tuple[BatchPlan, dict[int, Sequence]] | None = None
         while not self._stop.is_set():
-            if in_flight is not None:
-                self._apply(self._results_queue.get(), *in_flight)
-                in_flight = None
-            self._drain_ingress()
+            with nvtx_range("step"):
+                if in_flight is not None:
+                    outcome = self._results_queue.get()
+                    with nvtx_range("postprocess"):
+                        self._apply(outcome, *in_flight)
+                    in_flight = None
+                self._drain_ingress()
 
-            plan = self.scheduler.scheduler_step(self.running, self.waiting, self.allocator)
-            for seq_id in plan.preempted:
-                self.model_runner.free(seq_id)
-            PREEMPTIONS_TOTAL.inc(len(plan.preempted))
-            if plan.rejected:
-                self._abort(plan.rejected)
-            REQUESTS_IN_FLIGHT.set(len(self.running))
+                with nvtx_range("schedule"):
+                    plan = self.scheduler.scheduler_step(self.running, self.waiting, self.allocator)
+                    for seq_id in plan.preempted:
+                        self.model_runner.free(seq_id)
+                    PREEMPTIONS_TOTAL.inc(len(plan.preempted))
+                    self._preemptions += len(plan.preempted)
+                    if plan.rejected:
+                        self._abort(plan.rejected)
+                    REQUESTS_IN_FLIGHT.set(len(self.running))
 
-            if len(plan):
-                in_flight = (plan, {seq.seq_id: seq for seq in self.running})
-                self._plan_queue.put(in_flight)
-            else:
-                # Nothing runnable until a request arrives: an empty plan leaves nothing
-                # running, so no block or budget can come free on its own.
-                self._admit_ingress(self.ingress.get())
+                if len(plan):
+                    in_flight = (plan, {seq.seq_id: seq for seq in self.running})
+                    self._plan_queue.put(in_flight)
+                else:
+                    # Nothing runnable until a request arrives: an empty plan leaves nothing
+                    # running, so no block or budget can come free on its own.
+                    self._admit_ingress(self.ingress.get())
 
     def _apply(
         self, outcome: IterationResults | Exception, plan: BatchPlan, seqs: dict[int, Sequence]
@@ -285,7 +327,8 @@ def _build_allocator(
     activations, plus a paged run's CUDA graphs. A contiguous run allocates each sequence's
     buffer from the resulting capacity at admission."""
     block_size = config.kv_cache.block_size
-    num_blocks = config.kv_cache.num_blocks(_free_memory_bytes(model_runner) - reserved_bytes)
+    free = _capped_free_bytes(model_runner, config.kv_cache.device_memory_fraction)
+    num_blocks = config.kv_cache.num_blocks(free - reserved_bytes)
     if config.kv_allocator == "contiguous":
         return ContiguousAllocator(capacity_tokens=num_blocks * block_size)
     return BlockAllocator(num_blocks=num_blocks, block_size=block_size)
@@ -298,6 +341,16 @@ def _free_memory_bytes(model_runner: ModelRunner) -> int:
     return 2 * 1024**3
 
 
+def _capped_free_bytes(model_runner: ModelRunner, device_fraction: float | None) -> int:
+    """Free VRAM, held to what keeps everything on the device within `device_fraction` of its
+    total: the cap leaves `total * fraction - already_used` for what this engine adds."""
+    free = _free_memory_bytes(model_runner)
+    if device_fraction is None or not model_runner.device.startswith("cuda"):
+        return free
+    total = torch.cuda.mem_get_info()[1]
+    return min(free, int(total * device_fraction) - (total - free))
+
+
 def sequence_from_ingress(req: IngressRequest) -> Sequence:
     """A WAITING Sequence. admit_time stays unset until the scheduler admits it, so
     schedule_latency covers the time spent in `waiting`."""
@@ -306,4 +359,5 @@ def sequence_from_ingress(req: IngressRequest) -> Sequence:
         prompt_tokens=req.prompt_tokens,
         sampling_params=req.sampling_params,
         metrics=RequestMetrics(enqueue_time=req.arrival_time),
+        logprobs=req.logprobs,
     )
