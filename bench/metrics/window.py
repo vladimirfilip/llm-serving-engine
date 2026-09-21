@@ -1,4 +1,5 @@
-"""One load point reduced to the metrics of section 8.3, over its measurement window."""
+"""One load point reduced to its throughput, latency, goodput and energy metrics over its
+measurement window."""
 
 from __future__ import annotations
 

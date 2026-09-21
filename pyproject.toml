@@ -51,9 +51,9 @@ markers = [
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "B", "I", "RUF"]
+select = ["E4", "E501", "E7", "E9", "F", "B", "I", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
 # E741 flags `O` as ambiguous. Q, K, V, O, L, m, l is the notation of the FlashAttention
 # paper, and matching it makes the kernel checkable against the algorithm it implements.
-"src/llm_serving_engine/kernels/flash_attention.py" = ["E741"]
+"src/llm_serving_engine/kernels/flash_attention.py" = ["E501", "E741"]

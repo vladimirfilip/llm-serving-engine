@@ -1,0 +1,18 @@
+name: mock
+python: null
+accepts_token_ids: true
+uses_gpu: false
+has_tokenizer: false
+real_model: false
+request_model: "{served_model_name}"
+extra_body: {ignore_eos: true, skip_special_tokens: false}
+health_path: /health
+stats_api: internal
+score_api: internal
+launch:
+  - "{python}"
+  - "-m"
+  - "bench.engines.mock_server"
+  - "--port={port}"
+  - "--max-num-seqs={max_num_seqs}"
+tuning: {}

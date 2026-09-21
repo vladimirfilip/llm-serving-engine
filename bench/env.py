@@ -22,6 +22,7 @@ import pandas as pd
 import psutil
 
 from .config import Config
+from .gpu_tasks import run_task
 from .modelspec import ModelSpec
 from .run import git_info
 
@@ -69,7 +70,8 @@ def format_package_table(versions: dict[str, str | None]) -> str:
     rows = [f"{'package':<20}{'status':<10}{'version':<16}needed for / if missing"]
     for name, needed, missing in PACKAGES:
         v = versions[name]
-        rows.append(f"{name:<20}{'present' if v else 'MISSING':<10}{v or '-':<16}{needed} / {missing}")
+        state = "present" if v else "MISSING"
+        rows.append(f"{name:<20}{state:<10}{v or '-':<16}{needed} / {missing}")
     return "\n".join(rows)
 
 
@@ -138,7 +140,7 @@ def lock_clocks(hw: dict) -> ClockLock:
         result = nvidia_smi("-i", gpu, *command)
         if result.returncode != 0:
             return ClockLock(False, (result.stdout + result.stderr).strip())
-    return verify_clock_lock(hw)
+    return ClockLock(**run_task("verify-clock", hw=hw))
 
 
 def verify_clock_lock(hw: dict) -> ClockLock:
@@ -156,7 +158,8 @@ def verify_clock_lock(hw: dict) -> ClockLock:
         torch.cuda.synchronize()
         clocks.append(nvml.nvmlDeviceGetClockInfo(handle, nvml.NVML_CLOCK_SM))
     target, observed = hw["gpu_clock_mhz"], int(np.median(clocks))
-    if abs(observed - target) > CLOCK_TOLERANCE * target or max(clocks) - min(clocks) > 0.01 * target:
+    off_target = abs(observed - target) > CLOCK_TOLERANCE * target
+    if off_target or max(clocks) - min(clocks) > 0.01 * target:
         return ClockLock(False, f"SM clock reads {min(clocks)}-{max(clocks)} MHz under load, "
                                 f"locked to {target}", observed)
     return ClockLock(True, "", observed)
@@ -280,6 +283,11 @@ class GpuMonitor:
         return int(max(used)) if len(used) else None
 
 
+def measure_bandwidth() -> dict[str, float]:
+    """`bandwidth_probe` in a child process, so this one never holds a CUDA context."""
+    return run_task("bwprobe")
+
+
 def bandwidth_probe(alloc_gib: int = 4, warmup: int = 10, timed: int = 50) -> dict[str, float]:
     """Best-of read bandwidth from a bf16 reduction and copy bandwidth from a device-to-device
     copy (bytes read plus bytes written), in GB/s. Run with clocks locked and no engine up."""
@@ -362,5 +370,6 @@ def capture_env(cfg: Config, clock_lock: ClockLock, probe: dict | None) -> dict:
             hw["peak_tflops_bf16_dense"] * clock_lock.observed_mhz / hw["boost_clock_mhz"]
         )
     if probe:
-        env |= probe | {"bw_read_pct_of_datasheet": 100 * probe["bw_read_gbs"] / hw["peak_mem_bw_gbs"]}
+        pct = 100 * probe["bw_read_gbs"] / hw["peak_mem_bw_gbs"]
+        env |= probe | {"bw_read_pct_of_datasheet": pct}
     return env

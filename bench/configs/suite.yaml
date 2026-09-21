@@ -114,6 +114,15 @@ correctness:
     ppl_vs_ref_max_ratio: 1.005
     gsm8k_flexible_vs_vllm_min_delta_points: -2.0
 
+# Null-server check of the client: streams of tokens 10 ms apart from a server whose own timing is
+# negligible. This engine streams at most max_num_seqs = 64 at once, and on this 9-vCPU KVM guest a
+# raw-socket client (no HTTP library, no parsing) already sees 1.2 ms jitter p99 at 64 streams and
+# 5.5 ms at 256, so the limits are set to what the host can deliver to any client.
+client_check:
+  streams: 64
+  send_lag_p99_ms: 5
+  jitter_p99_ms: 3
+
 soak_pass:
   gpu_mem_growth_max_frac: 0.01
   throughput_drift_max_frac: 0.03

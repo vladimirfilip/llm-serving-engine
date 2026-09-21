@@ -86,6 +86,12 @@ class Run:
         self._status[phase] = {"state": state, "note": note}
         self.status_path.write_text(json.dumps(self._status, indent=2))
 
+    def aborted(self, phase: str) -> list[str]:
+        """Engines whose part of `phase` a failed MUST check aborted."""
+        prefix = f"{phase}:"
+        return [key.removeprefix(prefix) for key, v in self._status.items()
+                if key.startswith(prefix) and v["state"] == "aborted"]
+
     def log_path(self, engine: str, phase: str) -> Path:
         return self.dir / "logs" / f"{engine}_{phase}.log"
 

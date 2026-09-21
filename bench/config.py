@@ -47,6 +47,8 @@ class EngineSpec:
     launch: list[str]
     accepts_token_ids: bool = True
     uses_gpu: bool = True
+    has_tokenizer: bool = True
+    real_model: bool = True  # False for a fake engine, which has no reference to be judged against
     request_model: str = "{served_model_name}"
     extra_body: dict = field(default_factory=dict)
     health_path: str = "/health"
@@ -55,11 +57,17 @@ class EngineSpec:
     metrics: dict | None = None
     stats_api: str = "none"  # "internal" (/internal/stats), "prometheus" or "none"
     score_api: str = "none"  # "internal", "vllm", "sglang" or "none"
+    variants: dict = field(default_factory=dict)  # name -> {args_add, env} launch differences
     files: dict = field(default_factory=dict)
 
     @property
     def token_budgets(self) -> list[int | None]:
         return self.tuning.get("token_budget") or [None]
+
+    @property
+    def default_token_budget(self) -> int | None:
+        """The budget for a run that skipped `bench tune`."""
+        return self.tuning.get("default", self.token_budgets[0])
 
 
 def load_config(config_dir: Path = CONFIG_DIR, quick: bool = False) -> Config:

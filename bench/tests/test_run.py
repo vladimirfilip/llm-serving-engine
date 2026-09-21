@@ -33,3 +33,12 @@ def test_status_survives_reopening(tmp_path):
     reopened = Run.open(cfg, "r1", results_dir=tmp_path)
     assert json.loads(reopened.status_path.read_text())["kernels"] == {
         "state": "failed", "note": "no GPU"}
+
+
+def test_aborted_engines_are_listed_per_phase(tmp_path):
+    run = Run.open(load_config(), "r1", results_dir=tmp_path)
+    run.set_status("sweep:vllm", "aborted", "no_bursts")
+    run.set_status("sweep:ours", "done")
+    run.set_status("probe:sglang", "aborted", "gpu")
+    assert run.aborted("sweep") == ["vllm"] and run.aborted("probe") == ["sglang"]
+    assert run.aborted("tune") == []
