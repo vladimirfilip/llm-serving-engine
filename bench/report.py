@@ -49,9 +49,17 @@ def md_table(frame: pd.DataFrame, formats: dict[str, str] | None = None) -> str:
     return head + "\n".join(rows) + "\n"
 
 
+def read_table(path: Path) -> pd.DataFrame | None:
+    """A results table, or None when it has no columns (a suite wrote an empty frame)."""
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return None
+
+
 def load_tables(run_dir: Path) -> dict[str, pd.DataFrame]:
-    tables = run_dir / "tables"
-    return {p.stem: pd.read_csv(p) for p in tables.glob("*.csv") if p.stat().st_size}
+    tables = {p.stem: read_table(p) for p in (run_dir / "tables").glob("*.csv")}
+    return {name: frame for name, frame in tables.items() if frame is not None}
 
 
 def banners(env: dict, status: dict, checks: dict, summary: dict, tables: dict) -> list[str]:

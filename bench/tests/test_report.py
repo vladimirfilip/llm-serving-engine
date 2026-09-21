@@ -177,5 +177,16 @@ def test_a_run_whose_every_profile_was_empty_still_builds_a_report(tmp_path):
                    "gap_p99": None, "gap_time_fraction_over_50us": None,
                    "window_source": "no device events in the capture"}]
                  ).to_csv(run / "tables" / "nsys.csv", index=False)
+    (run / "tables" / "nsys_steps.csv").write_text(pd.DataFrame([]).to_csv(index=False))
     _, info = build_report(run)
-    assert info["drawn"]["p17"] is None
+    assert info["drawn"]["p17"] is None and info["drawn"]["p18"] is None
+
+
+def test_a_table_a_suite_left_with_no_columns_does_not_stop_the_report(tmp_path):
+    import pandas as pd
+
+    run = fixture_run.write(tmp_path / "r", {"probe", "sweep", "scheduler"})
+    for name in ("scheduler_interference", "scheduler_overload", "soak", "kernels_decode"):
+        (run / "tables" / f"{name}.csv").write_text(pd.DataFrame([]).to_csv(index=False))
+    _, info = build_report(run)
+    assert info["drawn"]["p01"] and info["drawn"]["p22"] is not None

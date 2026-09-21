@@ -181,4 +181,5 @@ def execute(run: Run, engines: list[str]) -> None:
     tables = run.dir / "tables"
     pd.DataFrame(summary).to_csv(tables / "nsys.csv", index=False)
     pd.concat(gaps).to_parquet(folder / "gaps.parquet")
-    pd.concat(steps).to_csv(tables / "nsys_steps.csv", index=False)
+    if any(len(frame) for frame in steps):
+        pd.concat(steps).to_csv(tables / "nsys_steps.csv", index=False)

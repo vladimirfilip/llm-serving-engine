@@ -48,7 +48,10 @@ class PlotContext:
         """`tables/<name>.csv`, or None when that suite did not produce it."""
         if name not in self._cache:
             path = self.run_dir / "tables" / f"{name}.csv"
-            frame = pd.read_csv(path) if path.exists() and path.stat().st_size else None
+            try:
+                frame = pd.read_csv(path) if path.exists() else None
+            except pd.errors.EmptyDataError:  # a suite wrote an empty frame: no columns at all
+                frame = None
             self._cache[name] = frame if frame is not None and len(frame) else None
         return self._cache[name]
 
