@@ -1,0 +1,20 @@
+# Cumulative steps: each step keeps the arguments and environment of every step before it.
+# Ours selects each optimization with an environment variable. Paged KV runs only on the fused
+# kernels, and graphs replay only against a paged pool, so the order differs from the usual
+# batching-first story: fused kernels come before paged KV.
+steps:
+  - name: naive_baseline
+    args_add: []
+    env:
+      LLM_SCHEDULER: static
+      LLM_KV_ALLOCATOR: contiguous
+      LLM_USE_CUSTOM_KERNELS: "false"
+      LLM_USE_CUDA_GRAPHS: "false"
+  - name: +continuous_batching
+    env: {LLM_SCHEDULER: continuous}
+  - name: +fused_kernels
+    env: {LLM_USE_CUSTOM_KERNELS: "true"}
+  - name: +paged_kv
+    env: {LLM_KV_ALLOCATOR: paged}
+  - name: +cuda_graphs
+    env: {LLM_USE_CUDA_GRAPHS: "true"}
