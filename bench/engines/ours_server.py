@@ -1,6 +1,6 @@
 """An OpenAI-style `/v1/completions` server around the engine, so the harness drives ours the
 way it drives every baseline. Kept thin: this wrapper is part of what gets measured.
-`python -m bench.engines.ours_server --model DIR --port N --max-model-len L`."""
+`python -m bench.engines.ours_server --port N --max-model-len L`, the model from `LLM_MODEL`."""
 
 from __future__ import annotations
 
@@ -66,6 +66,11 @@ async def stream_tokens(
             logprobs = submission.logprobs
             logprob = logprobs[len(generated) - 1] if logprobs is not None else None
             yield token_event(text, item, logprob)
+        if submission.logprobs is not None and len(submission.logprobs) != len(generated):
+            # the bounded channel dropped tokens, so positional logprobs would be misaligned
+            yield event({"error": f"{len(submission.logprobs) - len(generated)} token(s) "
+                                  f"dropped from a logprob stream"})
+            return
         if include_usage:
             yield event({"choices": [], "usage": usage_of(submission, len(generated))})
         yield b"data: [DONE]\n\n"

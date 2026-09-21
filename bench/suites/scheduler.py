@@ -43,16 +43,20 @@ def label_gaps(background: list[dict], injected: list[tuple[float, float]]) -> p
     return pd.DataFrame(rows, columns=["stream", "t", "itl", "label"])
 
 
-def windowed_tpot(background: list[dict], window_s: float) -> pd.DataFrame:
-    """Where gaps are not one per token, per-stream TPOT over fixed windows stands in for ITL."""
+def windowed_tpot(background: list[dict], window_s: float,
+                  injected: list[tuple[float, float]]) -> pd.DataFrame:
+    """Where gaps are not one per token, per-stream TPOT over fixed windows stands in for ITL,
+    labelled by the same overlap rule as gaps."""
     rows = []
     for stream, rec in enumerate(background):
         times = np.asarray(rec["token_times"])
         for start in np.arange(0.0, times.max() if len(times) else 0.0, window_s):
             inside = times[(times >= start) & (times < start + window_s)]
             if len(inside) > 1:
+                overlapping = during_prefill(start, start + window_s, injected)
                 rows.append({"stream": stream, "t": start + window_s,
-                             "itl": (inside[-1] - inside[0]) / (len(inside) - 1), "label": None})
+                             "itl": (inside[-1] - inside[0]) / (len(inside) - 1),
+                             "label": "during_prefill" if overlapping else "baseline"})
     return pd.DataFrame(rows, columns=["stream", "t", "itl", "label"])
 
 
@@ -127,23 +131,27 @@ def run_interference(session: Session, data, variant: str, folder) -> list[dict]
     background, injected = asyncio.run(interference_run(session.target(), source, cfg, t0))
     windows = [(r["t_send"], r["t_first"]) for r in injected if r["status"] == "ok"]
     gaps = (label_gaps(background, windows) if session.adapter.itl_valid
-            else windowed_tpot(background, TPOT_WINDOW_S))
+            else windowed_tpot(background, TPOT_WINDOW_S, windows))
     gaps.assign(variant=variant).to_parquet(folder / f"interference_{variant}.parquet")
     return summarize_interference(gaps, injected)
 
 
 def overload_metrics(records: list[dict], starvation_ttft_s: float) -> dict:
+    """A request that never got a first token counts as starved, the worst case there is."""
     df = pd.DataFrame(records)
     ok = df[df.status == "ok"]
     ttft = (ok.t_first - ok.t_send).to_numpy()
+    waited = df.t_first - df.t_send
+    starved = (waited > starvation_ttft_s) | (waited.isna() & (df.status != "ok"))
     rho = spearmanr(ok.prompt_len, ttft).statistic if len(ok) > 2 else float("nan")
     p50, p99 = percentile(ttft, 50), percentile(ttft, 99)
     return {"n": len(df), "ttft_p50": p50, "ttft_p99": p99,
             "ttft_max": float(ttft.max()) if len(ttft) else float("nan"),
             "ttft_p99_over_p50": p99 / p50 if p50 else float("nan"),
             "timeout_rate": float((df.status == "timeout").mean()),
-            "starved_fraction": float((ttft > starvation_ttft_s).sum() / len(df)),
-            "spearman_prompt_len_ttft": float(rho)}
+            "starved_fraction": float(starved.mean()),
+            "spearman_prompt_len_ttft": float(rho),
+            "send_lag_p99": percentile(df.t_send - df.t_sched, 99)}
 
 
 def run_overload(session: Session, data, ref_rps: float, folder) -> dict:
@@ -155,8 +163,8 @@ def run_overload(session: Session, data, ref_rps: float, folder) -> dict:
     reqs = make_requests(cfg.workloads["sharegpt"], cfg.workload_index("sharegpt"), n, seed, 3,
                          data)
     t_sched = poisson_schedule(rate, n, seed, STREAM, 1, 0)
-    records, _ = run_open_loop(session.target(timeout_s=cfg.suite["load_sweep"]["timeout_s"]),
-                               reqs, t_sched.tolist(), session.client_procs, session.client_cpus)
+    records, _ = run_open_loop(session.target(timeout_s=over["timeout_s"]), reqs,
+                               t_sched.tolist(), session.client_procs, session.client_cpus)
     pd.DataFrame(records).drop(columns=["token_times", "token_ids", "token_logprobs"]).to_parquet(
         folder / "overload.parquet")
     return overload_metrics(records, over["starvation_ttft_s"])

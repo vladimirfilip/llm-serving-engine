@@ -115,6 +115,13 @@ def test_special_tokens_get_text_only_when_the_request_asks_for_them():
     assert [json.loads(line)["choices"][0]["text"] for line in kept[:3]] == ["b", "<eot>", "d"]
 
 
+def test_a_logprob_stream_that_lost_a_token_ends_in_an_error_not_shifted_logprobs():
+    handle = FakeHandle(items=(1, 2, DONE), logprobs=[-0.5, -1.5, -2.5])  # 3 logprobs, 2 tokens
+    lines = events(post(handle, logprobs=1))
+    assert json.loads(lines[-1]) == {"error": "1 token(s) dropped from a logprob stream"}
+    assert "[DONE]" not in lines
+
+
 def test_an_aborted_request_ends_with_an_error_event_and_no_done():
     lines = events(post(FakeHandle(items=(1, ABORTED))))
     assert json.loads(lines[-1]) == {"error": "request aborted by the engine"}

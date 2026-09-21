@@ -44,6 +44,13 @@ def test_generation_is_greedy_and_records_the_logprob_of_each_chosen_token(tiny_
         ids = torch.cat([ids, torch.tensor([[token]])], dim=1)
 
 
+def test_long_prompts_are_generated_alone_by_kind_not_by_length(tiny_model):
+    model = model_of(tiny_model)
+    short, long = prompt(20, 8), prompt(21, 9) | {"kind": "long"}
+    records = {r["id"]: r for r in reference.generate(model, [short, long], 6, 3, pad_id=0)}
+    assert len(records["p20"]["token_ids"]) == 6 and len(records["p21"]["token_ids"]) == 3
+
+
 def test_batched_generation_matches_generating_each_prompt_alone(tiny_model):
     model = model_of(tiny_model)
     prompts = [prompt(1, 6), prompt(2, 11), prompt(3, 9)]
@@ -106,6 +113,8 @@ def test_tasks_cache_generations_by_prompt_and_regenerate_a_changed_prompt(tiny_
     assert reference.task_generate(prompts=prompts, **args) == {"generated": 0, "cached": 2}
     changed = [prompts[0], prompt(9, 9) | {"id": "p8"}]
     assert reference.task_generate(prompts=changed, **args) == {"generated": 1, "cached": 1}
+    longer = args | {"new_tokens": 5}
+    assert reference.task_generate(prompts=changed, **longer) == {"generated": 2, "cached": 0}
     assert {r["id"] for r in reference.read_jsonl(out)} == {"p7", "p8"}
 
 

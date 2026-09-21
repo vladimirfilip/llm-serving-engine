@@ -24,8 +24,7 @@ def test_busy_fraction_and_gap_statistics_follow_the_merged_union():
     assert out["gpu_busy_fraction"] == pytest.approx((1000 + 990 + 900) / 3000)
     assert sorted(out["gaps_s"] * 1e9) == pytest.approx([10, 100])
     assert out["gap_p50"] == pytest.approx(55e-9)
-    long_gaps = [100e-9 * 1e9 for _ in [0] if 100e-9 > nsys.GAP_LONG_S]
-    assert out["gap_time_fraction_over_50us"] == 0 and long_gaps == []
+    assert out["gap_time_fraction_over_50us"] == 0
 
 
 def test_only_gaps_longer_than_fifty_microseconds_count_toward_the_idle_fraction():
@@ -79,13 +78,35 @@ def test_step_breakdown_reports_each_ranges_time_and_gpu_idle_inside_the_period(
 
 def test_analyse_summarises_a_capture_and_breaks_down_only_ours_steps(tmp_path):
     make_db(tmp_path / "ours.sqlite", RANGES, KERNELS)
-    row, gaps, steps = nsys.analyse(tmp_path / "ours.sqlite", "ours", 16)
+    row, gaps, steps = nsys.analyse(tmp_path / "ours.sqlite", "ours", 16, capture_s=0.020)
     assert row["engine"] == "ours" and row["batch"] == 16
-    assert row["gpu_busy_fraction"] == pytest.approx(11 / 15)  # 11 ms busy in the 3-18 ms span
+    # 11 ms busy in a 20 ms capture that starts with the first kernel at 3 ms
+    assert row["gpu_busy_fraction"] == pytest.approx(11 / 20)
+    assert row["window_source"] == "capture_s from the first device event"
     assert len(gaps) == 1 and gaps.gap_s.iloc[0] == pytest.approx(0.004)
     assert isinstance(steps, pd.DataFrame) and len(steps) == 2 and (steps.batch == 16).all()
-    _, _, others = nsys.analyse(tmp_path / "ours.sqlite", "vllm", 16)
+    _, _, others = nsys.analyse(tmp_path / "ours.sqlite", "vllm", 16, capture_s=0.020)
     assert others.empty
+
+
+def test_the_capture_window_comes_from_nsight_when_the_export_records_it(tmp_path):
+    db = make_db(tmp_path / "x.sqlite", RANGES, KERNELS)
+    db.execute("CREATE TABLE ANALYSIS_DETAILS (startTime INTEGER, stopTime INTEGER)")
+    db.execute("INSERT INTO ANALYSIS_DETAILS VALUES (0, ?)", (30 * MS,))
+    db.commit()
+    row, _, _ = nsys.analyse(tmp_path / "x.sqlite", "ours", 1, capture_s=0.020)
+    assert row["window_source"] == "nsight capture bounds"
+    assert row["gpu_busy_fraction"] == pytest.approx(11 / 30)
+
+
+def test_an_export_without_nvtx_still_gives_gpu_statistics(tmp_path):
+    db = sqlite3.connect(tmp_path / "plain.sqlite")
+    db.execute("CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (start INTEGER, end INTEGER)")
+    db.executemany("INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?)", KERNELS)
+    db.commit()
+    row, gaps, steps = nsys.analyse(tmp_path / "plain.sqlite", "ours", 1, capture_s=0.020)
+    assert row["gpu_busy_fraction"] == pytest.approx(11 / 20) and len(gaps) == 1
+    assert steps.empty
 
 
 def test_the_suite_is_skipped_when_nsight_is_not_installed(fast_config, tmp_path):

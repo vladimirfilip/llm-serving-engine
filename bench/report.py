@@ -9,6 +9,8 @@ from pathlib import Path
 import pandas as pd
 
 from .config import load_config
+from .metrics.aggregate import aggregate_repeats
+from .metrics.correctness import gates_verdict
 from .plots import PLOTS, draw_all
 from .plots.style import PlotContext
 from .suites.common import datasets_dir
@@ -19,7 +21,7 @@ SECTIONS = [
     ("Single-stream", ("p10", "p11", "p12")),
     ("Kernels", ("p13", "p14", "p15", "p16")),
     ("System overhead", ("p17", "p18")),
-    ("Memory", ("p19", "p20")),
+    ("Memory", ("p04", "p19", "p20")),
     ("Scheduler", ("p21", "p22")),
     ("Energy, cold start, soak", ("p23", "p25", "p24")),
 ]
@@ -52,8 +54,7 @@ def load_tables(run_dir: Path) -> dict[str, pd.DataFrame]:
     return {p.stem: pd.read_csv(p) for p in tables.glob("*.csv") if p.stat().st_size}
 
 
-def banners(run_dir: Path, env: dict, status: dict, checks: dict, summary: dict,
-            tables: dict) -> list[str]:
+def banners(env: dict, status: dict, checks: dict, summary: dict, tables: dict) -> list[str]:
     out = []
     gates = summary.get("gates", {})
     if any(g["passed"] is False for g in gates.values()):
@@ -75,6 +76,8 @@ def banners(run_dir: Path, env: dict, status: dict, checks: dict, summary: dict,
     for engine, c in checks.items():
         if not c.get("itl_valid", True):
             out.append(f"{engine}: ITL percentiles withheld (events are not one per token).")
+        if not c.get("stats_available", True):
+            out.append(f"{engine}: no stats endpoint; queue, KV and memory plots show n/a.")
         for r in c.get("results", []):
             if r["skipped"]:
                 out.append(f"{engine}: check {r['name']} skipped: {r['detail']}")
@@ -84,10 +87,23 @@ def banners(run_dir: Path, env: dict, status: dict, checks: dict, summary: dict,
     return out
 
 
-def setup_block(env: dict, run_dir: Path, tuned: dict, suite: dict, tables: dict) -> str:
+def launch_commands(run_dir: Path) -> dict:
+    """Each engine's resolved launch command and token budget, from its first sweep point."""
+    out = {}
+    for meta in sorted((run_dir / "sweep").glob("*/*/*.json")):
+        data = json.loads(meta.read_text())
+        out.setdefault(data["engine"], {"launch": data["launch"],
+                                        "token_budget": data["token_budget"]})
+    return out
+
+
+def setup_block(env: dict, run_dir: Path, tuned: dict, suite: dict) -> str:
     gpu, model, hw = env.get("gpu", {}), env["model"], env["hardware"]
+    versions = ", ".join(f"{k} {v}" for k, v in env.get("baselines", {}).items() if v)
     lines = [f"- GPU: {gpu.get('name', 'none')}, driver {gpu.get('driver', 'n/a')}, "
              f"CUDA runtime {env.get('cuda_runtime')}, torch {env.get('torch')}",
+             f"- Engines: ours at commit {env.get('git_commit', '')[:7]}; "
+             f"baselines {versions or 'none'}",
              f"- Model: {Path(model['path']).name}, dtype {model['dtype']}, "
              f"max_model_len {model['max_model_len']}, max_num_seqs {model['max_num_seqs']}, "
              f"gpu_mem_util {model['gpu_mem_util']}",
@@ -100,10 +116,13 @@ def setup_block(env: dict, run_dir: Path, tuned: dict, suite: dict, tables: dict
                                      for w, s in suite["slo"].items()),
              "- Tuned token budgets: " + (", ".join(f"{e} {t['token_budget']}"
                                                    for e, t in tuned.items()) or "none")]
+    for engine, c in launch_commands(run_dir).items():
+        lines.append(f"- Launch, {engine} (token budget {c['token_budget']}): "
+                     f"`{' '.join(c['launch'])}`")
     return "\n".join(lines) + "\n"
 
 
-def headline_table(tables: dict, summary: dict, suite: dict) -> pd.DataFrame:
+def headline_table(tables: dict, summary: dict) -> pd.DataFrame:
     """One row per engine; each cell is read from a table, or n/a."""
     engines = sorted({e for t in tables.values() if "engine" in t for e in t.engine})
     capacity, sweep = tables.get("capacity"), tables.get("sweep_points")
@@ -125,9 +144,11 @@ def headline_table(tables: dict, summary: dict, suite: dict) -> pd.DataFrame:
             row["b1_tpot_ms"] = r.tpot_s.iloc[0] * 1000 if len(r) else None
             row["b1_bound_fraction"] = r.bound_fraction.iloc[0] if len(r) else None
         if sweep is not None and ref:
-            mine = sweep[(sweep.engine == e) & (sweep.workload == "sharegpt")]
+            mine = sweep[(sweep.engine == e) & (sweep.workload == "sharegpt") & sweep.valid]
             if len(mine):
-                near = mine.iloc[(mine.offered_rps - 0.5 * ref).abs().argsort()[:1]]
+                point = aggregate_repeats(
+                    mine, ["engine", "offered_rps"], ["tpot_p99", "energy_j_per_out_token"])
+                near = point.iloc[[(point.offered_rps - 0.5 * ref).abs().argmin()]]
                 row["p99_tpot_ms_at_half_ref"] = near.tpot_p99.iloc[0] * 1000
                 row["out_tok_per_joule_at_half_ref"] = (
                     1 / near.energy_j_per_out_token.iloc[0]
@@ -139,11 +160,7 @@ def headline_table(tables: dict, summary: dict, suite: dict) -> pd.DataFrame:
             row["first_request_penalty_ms"] = (r.first_request_penalty_s.median() * 1000
                                                if len(r) else None)
         rows.append(row)
-    gates = summary.get("gates", {})
-    verdict = ("n/a" if not gates else "pass" if all(g["passed"] for g in gates.values()
-                                                    if g["passed"] is not None)
-               and any(g["passed"] for g in gates.values()) else "fail"
-               if any(g["passed"] is False for g in gates.values()) else "not evaluated")
+    verdict = gates_verdict(summary["gates"]) if summary.get("gates") else "n/a"
     for row in rows:
         row["correctness"] = verdict if row["engine"] == "ours" else "n/a"
     return pd.DataFrame(rows)
@@ -181,27 +198,33 @@ def correctness_section(summary: dict) -> str:
     return text
 
 
-def method_notes(env: dict, tables: dict, checks: dict) -> str:
+def method_notes(run_dir: Path, checks: dict) -> str:
     notes = ["Latency is measured by the client and includes HTTP and detokenization for every "
              "engine.",
              "Peak TFLOP/s and bandwidth are datasheet values; MFU is against the datasheet "
              "peak, which is quoted at the boost clock, above the locked clock.",
              "One model, one dtype, one GPU.",
              "The mock and null engines exist to test the harness and carry no results."]
-    unavailable = [e for e, c in checks.items()
-                   if not any(r["name"] == "token_accounting" for r in c.get("results", []))]
-    if unavailable:
-        notes.append("Engines with no preflight record: " + ", ".join(unavailable) + ".")
-    kernels = read_json(Path(env.get("_run_dir", ".")) / "kernels" / "summary.json")
+    no_stats = [e for e, c in checks.items() if not c.get("stats_available", True)]
+    if no_stats:
+        notes.append("No stats endpoint for " + ", ".join(no_stats)
+                     + ": their queue, KV utilisation and memory-breakdown values are n/a.")
+    kernels = read_json(run_dir / "kernels" / "summary.json")
     if kernels.get("unavailable"):
         notes.append("Kernel contenders not run: " + "; ".join(
             f"{k}: {v}" for k, v in kernels["unavailable"].items()) + ".")
+    if kernels.get("dropped_for_error"):
+        notes.append("Kernel contenders dropped for numeric error above tolerance: "
+                     + ", ".join(kernels["dropped_for_error"]) + ".")
+    if kernels.get("skipped_decode_cells"):
+        notes.append("Decode-attention cells skipped because their KV would not fit: "
+                     + ", ".join(f"batch {b} x context {c}"
+                                 for b, c in kernels["skipped_decode_cells"]) + ".")
     return "\n".join(f"- {n}" for n in notes) + "\n"
 
 
 def build_report(run_dir: Path, config_dir: Path | None = None) -> tuple[Path, dict]:
     env = read_json(run_dir / "env.json")
-    env["_run_dir"] = str(run_dir)
     cfg = load_config(config_dir) if config_dir else load_config()
     suite = read_json_yaml(run_dir / "config_snapshot" / "suite.yaml") or cfg.suite
     status, checks = read_json(run_dir / "status.json"), read_json(run_dir / "checks.json")
@@ -214,12 +237,12 @@ def build_report(run_dir: Path, config_dir: Path | None = None) -> tuple[Path, d
                                              summary.get("gates", {}).values()),
                       quick=bool(env.get("quick")))
     drawn = draw_all(ctx)
-    headline = headline_table(tables, summary, suite)
+    headline = headline_table(tables, summary)
     parts = [f"# Benchmark report {run_dir.name}\n"]
-    notices = banners(run_dir, env, status, checks, summary, tables)
+    notices = banners(env, status, checks, summary, tables)
     if notices:
         parts.append("## Notices\n\n" + "\n".join(f"- {n}" for n in notices) + "\n")
-    parts += ["## Setup\n\n" + setup_block(env, run_dir, tuned, suite, tables),
+    parts += ["## Setup\n\n" + setup_block(env, run_dir, tuned, suite),
               "## Headline table\n\n" + md_table(headline, HEADLINE_FORMATS),
               "## Headline plots\n\n" + plot_lines(HEADLINE_PLOTS, drawn),
               "## Correctness\n\n" + correctness_section(summary)]
@@ -230,7 +253,7 @@ def build_report(run_dir: Path, config_dir: Path | None = None) -> tuple[Path, d
         parts.append(f"## {title}\n\n{body}")
         if title == "Scheduler" and "ablation" in tables:
             parts.append("## Ablation\n\n" + md_table(tables["ablation"]))
-    parts.append("## Method notes\n\n" + method_notes(env, tables, checks))
+    parts.append("## Method notes\n\n" + method_notes(run_dir, checks))
     report = run_dir / "report.md"
     report.write_text("\n".join(parts))
     return report, {"headline": headline, "drawn": drawn, "summary": summary, "env": env,

@@ -406,7 +406,9 @@ def write(
         ]
         csv("kernels_gemm", pd.DataFrame(gemm))
         (run_dir / "kernels" / "summary.json").write_text(
-            json.dumps({"unavailable": {"flash_attn": "flash-attn is not installed"}})
+            json.dumps({"unavailable": {"flash_attn": "flash-attn is not installed"},
+                    "dropped_for_error": ["flashinfer"],
+                    "skipped_decode_cells": [[128, 8192]]})
         )
     if "nsys" in suites:
         csv(

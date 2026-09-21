@@ -180,9 +180,27 @@ def test_a_short_soak_on_a_fake_engine_writes_its_windows_and_verdict(run, monke
     assert {p.name for p in folder.iterdir()} >= {"throughput.csv", "latency.csv", "verdict.json"}
     throughput = pd.read_csv(folder / "throughput.csv")
     assert len(throughput) == 8 and throughput.out_tok_s.max() > 0
+    assert "cumulative_errors" in pd.read_csv(folder / "memory.csv")
     assert list(pd.read_csv(run.dir / "tables" / "soak.csv").engine) == ["mock"]
 
 
 def test_soak_is_skipped_for_engines_it_does_not_cover(run):
     with pytest.raises(SuiteSkipped, match="soak runs on"):
         soak.execute(run, ["vllm"])
+
+
+def test_a_soak_criterion_with_no_samples_is_not_evaluated_rather_than_failed():
+    tokens, latency, memory = steady(2400)
+    verdict = soak.soak_verdict(tokens, latency, memory.iloc[0:0], 0, 2400, LIMITS)
+    assert verdict["gpu_mem_growth"]["passed"] is None
+    assert "no mem_used_bytes samples" in verdict["gpu_mem_growth"]["reason"]
+    assert verdict["throughput_drift"]["passed"] is True and verdict["passed"] is None
+    failing = soak.soak_verdict(tokens, latency, memory.iloc[0:0], 3, 2400, LIMITS)
+    assert failing["passed"] is False  # a real failure still fails the run
+
+
+def test_a_refused_cache_drop_is_recorded_in_the_coldstart_table(run, monkeypatch):
+    monkeypatch.setattr(coldstart, "drop_page_cache", lambda: False)
+    coldstart.execute(run, ["mock"])
+    table = pd.read_csv(run.dir / "tables" / "coldstart.csv")
+    assert table.cache_drop_refused.tolist() == [True, False]

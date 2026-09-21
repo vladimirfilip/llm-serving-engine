@@ -60,9 +60,24 @@ def read_device_intervals(db: sqlite3.Connection) -> list[tuple[int, int]]:
     return out
 
 
+def capture_window(db: sqlite3.Connection, intervals: list[tuple[int, int]],
+                   capture_s: float) -> tuple[tuple[int, int], str]:
+    """The capture window in ns and where it came from: the start and stop Nsight recorded, or
+    `capture_s` from the first device event when the export carries no capture bounds."""
+    present = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "ANALYSIS_DETAILS" in present:
+        row = db.execute("SELECT startTime, stopTime FROM ANALYSIS_DETAILS LIMIT 1").fetchone()
+        if row and row[0] is not None and row[1] is not None:
+            return (row[0], row[1]), "nsight capture bounds"
+    first = min(s for s, _ in intervals)
+    return (first, first + int(capture_s * 1e9)), "capture_s from the first device event"
+
+
 def read_nvtx(db: sqlite3.Connection) -> pd.DataFrame:
     """NVTX ranges as (name, start, end); the name is inline text or a string-table id,
-    depending on the Nsight version."""
+    depending on the Nsight version. Empty when the capture holds no NVTX events."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='NVTX_EVENTS'").fetchone():
+        return pd.DataFrame(columns=["name", "start", "end"])
     columns = {r[1] for r in db.execute("PRAGMA table_info(NVTX_EVENTS)")}
     name = ("COALESCE(text, (SELECT value FROM StringIds WHERE id = textId))"
             if "textId" in columns else "text")
@@ -89,16 +104,17 @@ def step_breakdown(nvtx: pd.DataFrame, intervals: list[tuple[int, int]]) -> pd.D
     return pd.DataFrame(rows)
 
 
-def analyse(db_path: Path, engine: str, batch: int) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
+def analyse(db_path: Path, engine: str, batch: int,
+            capture_s: float) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
     db = sqlite3.connect(db_path)
     intervals = read_device_intervals(db)
-    window = (min(s for s, _ in intervals), max(e for _, e in intervals))
+    window, source = capture_window(db, intervals, capture_s)
     stats = busy_and_gaps(intervals, window)
     gaps = pd.DataFrame({"engine": engine, "batch": batch, "gap_s": stats.pop("gaps_s")})
     steps = pd.DataFrame()
     if engine == "ours":
         steps = step_breakdown(read_nvtx(db), intervals).assign(batch=batch)
-    return {"engine": engine, "batch": batch} | stats, gaps, steps
+    return {"engine": engine, "batch": batch, "window_source": source} | stats, gaps, steps
 
 
 def profile(run: Run, engine: str, batch: int, data, folder: Path) -> Path:
@@ -141,11 +157,14 @@ def execute(run: Run, engines: list[str]) -> None:
     for engine in engines:
         for batch in run.cfg.suite["nsys"]["batch_sizes"]:
             with guarded(run, "nsys", engine):
-                row, gap_frame, step_frame = analyse(profile(run, engine, batch, data, folder),
-                                                     engine, batch)
+                row, gap_frame, step_frame = analyse(
+                    profile(run, engine, batch, data, folder), engine, batch,
+                    run.cfg.suite["nsys"]["capture_s"])
                 summary.append(row)
                 gaps.append(gap_frame)
                 steps.append(step_frame)
+    if not summary:
+        return
     tables = run.dir / "tables"
     pd.DataFrame(summary).to_csv(tables / "nsys.csv", index=False)
     pd.concat(gaps).to_parquet(folder / "gaps.parquet")

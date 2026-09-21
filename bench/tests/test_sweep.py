@@ -96,3 +96,16 @@ def test_tuning_picks_the_highest_throughput_and_the_smaller_budget_within_two_p
 def test_an_engine_with_no_tuning_knob_keeps_a_fixed_launch(run):
     tune.execute(run, ["mock"])
     assert json.loads((run.dir / "tune" / "tuned.json").read_text())["mock"]["token_budget"] is None
+
+
+def test_a_probe_rerun_skips_measured_workloads_and_a_crash_keeps_what_was_taken(run):
+    probe.execute(run, ["mock"])
+    first = probe.capacity_path(run).read_text()
+    probe.execute(run, ["mock"])  # nothing left to measure: no engine is launched
+    assert probe.capacity_path(run).read_text() == first
+    saved = json.loads(first)
+    del saved["mock"]["short_long"]
+    probe.capacity_path(run).write_text(json.dumps(saved))
+    probe.execute(run, ["mock"])
+    assert set(json.loads(probe.capacity_path(run).read_text())["mock"]) == set(saved["mock"]) | {
+        "short_long"}

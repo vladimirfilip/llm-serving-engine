@@ -1,3 +1,5 @@
+import json
+
 import pandas as pd
 import pytest
 import yaml
@@ -100,3 +102,36 @@ def test_the_suite_writes_every_memory_table_for_a_fake_engine(run):
     device = pd.read_csv(tables / "memory_device.csv")
     assert {"idle_bytes", "peak_bytes", "peak_source"} <= set(device.columns)
     assert device.peak_source.tolist() == ["kv_util run"]  # no sweep was run for this engine
+
+
+def test_an_engine_that_fails_a_must_check_is_recorded_and_others_keep_their_own_rows(
+    fast_config_dir, tmp_path, synthetic_datasets
+):
+    import shutil
+
+    engines = fast_config_dir / "engines"
+    bad = yaml.safe_load((engines / "mock.yaml").read_text())
+    bad["name"] = "bad"
+    bad["launch"] += ["--burst=4"]  # bursts fail a MUST check
+    (engines / "bad.yaml").write_text(yaml.safe_dump(bad))
+    run = Run.open(load_config(fast_config_dir), "guard", results_dir=tmp_path / "results")
+    probe.execute(run, ["mock"])
+    capacity = json.loads(probe.capacity_path(run).read_text())
+    capacity["bad"] = capacity["mock"]
+    probe.capacity_path(run).write_text(json.dumps(capacity))
+    memory.execute(run, ["bad", "mock"])  # the failing engine comes first: nothing to carry over
+    assert run.aborted("memory") == ["bad"]
+    grid = pd.read_csv(run.dir / "tables" / "memory_grid.csv")
+    assert set(grid.engine) == {"mock"}
+    assert set(pd.read_csv(run.dir / "tables" / "memory_device.csv").engine) == {"mock"}
+    shutil.rmtree(run.dir / "memory" / "bad", ignore_errors=True)
+
+
+def test_recovery_needs_health_and_a_16_token_completion_to_succeed(run):
+    from bench.engines.base import Launch
+    from bench.suites.common import engine_session
+
+    with engine_session(run, "mock", "t", Launch(), checks=False) as s:
+        assert memory.recovered(s, recover_s=10)
+        s.adapter.proc.stop()
+        assert not memory.recovered(s, recover_s=2)

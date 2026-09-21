@@ -105,3 +105,13 @@ def evaluate_gates(summary: dict, gates: dict) -> dict[str, dict]:
         if ours_gsm is not None and vllm_gsm is not None
         else gate(None, "not evaluated: needs GSM8K for ours and vllm"))
     return out
+
+
+def gates_verdict(gates: dict[str, dict]) -> str:
+    """`pass` only when all four gates were evaluated and passed; `fail` if any failed;
+    otherwise `not evaluated`. Publishing and the headline table share this rule."""
+    if any(g["passed"] is False for g in gates.values()):
+        return "fail"
+    if len(gates) < 4 or any(g["passed"] is None for g in gates.values()):
+        return "not evaluated"
+    return "pass"

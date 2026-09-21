@@ -29,14 +29,6 @@ def _use_uvloop() -> None:
         pass
 
 
-def uvloop_available() -> bool:
-    try:
-        import uvloop  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
 async def open_loop(target: Target, requests: list[Request], t_sched: list[float],
                     t0: float) -> list[dict]:
     async with new_session() as session:

@@ -83,6 +83,7 @@ scheduler:
   overload:
     rate_fraction: 1.5
     duration_s: 120
+    timeout_s: 300
     starvation_ttft_s: 30
 
 soak:

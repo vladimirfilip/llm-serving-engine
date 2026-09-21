@@ -50,6 +50,7 @@ def decode_versus_context(
     rows = []
     for length in cfg["contexts"]:
         if length + cfg["decode_tokens"] > max_len:
+            rows.append({"context": length, "reason": "exceeds max_model_len"})
             continue
         reqs = prompts(session, data, length, cfg["decode_tokens"], cfg["repeats"] + 1, 0)
         records = one_at_a_time(session, reqs)[1:]  # the first request is a warmup
@@ -68,6 +69,7 @@ def ttft_versus_prompt(session: Session, data, spec: ModelSpec, peak_tflops: flo
     rows = []
     for length in cfg["ttft_prompts"]:
         if length + 2 > max_len:
+            rows.append({"prompt": length, "reason": "exceeds max_model_len"})
             continue
         reqs = prompts(session, data, length, 2, 2 + cfg["ttft_repeats"], 1)
         records = one_at_a_time(session, reqs)[2:]  # two warmups
@@ -123,7 +125,6 @@ def throughput_versus_batch(session: Session, data) -> list[dict]:
 
 def execute(run: Run, engines: list[str]) -> None:
     data = load_datasets(run)
-    env = load_env(run) if (run.dir / "env.json").exists() else {}
     tables: dict[str, list[dict]] = {"decode": [], "ttft": [], "batch": []}
     for engine in engines:
         with guarded(run, "single_stream", engine), engine_session(run, engine, "single") as s:

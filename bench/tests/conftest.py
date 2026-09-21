@@ -33,7 +33,7 @@ def fast_suite(suite: dict) -> dict:
     s["scheduler"]["interference"].update(background_streams=2, background_output=200,
                                           warm_s=1, inject_every_s=1, inject_for_s=3, tail_s=1,
                                           inject_prompt=512, inject_output=4)
-    s["scheduler"]["overload"].update(duration_s=3)
+    s["scheduler"]["overload"].update(duration_s=3, timeout_s=60)
     s["coldstart"]["launches"] = 2
     s["correctness"].update(n_prompts=6, n_long_prompts=1, long_prompt_len=600, max_new_tokens=24,
                             long_max_new_tokens=8, batch_invariance_prompts=4,

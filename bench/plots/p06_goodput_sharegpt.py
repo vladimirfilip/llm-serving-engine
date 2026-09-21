@@ -20,11 +20,15 @@ def draw(ctx):
         if summary is not None:
             row = summary[(summary.engine == engine) & (summary.workload == "sharegpt")]
             if len(row) and row.max_sustainable_rps.notna().iloc[0]:
-                ax.axvline(row.max_sustainable_rps.iloc[0], color=color(engine), ls=":", lw=1)
+                rate = row.max_sustainable_rps.iloc[0]
+                ax.axvline(rate, color=color(engine), ls=":", lw=1)
+                at = data[(data.engine == engine) & (data.offered_rps == rate)]
+                ax.plot(at.offered_rps, at.goodput_rps, "D", color=color(engine), ms=8,
+                        mec="white", zorder=7)
     if hollow:
         hollow_legend(ax)
     ax.set_xlabel("offered load (requests/s)")
     ax.set_ylabel("goodput (requests/s meeting the SLO)")
     ax.legend(fontsize=8)
     return finish(fig, ctx, "p06_goodput_sharegpt", "ShareGPT: goodput against offered load",
-                  "dotted vertical line: largest rate with at least 90% SLO attainment")
+                  "diamond and dotted line: largest rate with at least 90% SLO attainment")

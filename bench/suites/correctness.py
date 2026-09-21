@@ -67,13 +67,28 @@ def reference_ppl(run: Run) -> float:
 
 
 def generate_tokens(session: Session, prompts: list[dict], cfg: dict) -> list[dict]:
-    """Greedy generations at concurrency 16: token ids and the engine's own logprobs."""
-    requests = [Request(i, p["prompt_token_ids"], new_tokens(p, cfg))
-                for i, p in enumerate(prompts)]
-    records, _ = run_bounded(session.target(logprobs=True), requests, GENERATION_CONCURRENCY,
-                             session.client_cpus)
-    return [{"id": p["id"], "token_ids": r["token_ids"], "logprobs": r["token_logprobs"]}
-            for p, r in zip(prompts, records, strict=True) if r["status"] == "ok"]
+    """Greedy generations: token ids and the engine's own logprobs. ShareGPT prompts run at
+    concurrency 16; long prompts one at a time, since each is larger than half the KV pool and
+    two admitted together can both stall mid-prefill."""
+    out = []
+    for group, concurrency in (([p for p in prompts if p["kind"] != "long"],
+                                GENERATION_CONCURRENCY),
+                               ([p for p in prompts if p["kind"] == "long"], 1)):
+        requests = [Request(i, p["prompt_token_ids"], new_tokens(p, cfg))
+                    for i, p in enumerate(group)]
+        records, _ = run_bounded(session.target(logprobs=True), requests, concurrency,
+                                 session.client_cpus)
+        out += [{"id": p["id"], "token_ids": r["token_ids"], "logprobs": r["token_logprobs"]}
+                for p, r in zip(group, records, strict=True)
+                if r["status"] == "ok" and complete_tokens(r)]
+    return out
+
+
+def complete_tokens(record: dict) -> bool:
+    """Every generated token came back with its id; an engine that returns no ids is kept, so
+    the missing ids are reported rather than the generation vanishing."""
+    ids = record["token_ids"]
+    return not ids or len(ids) == record["completion_tokens_usage"]
 
 
 def run_batch_invariance(session: Session, prompts: list[dict], data) -> dict:
@@ -85,24 +100,31 @@ def run_batch_invariance(session: Session, prompts: list[dict], data) -> dict:
     filler = [Request(len(mine) + i, rec["prompt_token_ids"], tokens)
               for i, rec in enumerate(data.sharegpt_pool[: cfg["batch_invariance_background"]])]
 
-    def alone() -> list[list[int]]:
+    def token_ids_of(records: list[dict]) -> list[list[int]] | None:
+        ids = [r["token_ids"] for r in records]
+        return ids if all(ids) else None
+
+    def alone() -> list[list[int]] | None:
         out = []
         for req in mine:
             (rec,), _ = run_open_loop(session.target(logprobs=True), [req], [0.0],
                                       cpus=session.client_cpus)
-            out.append(rec["token_ids"])
-        return out
+            out.append(rec)
+        return token_ids_of(out)
 
-    def amid(order: list[Request]) -> list[list[int]]:
+    def amid(order: list[Request]) -> list[list[int]] | None:
         records, _ = run_open_loop(session.target(logprobs=True), order, [0.0] * len(order),
                                    session.client_procs, session.client_cpus)
-        by_id = {r["req_id"]: r["token_ids"] for r in records}
-        return [by_id[req.req_id] for req in mine]
+        by_id = {r["req_id"]: r for r in records}
+        return token_ids_of([by_id[req.req_id] for req in mine])
 
     rng = np.random.default_rng(session.run.cfg.suite["seed"])
     everything = [*mine, *filler]
     shuffled = [everything[i] for i in rng.permutation(len(everything))]
-    return batch_invariance(alone(), alone(), amid(everything), amid(shuffled))
+    runs = (alone(), alone(), amid(everything), amid(shuffled))
+    if any(run is None for run in runs):
+        return {"unavailable": "the engine returned no token ids, so runs cannot be compared"}
+    return batch_invariance(*runs)
 
 
 def measure_perplexity(session: Session) -> float | None:

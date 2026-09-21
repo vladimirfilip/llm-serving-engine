@@ -43,8 +43,9 @@ def test_gaps_are_labelled_per_stream_and_summarised_per_label():
 
 def test_windowed_tpot_stands_in_for_itl_when_events_are_not_per_token():
     stream = {"token_times": [i * 0.1 for i in range(45)]}  # 10 tokens/s for 4.4 s
-    frame = windowed_tpot([stream], 2.0)
+    frame = windowed_tpot([stream], 2.0, injected=[(1.0, 2.5)])
     assert len(frame) == 3 and frame.itl.tolist() == pytest.approx([0.1, 0.1, 0.1])
+    assert frame.label.tolist() == ["during_prefill", "during_prefill", "baseline"]
 
 
 def test_overload_metrics_follow_their_definitions():
@@ -55,7 +56,8 @@ def test_overload_metrics_follow_their_definitions():
         r["token_times"] = r["token_times"] or []
     m = overload_metrics(records, starvation_ttft_s=30)
     assert m["n"] == 5 and m["timeout_rate"] == pytest.approx(0.2)
-    assert m["starved_fraction"] == pytest.approx(2 / 5)  # two of five waited over 30 s
+    # two waited over 30 s and the timed-out request never got a first token at all
+    assert m["starved_fraction"] == pytest.approx(3 / 5)
     assert m["ttft_p50"] == pytest.approx(21.0) and m["ttft_max"] == pytest.approx(50.0)
     assert m["ttft_p99_over_p50"] == pytest.approx(m["ttft_p99"] / 21.0)
     assert m["spearman_prompt_len_ttft"] == pytest.approx(1.0)  # longer prompts waited longer

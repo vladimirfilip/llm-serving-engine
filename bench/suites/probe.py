@@ -62,11 +62,18 @@ def execute(run: Run, engines: list[str], repeats: int = 1) -> None:
     data = load_datasets(run)
     capacity = load_capacity(run)
     for engine in engines:
+        todo = [w for w in run.cfg.workloads if run.force or w not in capacity.get(engine, {})]
+        if not todo:
+            continue
         with guarded(run, "probe", engine), engine_session(run, engine, "probe") as session:
-            for workload in run.cfg.workloads:
+            for workload in todo:
                 results = [measure_capacity(session, workload, data, r) for r in range(repeats)]
                 best = results[int(np.argmax([r["capacity_tok_s"] for r in results]))]
                 capacity.setdefault(engine, {})[workload] = best | {"repeats": results}
+                save_capacity(run, capacity)
+
+
+def save_capacity(run: Run, capacity: dict) -> None:
     capacity_path(run).parent.mkdir(exist_ok=True)
     capacity_path(run).write_text(json.dumps(capacity, indent=2))
     rows = [{"engine": e, "workload": w, "capacity_tok_s": c["capacity_tok_s"],

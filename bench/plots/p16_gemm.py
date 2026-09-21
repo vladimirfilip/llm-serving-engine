@@ -14,15 +14,16 @@ def draw(ctx):
     ratio = (ours.ms_median / torch_.ms_median).unstack("m")
     fig, axes = figure(1, 2)
     ax = axes[0][0]
-    image = ax.imshow(ratio.to_numpy(), cmap="RdBu_r", aspect="auto",
-                      norm=TwoSlopeNorm(1.0, vmin=min(ratio.min().min(), 0.99),
-                                        vmax=max(ratio.max().max(), 1.01)))
+    log_ratio = np.log2(ratio.to_numpy())
+    span = max(abs(log_ratio).max(), 0.01)
+    image = ax.imshow(log_ratio, cmap="RdBu_r", aspect="auto",
+                      norm=TwoSlopeNorm(0.0, vmin=-span, vmax=span))
     ax.set_xticks(range(ratio.shape[1]), [str(m) for m in ratio.columns], fontsize=7)
     ax.set_yticks(range(ratio.shape[0]), ratio.index, fontsize=8)
     ax.set_xlabel("M (rows)")
     for i, j in np.ndindex(ratio.shape):
         ax.text(j, i, f"{ratio.iloc[i, j]:.2f}", ha="center", va="center", fontsize=6)
-    fig.colorbar(image, ax=ax, label="t_ours / t_torch")
+    fig.colorbar(image, ax=ax, label="log2(t_ours / t_torch); 0 is parity")
     small = data[data.m <= 64]
     for shape in ("qkv_proj", "down_proj"):
         for contender in ("ours", "torch"):

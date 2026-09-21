@@ -11,8 +11,15 @@ from pathlib import Path
 import pandas as pd
 
 from .config import BENCH_DIR, REPO_ROOT
+from .metrics.correctness import gates_verdict
 from .plots import PLOTS
-from .report import HEADLINE_FORMATS, HEADLINE_PLOTS, build_report, md_table
+from .report import (
+    HEADLINE_FORMATS,
+    HEADLINE_PLOTS,
+    build_report,
+    launch_commands,
+    md_table,
+)
 
 PUBLISHED = BENCH_DIR / "published"
 START, END = "<!-- BENCH:START -->", "<!-- BENCH:END -->"
@@ -33,9 +40,10 @@ def unmet_conditions(run_dir: Path) -> list[str]:
         unmet.append("the run was --quick")
     if not env.get("clocks_locked"):
         unmet.append("clocks were not locked")
-    if len(gates) < 4 or any(g["passed"] is None for g in gates.values()):
+    verdict_ = gates_verdict(gates)
+    if verdict_ == "not evaluated":
         unmet.append("not all four correctness gates were evaluated")
-    elif not all(g["passed"] for g in gates.values()):
+    elif verdict_ == "fail":
         unmet.append("a correctness gate failed")
     if env.get("git_dirty"):
         unmet.append("the engine tree was dirty during the run")
@@ -65,15 +73,6 @@ def sanitizer(env: dict):
         return re.sub(r"(?<![\w.])/root\b", "~", text)
 
     return clean
-
-
-def commands(run_dir: Path) -> dict:
-    out = {}
-    for meta in sorted((run_dir / "sweep").glob("*/*/*.json")):
-        data = json.loads(meta.read_text())
-        out.setdefault(data["engine"], {"launch": data["launch"],
-                                        "token_budget": data["token_budget"]})
-    return out
 
 
 def verdict(gate: dict) -> str:
@@ -141,9 +140,9 @@ def publish(run_dir: Path, force: bool = False, write_readme: bool = False,
     for csv in (run_dir / "tables").glob("*.csv"):
         (published / "tables" / csv.name).write_text(clean(csv.read_text()))
     (published / "report.md").write_text(clean((run_dir / "report.md").read_text()))
-    env_public = {k: v for k, v in env.items() if not k.startswith("_")}
-    (published / "env.json").write_text(clean(json.dumps(env_public, indent=2)))
-    (published / "commands.json").write_text(clean(json.dumps(commands(run_dir), indent=2)))
+    (published / "env.json").write_text(clean(json.dumps(env, indent=2)))
+    (published / "commands.json").write_text(
+        clean(json.dumps(launch_commands(run_dir), indent=2)))
     (published / "run.json").write_text(clean(json.dumps({
         "run_id": run_dir.name, "engine_commit": env["git_commit"], "date": run_dir.name[:8],
         "model": Path(env["model"]["path"]).name, "gpu": env["gpu"]["name"],

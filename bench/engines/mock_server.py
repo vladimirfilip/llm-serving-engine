@@ -31,6 +31,7 @@ class MockConfig:
     kv_blocks: int = 4096
     block_size: int = 16
     crash_running: int = 0  # exit the process once this many sequences run together; 0 never
+    token_ids: bool = True  # name each logprob token by id; False gives plain text, like SGLang
 
 
 @dataclass(slots=True)
@@ -140,10 +141,11 @@ class MockEngine:
         }
 
 
-def chunk(token: int, logprob: float | None) -> bytes:
+def chunk(token: int, logprob: float | None, ids: bool = True) -> bytes:
     choice = {"index": 0, "text": f" t{token}", "finish_reason": None}
     if logprob is not None:
-        choice["logprobs"] = {"tokens": [f"token_id:{token}"], "token_logprobs": [logprob]}
+        name = f"token_id:{token}" if ids else f" t{token}"
+        choice["logprobs"] = {"tokens": [name], "token_logprobs": [logprob]}
     return b"data: " + orjson.dumps({"choices": [choice]}) + b"\n\n"
 
 
@@ -168,7 +170,8 @@ async def completions(request: web.Request) -> web.StreamResponse:
         sent += 1
         pending.append(token)
         if bundle == 1:
-            await response.write(chunk(token, logprob if stream.logprobs else None))
+            await response.write(chunk(token, logprob if stream.logprobs else None,
+                                       engine.cfg.token_ids))
         elif len(pending) == bundle or sent == stream.max_tokens:
             text = "".join(f" t{t}" for t in pending)
             await response.write(b"data: " + orjson.dumps(

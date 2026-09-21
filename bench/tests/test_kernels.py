@@ -33,6 +33,9 @@ def test_every_contender_of_ours_matches_the_fp32_reference_and_gemms_report_the
     assert set(gemm.contender) == {"ours", "torch"} and set(gemm["shape"]) == {
         "qkv_proj", "o_proj", "gate_up_proj", "down_proj", "lm_head"}
     assert (gemm.groupby("contender").size() == 10).all()
+    ratios = gemm[gemm.contender == "ours"].ratio_to_torch
+    assert ratios.notna().all() and (ratios > 0).all()
+    assert (gemm[gemm.contender == "torch"].ratio_to_torch == 1.0).all()
 
 
 def test_decode_cells_that_would_not_fit_are_skipped_and_named(tmp_path):

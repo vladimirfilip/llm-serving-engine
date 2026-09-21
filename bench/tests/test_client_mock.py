@@ -104,3 +104,29 @@ def test_a_failing_server_is_recorded_as_an_error_not_raised(mock_adapter):
 
 def test_the_mock_is_launched_with_the_harness_interpreter(mock_adapter):
     assert mock_adapter.launch_argv[0] == sys.executable
+
+
+def test_an_event_with_empty_text_still_records_its_token_id_and_logprob():
+    """A held-back multi-byte character streams an empty-text event; dropping it would make the
+    reference score a sequence the engine never produced."""
+    from bench.client.stream import _on_event
+
+    rec = {"token_logprobs": [], "token_ids": []}
+    times: list[float] = []
+    empty = (b'{"choices":[{"text":"","logprobs":{"tokens":["token_id:7"],'
+             b'"token_logprobs":[-1.5]}}]}')
+    assert not _on_event(empty, rec, times, 0.5, parse_tokens=True)
+    text = (b'{"choices":[{"text":" a","logprobs":{"tokens":["token_id:8"],'
+            b'"token_logprobs":[-0.5]}}]}')
+    _on_event(text, rec, times, 0.6, parse_tokens=True)
+    assert rec["token_ids"] == [7, 8] and rec["token_logprobs"] == [-1.5, -0.5]
+    assert times == [0.6]  # only the event with text is a streamed token for timing
+
+
+def test_logprob_tokens_that_are_plain_text_give_no_ids_and_do_not_crash():
+    from bench.client.stream import _on_event
+
+    rec = {"token_logprobs": [], "token_ids": []}
+    _on_event(b'{"choices":[{"text":" a","logprobs":{"tokens":[" a"],"token_logprobs":[-1.0]}}]}',
+              rec, [], 0.1, parse_tokens=True)
+    assert rec["token_ids"] == [] and rec["token_logprobs"] == [-1.0]

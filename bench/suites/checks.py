@@ -52,11 +52,11 @@ def load_checks(run) -> dict:
 
 
 def save_check_results(run, engine: str, results: list[CheckResult], itl_valid: bool,
-                       client_procs: int) -> None:
+                       client_procs: int, stats_available: bool) -> None:
     all_checks = load_checks(run)
     all_checks.setdefault(engine, {}).update(
         {"results": [asdict(r) for r in results], "itl_valid": itl_valid,
-         "client_procs": client_procs})
+         "client_procs": client_procs, "stats_available": stats_available})
     checks_path(run).write_text(json.dumps(all_checks, indent=2))
 
 
@@ -71,12 +71,12 @@ def _ttft(record: dict) -> float:
     return record["token_times"][0] - record["t_send"]
 
 
-def check_gpu_idle(gpu_index: int, settle_s: float = IDLE_SETTLE_S) -> CheckResult:
+def check_gpu_idle(gpu_index: int, settle_s: float | None = None) -> CheckResult:
     """Nothing else is using the GPU: no compute process and under 5% utilisation. A GPU that
     was busy a moment ago, with our own previous task, gets `settle_s` to go quiet."""
     from .. import env
 
-    deadline = time.perf_counter() + settle_s
+    deadline = time.perf_counter() + (IDLE_SETTLE_S if settle_s is None else settle_s)
     while True:
         pids = env.compute_pids()
         utilization = env.gpu_utilization_pct(gpu_index)
@@ -191,8 +191,11 @@ def null_server_check(limits: dict, procs: int, cpus: str | None,
         os.killpg(server.pid, signal.SIGTERM)
         server.wait()
     lag = percentile([r["t_send"] - r["t_sched"] for r in records], 99)
-    jitter = percentile(np.concatenate([np.abs(token_gaps(r["token_times"]) - NULL_GAP_S)
-                                        for r in records if len(r["token_times"]) > 1]), 99)
+    gaps = [np.abs(token_gaps(r["token_times"]) - NULL_GAP_S)
+            for r in records if len(r["token_times"]) > 1]
+    if not gaps:
+        return False, f"{procs} process(es): no stream delivered two tokens"
+    jitter = percentile(np.concatenate(gaps), 99)
     ok = lag < limits["send_lag_p99_ms"] / 1000 and jitter < limits["jitter_p99_ms"] / 1000
     return ok, (f"{procs} process(es): send_lag p99 {lag * 1e3:.2f} ms, "
                 f"jitter p99 {jitter * 1e3:.2f} ms")
@@ -222,7 +225,8 @@ def ensure_checks(session: Session) -> None:
             check_no_bursts(session), check_tokenizer_identity(session), client_result,
         ]
         itl_valid = all(r.passed for r in results if r.name in ("token_accounting", "no_bursts"))
-        save_check_results(run, engine, results, itl_valid, procs)
+        save_check_results(run, engine, results, itl_valid, procs,
+                           session.adapter.stats() is not None)
         cached = load_checks(run)[engine]
     session.adapter.itl_valid = cached["itl_valid"]
     session.client_procs = max(session.client_procs, cached["client_procs"])

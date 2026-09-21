@@ -41,6 +41,7 @@ def test_the_suite_writes_decode_ttft_and_batch_tables(run):
     ttft = pd.read_csv(tables / "single_ttft.csv")
     assert list(ttft.prompt) == [128, 512] and (ttft.ttft_s > 0).all()
     assert ttft.ttft_s.is_monotonic_increasing and (ttft.prefill_mfu > 0).all()
+    assert "reason" not in ttft or ttft.reason.isna().all()
 
     batch = pd.read_csv(tables / "single_batch.csv")
     assert list(batch.batch) == [1, 2, 4]
@@ -52,4 +53,7 @@ def test_the_suite_writes_decode_ttft_and_batch_tables(run):
 def test_contexts_past_the_model_length_are_skipped(run):
     run.cfg.suite["single_stream"]["contexts"] = [128, 16384]
     single_stream.execute(run, ["mock"])
-    assert list(pd.read_csv(run.dir / "tables" / "single_decode.csv").context) == [128]
+    decode = pd.read_csv(run.dir / "tables" / "single_decode.csv").set_index("context")
+    assert list(decode.index) == [128, 16384]
+    assert decode.loc[16384, "reason"] == "exceeds max_model_len"
+    assert pd.isna(decode.loc[16384, "tpot_s"]) and pd.notna(decode.loc[128, "tpot_s"])

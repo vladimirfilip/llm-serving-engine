@@ -51,6 +51,7 @@ def execute(run: Run, engines: list[str]) -> None:
                     ttfts.append(rec["token_times"][0] - rec["t_send"])
                 rows.append({"engine": engine, "launch": launch_index,
                              "cache": "cold_cache" if dropped else "warm_cache",
+                             "cache_drop_refused": launch_index == 0 and not dropped,
                              "wait_ready_s": s.ready_s,
                              "first_request_penalty_s": first_request_penalty(ttfts)})
     pd.DataFrame(rows).to_csv(run.dir / "tables" / "coldstart.csv", index=False)

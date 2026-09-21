@@ -19,7 +19,7 @@ def draw(ctx):
         ax.set(xscale="log", xlabel="context (tokens, log)", ylabel="KV read bandwidth (GB/s)")
         if bw:
             twin = ax.twinx()
-            twin.set_ylim(0, ax.get_ylim()[1] / bw * 100)
+            twin.set_ylim(*(v / bw * 100 for v in ax.get_ylim()))
             twin.set_ylabel("% of measured read bandwidth")
     axes[0][0].legend(fontsize=8)
     return finish(fig, ctx, "p14_attn_decode", "Decode attention bandwidth",

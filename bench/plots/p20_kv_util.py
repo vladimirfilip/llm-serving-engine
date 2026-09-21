@@ -7,7 +7,13 @@ def draw(ctx):
     data = ctx.table("kv_util")
     if data is None:
         return None
+    checks = ctx.json("checks.json") or {}
     fig, axes = figure(1, 2)
+    for engine, c in checks.items():
+        if not c.get("stats_available", True):
+            for ax in axes[0]:
+                ax.text(0.5, 0.9 - 0.06 * list(checks).index(engine), f"{engine}: n/a (no stats)",
+                        transform=ax.transAxes, ha="center", fontsize=8)
     for engine in ordered(data.engine):
         frame = data[data.engine == engine].sort_values("t_s")
         line(axes[0][0], engine, frame.t_s, frame.kv_util * 100, marker=None)

@@ -41,10 +41,7 @@ def paged_decode(batch: int, ctx: int, spec: ModelSpec) -> tuple[Callable, torch
         rows = torch.zeros(batch, padded, spec.n_kv_heads, spec.head_dim, device=DEVICE,
                            dtype=dense.dtype)
         rows[:, :ctx] = dense
-        scratch = torch.zeros(1, BLOCK_SIZE, spec.n_kv_heads, spec.head_dim, device=DEVICE,
-                              dtype=dense.dtype)
-        return torch.cat([rows.view(batch * blocks, BLOCK_SIZE, spec.n_kv_heads, spec.head_dim),
-                          scratch])
+        return rows.view(batch * blocks, BLOCK_SIZE, spec.n_kv_heads, spec.head_dim)
 
     k_pool, v_pool = pool(k), pool(v)
     table = torch.arange(batch * blocks, dtype=torch.int32, device=DEVICE).view(batch, blocks)

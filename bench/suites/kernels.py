@@ -81,7 +81,8 @@ def attention_rows(contenders, kind: str, points: list[tuple], spec: ModelSpec, 
     return rows
 
 
-def gemm_rows(contenders, spec: ModelSpec, cfg: dict) -> list[dict]:
+def gemm_rows(contenders, spec: ModelSpec, cfg: dict, failures: dict[str, str]) -> list[dict]:
+    """Every contender's time per projection and M, and `ratio_to_torch` (ours over torch time)."""
     from ..kernels.protocol import GEMM_SHAPES, gemm_shape
 
     rows = []
@@ -89,15 +90,26 @@ def gemm_rows(contenders, spec: ModelSpec, cfg: dict) -> list[dict]:
         n, k = gemm_shape(which, spec)
         for m in cfg["gemm_m"]:
             for adapter in contenders:
-                fn = adapter.gemm(which, m, spec)
-                if fn is None:
+                if adapter.name in failures:
                     continue
-                t = time_closure(fn, cfg["warmup_iters"], cfg["timed_iters"], cfg["l2_flush_mib"])
+                try:
+                    fn = adapter.gemm(which, m, spec)
+                    if fn is None:
+                        continue
+                    t = time_closure(fn, cfg["warmup_iters"], cfg["timed_iters"],
+                                     cfg["l2_flush_mib"])
+                except Exception as e:  # a contender that cannot run here is reported by name
+                    failures[adapter.name] = f"{type(e).__name__}: {str(e).strip()[-300:]}"
+                    continue
                 seconds = t["ms_median"] / 1000
                 moved = (n * k + m * (n + k)) * spec.dtype_bytes
                 rows.append({"contender": adapter.name, "shape": which, "m": m, "n": n, "k": k,
                              "tflop_s": 2 * m * n * k / seconds / 1e12,
                              "gb_s": moved / seconds / 1e9} | t)
+    torch_ms = {(r["shape"], r["m"]): r["ms_median"] for r in rows if r["contender"] == "torch"}
+    for r in rows:
+        r["ratio_to_torch"] = r["ms_median"] / torch_ms[(r["shape"], r["m"])] \
+            if (r["shape"], r["m"]) in torch_ms else None
     return rows
 
 
@@ -127,7 +139,7 @@ def task_kernels(model_path: str, dtype: str, cfg: dict, bw_read_gbs: float | No
         "kernels_prefill": attention_rows(contenders, "prefill",
                                           [(n,) for n in cfg["prefill_lengths"]], spec, cfg,
                                           bw_read_gbs, failures),
-        "kernels_gemm": gemm_rows(contenders, spec, cfg),
+        "kernels_gemm": gemm_rows(contenders, spec, cfg, failures),
     }
     for name, rows in tables.items():
         pd.DataFrame(rows).to_csv(out / f"{name}.csv", index=False)

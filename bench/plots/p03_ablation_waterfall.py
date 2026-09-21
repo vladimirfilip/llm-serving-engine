@@ -9,8 +9,7 @@ def draw(ctx):
     data = ctx.table("ablation")
     if data is None:
         return None
-    data = data[data.get("skipped", data.step.map(lambda _: None)).isna()] \
-        if "skipped" in data else data
+    data = data[data.skipped.isna()] if "skipped" in data else data
     fig, axes = figure(1, 2)
     for ax, metric, label in ((axes[0][0], "out_tok_s", "ShareGPT capacity (tokens/s)"),
                               (axes[0][1], "tpot_s", "batch-1 TPOT (ms)")):

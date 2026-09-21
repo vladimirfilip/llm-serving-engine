@@ -10,11 +10,13 @@ from pathlib import Path
 
 from . import env
 from .config import CONFIG_DIR, load_config, load_engine
+from .engines.base import CheckFailed
 from .gpu_tasks import run_task
 from .modelspec import ModelSpec
 from .run import Run
 from .suites import SUITE_ORDER, suite_function
-from .suites.common import SuiteSkipped, datasets_dir, ensure_env
+from .suites.checks import load_checks
+from .suites.common import SuiteSkipped, datasets_dir, engine_session, ensure_env
 from .workloads.prepare import prepare_data
 from .workloads.synthetic import write_synthetic
 
@@ -26,22 +28,38 @@ def missing_hardware_fields(hw: dict) -> list[str]:
 
 
 def cmd_env_check(args: argparse.Namespace) -> int:
-    cfg = load_config()
-    versions = env.package_versions()
-    print(env.format_package_table(versions))
+    """The package inventory and hardware state; with `--engines`, also each engine's preflight
+    checks (GPU idle, prefix cache, token accounting, bursts, tokenizer, client), which write
+    `checks.json` and fail the command when a MUST check fails."""
+    cfg = load_config(args.config_dir or CONFIG_DIR)
+    print(env.format_package_table(env.package_versions()))
     missing = missing_hardware_fields(cfg.hardware)
     if missing and not args.allow_unlocked:
         print(f"hardware.yaml leaves required fields unset: {', '.join(missing)}", file=sys.stderr)
         return 1
     if not env.gpu_available():
         print("no NVIDIA driver: GPU checks skipped")
+    elif args.engines is None:
+        lock = env.lock_clocks(cfg.hardware)
+        print(f"gpu: {json.dumps(env.gpu_facts(cfg.hardware['gpu_index']))}")
+        print(f"clocks locked: {lock.locked} {lock.error}")
+        if not lock.locked and not args.allow_unlocked:
+            return 1
+    if args.engines is None:
         return 0
-    lock = env.lock_clocks(cfg.hardware)
-    print(f"gpu: {json.dumps(env.gpu_facts(cfg.hardware['gpu_index']))}")
-    print(f"clocks locked: {lock.locked} {lock.error}")
-    if not lock.locked and not args.allow_unlocked:
-        return 1
-    return 0
+    run = open_run(args)
+    ok = True
+    for engine in args.engines.split(","):
+        try:
+            with engine_session(run, engine, "env-check"):
+                pass
+        except CheckFailed as e:
+            print(f"{engine}: FAILED {e}", file=sys.stderr)
+            ok = False
+            continue
+        for r in load_checks(run)[engine]["results"]:
+            print(f"{engine}: {r['name']}: {'pass' if r['passed'] else 'FAIL'} {r['detail']}")
+    return 0 if ok else 1
 
 
 def cmd_bwprobe(_args: argparse.Namespace) -> int:
@@ -57,8 +75,8 @@ def cmd_bwprobe(_args: argparse.Namespace) -> int:
     return 0
 
 
-def add_run_flags(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--engines", default="ours")
+def add_run_flags(parser: argparse.ArgumentParser, engines: str | None = "ours") -> None:
+    parser.add_argument("--engines", default=engines)
     parser.add_argument("--run-id")
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--force", action="store_true")
@@ -210,8 +228,8 @@ def cmd_prepare_data(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bench")
     commands = parser.add_subparsers(dest="command", required=True)
-    check = commands.add_parser("env-check", help="package inventory, GPU idle and clock lock")
-    check.add_argument("--allow-unlocked", action="store_true")
+    check = commands.add_parser("env-check", help="package inventory, clock lock, engine checks")
+    add_run_flags(check, engines=None)
     check.set_defaults(fn=cmd_env_check)
     probe = commands.add_parser("bwprobe", help="measure read and copy bandwidth, no engine up")
     probe.set_defaults(fn=cmd_bwprobe)

@@ -53,7 +53,7 @@ def test_a_busy_gpu_aborts_the_engine_and_the_result_is_recorded(run, monkeypatc
     monkeypatch.setattr(env, "gpu_available", lambda: True)
     monkeypatch.setattr(env, "compute_pids", lambda: [4242])
     monkeypatch.setattr(env, "gpu_utilization_pct", lambda _index: 60)
-    monkeypatch.setattr(checks, "IDLE_SETTLE_S", 0.0)
+    monkeypatch.setattr(checks, "IDLE_SETTLE_S", 0.0)  # read when the check runs, not at import
     with pytest.raises(CheckFailed, match="GPU not idle"):
         checks.require_idle_gpu(run, "ours")
     saved = checks.load_checks(run)["ours"]["gpu_idle"]

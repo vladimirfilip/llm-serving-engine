@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pandas as pd
@@ -13,7 +15,7 @@ from ..client.runner import run_open_loop
 from ..run import Run
 from ..workloads.arrivals import poisson_schedule, request_count
 from ..workloads.workloads import Request, fixed_requests, make_requests
-from .common import Session, guarded, load_datasets
+from .common import Session, engine_session, guarded, load_datasets
 from .probe import load_capacity, ref_capacity_rps
 from .session_tools import Relauncher, StatsPoller
 
@@ -137,9 +139,9 @@ def measure_utilization(
     peak device memory it reached."""
     cfg = session.run.cfg.suite["memory"]
     time.sleep(1.5)  # one GPU-monitor status sample after startup
-    out = {"idle_device_bytes": device_used(session), "idle_breakdown": None}
     stats = session.adapter.stats()
-    out["idle_breakdown"] = stats and stats.get("memory_bytes")
+    out = {"idle_device_bytes": device_used(session),
+           "idle_breakdown": stats and stats.get("memory_bytes")}
     if session.spec.name == "ours" and "ours" in capacity:
         half = 0.5 * capacity["ours"]["sharegpt"]["capacity_rps"]
         sharegpt_load(session, data, half, cfg["kv_util_duration_s"], 1)
@@ -174,17 +176,22 @@ def exhaustion(session: Session, cfg: dict, max_model_len: int) -> dict:
 
 
 def recovered(session: Session, recover_s: float) -> bool:
-    """Whether the server answers a 16-token request within `recover_s` of the overload."""
+    """Whether `/health` is up and a 16-token request completes within `recover_s` of the
+    overload."""
     deadline = time.perf_counter() + recover_s
     while time.perf_counter() < deadline:
         if session.adapter.proc.exited():
             return False
         try:
+            with urllib.request.urlopen(session.adapter.base_url()
+                                        + session.spec.health_path, timeout=5):
+                pass
             body = session.adapter.complete([1, 2, 3], 16)
             if body["usage"]["completion_tokens"] == 16:
                 return True
-        except Exception:  # any failure just means "not yet"
-            time.sleep(1.0)
+        except (urllib.error.URLError, OSError, KeyError, ValueError):
+            pass
+        time.sleep(1.0)
     return False
 
 
@@ -208,8 +215,6 @@ def sweep_peak_memory(run: Run, engine: str) -> int | None:
 
 
 def execute(run: Run, engines: list[str]) -> None:
-    from .common import engine_session
-
     data = load_datasets(run)
     cfg = run.cfg.suite["memory"]
     capacity = load_capacity(run)
@@ -218,16 +223,21 @@ def execute(run: Run, engines: list[str]) -> None:
     for engine in engines:
         folder = run.phase_dir("memory") / engine
         folder.mkdir(exist_ok=True)
+        util = None
         with guarded(run, "memory", engine), engine_session(run, engine, "memory_util") as s:
             util = measure_utilization(s, data, capacity, ref_rps, folder)
+        if util is None:
+            continue
         for phase in ("idle", "loaded"):
             for component, nbytes in (util.get(f"{phase}_breakdown") or {}).items():
                 breakdown.append({"engine": engine, "phase": phase, "component": component,
                                   "bytes": nbytes})
+        sweep_peak = sweep_peak_memory(run, engine)
         device.append({"engine": engine, "idle_bytes": util["idle_device_bytes"],
-                       "peak_bytes": sweep_peak_memory(run, engine) or util["peak_device_bytes"],
-                       "peak_source": "sweep" if sweep_peak_memory(run, engine) else "kv_util run"})
-        grid += [{"engine": engine, **c} for c in capacity_grid(run, engine, data, folder)]
+                       "peak_bytes": sweep_peak or util["peak_device_bytes"],
+                       "peak_source": "sweep" if sweep_peak else "kv_util run"})
+        with guarded(run, "memory", engine):
+            grid += [{"engine": engine, **c} for c in capacity_grid(run, engine, data, folder)]
         with guarded(run, "memory", engine), Relauncher(run, engine, "memory_exhaustion") as up:
             exhausted.append({"engine": engine,
                               **exhaustion(up.session(), cfg, run.cfg.model["max_model_len"])})

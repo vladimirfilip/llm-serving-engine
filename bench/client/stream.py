@@ -135,10 +135,11 @@ def _on_event(payload: bytes, rec: dict, times: list[float], now: float,
     if usage := event.get("usage"):
         rec["prompt_tokens_usage"] = usage["prompt_tokens"]
         rec["completion_tokens_usage"] = usage["completion_tokens"]
-    choices = event.get("choices")
-    if choices and choices[0].get("text"):
-        times.append(now)
-        if (lp := choices[0].get("logprobs")) and lp.get("token_logprobs"):
+    if choices := event.get("choices"):
+        choice = choices[0]
+        if choice.get("text"):
+            times.append(now)
+        if (lp := choice.get("logprobs")) and lp.get("token_logprobs"):
             rec["token_logprobs"].append(lp["token_logprobs"][0])
             token = lp.get("tokens", [""])[0]
             if token.startswith("token_id:"):  # engines that return plain text have no ids

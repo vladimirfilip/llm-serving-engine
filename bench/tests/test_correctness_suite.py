@@ -91,3 +91,20 @@ def test_an_engine_that_matches_the_reference_passes_the_gates_it_can_be_judged_
     # the gates judge the engine named `ours`; a fake named mock is measured but not gated
     assert all(g["passed"] is None for g in summary["gates"].values())
     assert (real_model_run.dir / "tables" / "correctness.csv").exists()
+
+
+def test_batch_invariance_is_unavailable_not_perfect_when_an_engine_returns_no_token_ids(run):
+    from bench.engines.base import Launch
+    from bench.suites.common import engine_session
+
+    data = correctness.load_datasets(run)
+    launch = Launch(args_add=["--token-ids=false"])
+    with engine_session(run, "mock", "t", launch, checks=False) as s:
+        out = correctness.run_batch_invariance(s, correctness.select_prompts(run), data)
+    assert out == {"unavailable": "the engine returned no token ids, so runs cannot be compared"}
+
+
+def test_generation_keeps_a_record_with_no_ids_but_drops_one_with_missing_ids():
+    assert correctness.complete_tokens({"token_ids": [], "completion_tokens_usage": 5})
+    assert correctness.complete_tokens({"token_ids": [1, 2], "completion_tokens_usage": 2})
+    assert not correctness.complete_tokens({"token_ids": [1], "completion_tokens_usage": 2})

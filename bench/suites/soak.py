@@ -70,29 +70,36 @@ def windowed(records: pd.DataFrame, window_s: float, duration_s: float) -> pd.Da
 
 def soak_verdict(tokens: pd.DataFrame, latency: pd.DataFrame, memory: pd.DataFrame,
                  errors: int, duration_s: float, limits: dict) -> dict:
-    """The pass criteria: the evaluation part of the run against its reference part."""
+    """The pass criteria: the evaluation part of the run against its reference part. A criterion
+    whose windows hold no samples is `passed: None` with a reason, and does not count as failed."""
     ref_lo, ref_hi = (f * duration_s for f in REFERENCE_FRACTION)
     eval_lo = EVALUATION_START_FRACTION * duration_s
 
     def part(frame: pd.DataFrame, column: str, lo: float, hi: float) -> np.ndarray:
-        inside = frame[(frame.t_s >= lo) & (frame.t_s < hi)][column].dropna()
-        return inside.to_numpy()
+        return frame[(frame.t_s >= lo) & (frame.t_s < hi)][column].dropna().to_numpy()
 
-    mem_ref = np.median(part(memory, "mem_used_bytes", ref_lo, ref_hi))
-    mem_growth = (part(memory, "mem_used_bytes", eval_lo, duration_s).max() - mem_ref) / mem_ref
-    tok_ref = np.median(part(tokens, "out_tok_s", ref_lo, ref_hi))
-    tok_drift = abs(np.median(part(tokens, "out_tok_s", eval_lo, duration_s)) - tok_ref) / tok_ref
-    p99_ref = np.median(part(latency, "tpot_p99", ref_lo, ref_hi))
-    p99_growth = (np.median(part(latency, "tpot_p99", eval_lo, duration_s)) - p99_ref) / p99_ref
-    checks = {
-        "gpu_mem_growth": (mem_growth, limits["gpu_mem_growth_max_frac"]),
-        "throughput_drift": (tok_drift, limits["throughput_drift_max_frac"]),
-        "p99_tpot_growth": (p99_growth, limits["p99_tpot_drift_max_frac"]),
+    def criterion(frame: pd.DataFrame, column: str, limit: float, measure) -> dict:
+        ref, later = part(frame, column, ref_lo, ref_hi), part(frame, column, eval_lo, duration_s)
+        if not len(ref) or not len(later):
+            return {"value": None, "limit": limit, "passed": None,
+                    "reason": f"no {column} samples in the reference or evaluation window"}
+        value = float(measure(ref, later))
+        return {"value": value, "limit": limit, "passed": bool(value <= limit)}
+
+    out = {
+        "gpu_mem_growth": criterion(memory, "mem_used_bytes", limits["gpu_mem_growth_max_frac"],
+                                    lambda ref, later: (later.max() - np.median(ref))
+                                    / np.median(ref)),
+        "throughput_drift": criterion(tokens, "out_tok_s", limits["throughput_drift_max_frac"],
+                                      lambda ref, later: abs(np.median(later) - np.median(ref))
+                                      / np.median(ref)),
+        "p99_tpot_growth": criterion(latency, "tpot_p99", limits["p99_tpot_drift_max_frac"],
+                                     lambda ref, later: (np.median(later) - np.median(ref))
+                                     / np.median(ref)),
+        "errors": {"value": errors, "limit": 0, "passed": errors == 0},
     }
-    out = {name: {"value": float(v), "limit": lim, "passed": bool(v <= lim)}
-           for name, (v, lim) in checks.items()}
-    out["errors"] = {"value": errors, "limit": 0, "passed": errors == 0}
-    out["passed"] = all(c["passed"] for c in out.values())
+    verdicts = [c["passed"] for c in out.values()]
+    out["passed"] = (False if False in verdicts else None if None in verdicts else True)
     return out
 
 
@@ -106,6 +113,7 @@ def execute(run: Run, engines: list[str]) -> None:
     ref = ref_capacity_rps(run, "sharegpt", engines)
     workload = run.cfg.workloads["sharegpt"]
     index = run.cfg.workload_index("sharegpt")
+    summary = []
     for engine in wanted:
         folder = run.phase_dir("soak") / engine
         folder.mkdir(exist_ok=True)
@@ -127,11 +135,13 @@ def execute(run: Run, engines: list[str]) -> None:
         memory = memory.iloc[:: max(1, int(cfg["sample_s"]))]
         tokens.to_csv(folder / "throughput.csv", index=False)
         latency.to_csv(folder / "latency.csv", index=False)
-        memory[["t_s", "mem_used_bytes", "server_rss_bytes"]].to_csv(folder / "memory.csv",
-                                                                     index=False)
+        errors = df[df.status != "ok"].t_done.fillna(df.t_send)
+        memory["cumulative_errors"] = [int((errors <= t).sum()) for t in memory.t_s]
+        memory[["t_s", "mem_used_bytes", "server_rss_bytes", "cumulative_errors"]].to_csv(
+            folder / "memory.csv", index=False)
         verdict = soak_verdict(tokens, latency, memory, int((df.status != "ok").sum()),
                                duration_s, run.cfg.suite["soak_pass"])
         pd.Series(verdict).to_json(folder / "verdict.json")
-        pd.DataFrame([{"engine": engine, "passed": verdict["passed"]}
-                      | {k: v["value"] for k, v in verdict.items() if k != "passed"}]
-                     ).to_csv(run.dir / "tables" / "soak.csv", index=False)
+        summary.append({"engine": engine, "passed": verdict["passed"]}
+                       | {k: v["value"] for k, v in verdict.items() if k != "passed"})
+    pd.DataFrame(summary).to_csv(run.dir / "tables" / "soak.csv", index=False)
