@@ -1,0 +1,16 @@
+gpu_index: 0
+# Locked with nvidia-smi -lgc <mhz>,<mhz>. The driver settles 1900 on its 1897 MHz bin, inside the
+# lock check's 2% tolerance, and a BF16 GEMM there draws ~124 W of the 250 W limit, so the lock
+# never throttles.
+gpu_clock_mhz: 1900
+boost_clock_mhz: 2510          # datasheet boost: the clock the peak TFLOP/s below is quoted at
+mem_clock_mhz: 14001           # the only memory clock the card offers
+power_limit_w: null
+# Vendor spec page for the RTX 5070: 12 GB GDDR7 on a 192-bit bus, 988 AI TOPS (FP4, sparse).
+# 192 bit / 8 * 28 Gbps = 672 GB/s. BF16 dense with FP32 accumulate is 988 / 16 = 61.75 TFLOP/s.
+peak_tflops_bf16_dense: 61.75
+peak_mem_bw_gbs: 672.0
+cpu_affinity:
+  server: "0-4"
+  client: "5-8"
+nsys_path: nsys

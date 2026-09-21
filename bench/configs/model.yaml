@@ -1,0 +1,8 @@
+hf_repo: unsloth/Llama-3.2-3B-Instruct
+local_path: /models/Llama-3.2-3B-Instruct
+dtype: bfloat16
+served_model_name: model
+max_model_len: 16384         # vLLM refuses 32768 at 0.90 utilisation: weights leave ~30k KV tokens
+max_num_seqs: 64            # 256 fails the engine's piecewise-graph self-check; the KV pool holds ~36k tokens
+gpu_mem_util: 0.90
+precisions: [bfloat16]

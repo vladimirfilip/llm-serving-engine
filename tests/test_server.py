@@ -140,22 +140,6 @@ def test_generate_builds_sampling_params_from_the_body():
 
 
 @pytest.mark.asyncio
-async def test_loadgen_client_parses_this_server_s_sse_stream():
-    """The only test where the server's SSE events and the load generator's parser meet."""
-    from llm_serving_engine.loadgen.client import load_client, send_request
-
-    app = create_app(FakeEngine(on_submit=put_all(1, 2, 3, DONE)))
-    async with load_client("http://test", transport=httpx.ASGITransport(app=app)) as client:
-        result = await send_request(client, "hello")
-
-    assert result["success"] is True
-    assert result["num_tokens_received"] == 3
-    assert result["prompt_tokens"] == 1
-    assert result["output_tokens"] == 3
-    assert len(result["token_times"]) == 3
-
-
-@pytest.mark.asyncio
 async def test_a_client_that_disconnects_mid_stream_releases_its_channel():
     """TestClient drains every response, so it can't walk away mid-stream; cancelling an
     httpx request over ASGITransport is what a dropped connection does to the app."""

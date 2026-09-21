@@ -18,17 +18,31 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff", "matplotlib>=3.8"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff"]
+bench = [
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "pyyaml",
+    "aiohttp",
+    "orjson",
+    "matplotlib>=3.8",
+    "scipy",
+    "psutil",
+    "nvidia-ml-py",
+    "datasets",
+    "lm-eval",
+]
 
 [project.scripts]
 llm-serve = "llm_serving_engine.server:main"
-llm-loadgen = "llm_serving_engine.loadgen.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
+testpaths = ["tests", "bench/tests"]
 markers = [
     "cuda: needs a CUDA device; a CPU-only machine deselects these with -m 'not cuda'",
 ]

@@ -1,0 +1,120 @@
+seed: 1234
+
+slo:
+  sharegpt:    {ttft_ms: 500,  tpot_ms: 50}
+  short_short: {ttft_ms: 200,  tpot_ms: 50}
+  long_short:  {ttft_ms: 1500, tpot_ms: 50}
+  short_long:  {ttft_ms: 200,  tpot_ms: 50}
+  ctx32k:      {ttft_ms: 8000, tpot_ms: 80}
+slo_attainment_target: 0.90
+
+workloads:
+  sharegpt:    {kind: sharegpt, n_pool: 4000, max_prompt: 1024, max_total: 2048}
+  short_short: {kind: fixed, prompt: 128,   output: 128}
+  long_short:  {kind: fixed, prompt: 4096,  output: 128}
+  short_long:  {kind: fixed, prompt: 128,   output: 1024}
+  ctx32k:      {kind: fixed, prompt: 32000, output: 128, requires_max_model_len: 32768}
+
+load_sweep:
+  window: [0.1, 0.9]
+  target_duration_s: 120
+  warmup_requests: 32
+  probe_requests: 512
+  client_lag_p99_limit_ms: 5
+  timeout_s: 300
+  error_rate_limit: 0.01
+  per_workload:
+    sharegpt:    {fractions: [0.05,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0,1.1,1.25], repeats: 3, min_requests: 200, max_requests: 4000}
+    short_short: {fractions: [0.1,0.3,0.5,0.7,0.9,1.0,1.1], repeats: 1, min_requests: 200, max_requests: 4000}
+    long_short:  {fractions: [0.1,0.3,0.5,0.7,0.9,1.0,1.1], repeats: 1, min_requests: 200, max_requests: 4000}
+    short_long:  {fractions: [0.1,0.3,0.5,0.7,0.9,1.0,1.1], repeats: 1, min_requests: 100, max_requests: 2000}
+    ctx32k:      {fractions: [0.1,0.3,0.5,0.7,0.9,1.0,1.1], repeats: 1, min_requests: 40,  max_requests: 400}
+  rate_grid_rps_override: null
+
+single_stream:
+  contexts: [128, 512, 2048, 8192, 16384, 32768]
+  decode_tokens: 288
+  skip_tokens: 32
+  repeats: 5
+  ttft_prompts: [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+  ttft_repeats: 10
+  batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+  batch_warmup_s: 15
+  batch_total_s: 60
+
+kernels:
+  warmup_iters: 25
+  timed_iters: 100
+  l2_flush_mib: 256
+  decode_batches: [1, 4, 16, 64, 128]
+  decode_contexts: [512, 2048, 8192, 32768]
+  prefill_lengths: [128, 512, 2048, 8192, 16384, 32768]
+  gemm_m: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  max_kv_fraction_of_gpu_mem: 0.40
+
+nsys:
+  batch_sizes: [1, 16, 64]
+  warm_s: 15
+  capture_s: 10
+
+memory:
+  grid_batches: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+  grid_lengths: [512, 1024, 2048, 4096, 8192, 16384, 32768]
+  cell_timeout_s: 600
+  cell_output_tokens: 128
+  kv_util_rate_fraction: 0.8
+  kv_util_duration_s: 300
+  exhaustion_batch: 256
+  exhaustion_output_tokens: 1024
+  hang_s: 120
+  recover_s: 60
+
+scheduler:
+  interference:
+    background_streams: 16
+    background_prompt: 128
+    background_output: 4096
+    warm_s: 30
+    inject_every_s: 5
+    inject_for_s: 90
+    tail_s: 30
+    inject_prompt: 8192
+    inject_output: 16
+  overload:
+    rate_fraction: 1.5
+    duration_s: 120
+    starvation_ttft_s: 30
+
+soak:
+  engines: [ours]
+  duration_h: 4
+  rate_fraction: 0.6
+  sample_s: 10
+
+coldstart:
+  launches: 3
+
+correctness:
+  n_prompts: 200
+  prompt_len_range: [32, 1024]
+  n_long_prompts: 8
+  long_prompt_len: 16000
+  max_new_tokens: 512
+  long_max_new_tokens: 128
+  ppl_window: 2048
+  gsm8k_fewshot: 5
+  gsm8k_limit: null
+  batch_invariance_prompts: 32
+  batch_invariance_tokens: 256
+  batch_invariance_background: 64
+  confident_gap_nats: 1.0
+  gates:
+    confident_mismatch_rate_max: 0.001
+    mean_abs_dlogprob_vs_baseline_median_max_ratio: 1.5
+    ppl_vs_ref_max_ratio: 1.005
+    gsm8k_flexible_vs_vllm_min_delta_points: -2.0
+
+soak_pass:
+  gpu_mem_growth_max_frac: 0.01
+  throughput_drift_max_frac: 0.03
+  p99_tpot_drift_max_frac: 0.10
