@@ -167,3 +167,15 @@ def test_the_interference_plot_is_sized_by_its_panels_not_its_combinations(tmp_p
         plt.close = original
     width, height = captured["fig"].get_size_inches()
     assert len(captured["fig"].axes) == 2 * 7 and (width, height) == (7 * 7, 4.5 * 8)
+
+
+def test_a_run_whose_every_profile_was_empty_still_builds_a_report(tmp_path):
+    import pandas as pd
+
+    run = fixture_run.write(tmp_path / "r", {"sweep"})
+    pd.DataFrame([{"engine": "ours", "batch": 16, "gpu_busy_fraction": None, "gap_p50": None,
+                   "gap_p99": None, "gap_time_fraction_over_50us": None,
+                   "window_source": "no device events in the capture"}]
+                 ).to_csv(run / "tables" / "nsys.csv", index=False)
+    _, info = build_report(run)
+    assert info["drawn"]["p17"] is None

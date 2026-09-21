@@ -148,4 +148,4 @@ def test_a_capture_with_no_device_events_is_reported_not_a_crash(tmp_path):
     db.commit()
     row, gaps, steps = nsys.analyse(tmp_path / "empty.sqlite", "ours", 1, capture_s=0.020)
     assert row["window_source"] == "no device events in the capture"
-    assert gaps.empty and steps.empty
+    assert row["gpu_busy_fraction"] is None and gaps.empty and steps.empty

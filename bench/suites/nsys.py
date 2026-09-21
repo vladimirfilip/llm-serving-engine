@@ -117,7 +117,8 @@ def analyse(db_path: Path, engine: str, batch: int,
     db = sqlite3.connect(db_path)
     intervals = read_device_intervals(db)
     if not intervals:
-        return ({"engine": engine, "batch": batch,
+        return ({"engine": engine, "batch": batch, "gpu_busy_fraction": None, "gap_p50": None,
+                 "gap_p99": None, "gap_time_fraction_over_50us": None,
                  "window_source": "no device events in the capture"},
                 pd.DataFrame(columns=["engine", "batch", "gap_s"]), pd.DataFrame())
     window, source = capture_window(db, intervals, capture_s)

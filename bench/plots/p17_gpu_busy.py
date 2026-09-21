@@ -8,7 +8,7 @@ from .style import color, figure, finish, ordered
 
 def draw(ctx):
     data = ctx.table("nsys")
-    if data is None:
+    if data is None or data.gpu_busy_fraction.isna().all():
         return None
     fig, axes = figure(1, 2)
     engines, batches = ordered(data.engine), sorted(data.batch.unique())
