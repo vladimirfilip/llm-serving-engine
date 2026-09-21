@@ -31,7 +31,7 @@ bench = [
     "psutil",
     "nvidia-ml-py",
     "datasets",
-    "lm-eval",
+    "lm-eval[api]",
 ]
 
 [project.scripts]

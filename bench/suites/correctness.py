@@ -158,7 +158,9 @@ def run_gsm8k(session: Session, out_dir: Path) -> dict | None:
                "--model_args", args, "--output_path", str(out_dir)]
     if suite["gsm8k_limit"]:
         command += ["--limit", str(suite["gsm8k_limit"])]
-    subprocess.run(command, check=True, capture_output=True, text=True)
+    done = subprocess.run(command, capture_output=True, text=True)
+    if done.returncode:
+        raise RuntimeError(f"lm_eval exited {done.returncode}: {done.stderr[-1500:]}")
     latest = max(out_dir.rglob("results_*.json"), key=lambda p: p.stat().st_mtime)
     results = json.loads(latest.read_text())["results"]["gsm8k"]
     return {"gsm8k_strict": results["exact_match,strict-match"],
