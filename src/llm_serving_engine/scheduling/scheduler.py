@@ -8,22 +8,30 @@ back in. Subclasses differ only in `admission_cap`.
 
   1. DECODING sequences, one token each. Decode tokens don't draw on TOKEN_BUDGET, so a
      client mid-stream is never stalled behind prefill work.
-  2. The PREFILLING sequence continues its chunk, if its next chunk's blocks are free. No
-     one chunk exceeds `max_prefill_chunk`, so a long prompt leaves budget for step 3.
+  2. PREFILLING sequences continue their chunks. A chunk whose blocks aren't free preempts
+     the PREFILLING sequences admitted after it, so prompts that jointly outgrow the pool
+     still finish one at a time. No one chunk exceeds `max_prefill_chunk`, so a long
+     prompt leaves budget for step 3.
   3. Admissions from `waiting` in arrival order, gated by the remaining budget, the
      allocator and `admission_cap`. A head that doesn't fit is skipped, so a short prompt
      doesn't wait on the blocks a long one needs, until MAX_ADMISSION_SKIPS admissions
      have gone ahead of it; from then on nothing is admitted until the head itself fits.
 
-`running` is in admission order, so `running[-1]` is the most recently admitted sequence,
-and when a decode token finds no free block, sequences are preempted from the tail. A
-preempted sequence frees its blocks, returns to the head of `waiting` and later re-prefills
-prompt + generated tokens.
+`running` is in admission order, so `running[-1]` is the most recently admitted sequence.
+A decode token that finds no free block preempts from the tail of `running`, regardless of
+status; a stalled prefill chunk preempts only the PREFILLING sequences admitted after it,
+never one this step already planned, so step 1's decoders are never undone by step 2.
+Either way a preempted sequence frees its blocks, returns to the head of `waiting` and
+later re-prefills prompt + generated tokens. Since every allocated block belongs to some
+running sequence, `scheduler_step` never returns an empty plan while `running` is
+non-empty: every running sequence either runs this step, or is itself preempted to make
+room for one that does.
 
 TOKEN_BUDGET bounds one iteration's prefill compute, so a long prompt can't spike
 inter-token latency for the sequences decoding beside it, and no single prompt may take
-more than MAX_PREFILL_CHUNK_FRACTION of it, so its chunks never starve admission until it
-finishes prefilling. MAX_CONCURRENT_SEQUENCES bounds
+more than MAX_PREFILL_CHUNK_FRACTION of it, so its own chunks never starve admission. A
+step that preempts to fit one, though, spends the rest of that step's budget on it (see
+`_plan_prefill_continuations`). MAX_CONCURRENT_SEQUENCES bounds
 the decode batch: every running sequence gets a token every iteration, so iteration time
 grows with `running`; past the cap, demand waits in `waiting` as schedule latency.
 """
@@ -65,7 +73,7 @@ class Scheduler(ABC):
     ) -> BatchPlan:
         plan = BatchPlan()
         self._plan_decodes(running, waiting, allocator, plan)
-        budget = self._plan_prefill_continuations(running, allocator, plan)
+        budget = self._plan_prefill_continuations(running, waiting, allocator, plan)
         self._plan_admissions(running, waiting, allocator, plan, budget)
         return plan
 
@@ -84,21 +92,32 @@ class Scheduler(ABC):
             i += 1
 
     def _plan_prefill_continuations(
-        self, running: list[Sequence], allocator: KVAllocator, plan: BatchPlan
+        self, running: list[Sequence], waiting: deque[Sequence], allocator: KVAllocator,
+        plan: BatchPlan,
     ) -> int:
-        """Returns the budget left for admissions. A chunk that doesn't fit waits and
-        leaves no budget, so no later arrival takes the blocks it waits for; the
-        PREFILLING sequence stays the tail, where decodes preempt first."""
+        """Returns the budget left for admissions. A chunk that doesn't fit preempts the
+        PREFILLING sequences admitted after it; with nothing left to preempt, it waits and
+        leaves no budget, so no later arrival takes the blocks it waits for. A preemption
+        also leaves no budget, even on success: it stops every later prefill continuation
+        this step too, so none of them can be admitted onto the blocks just freed."""
         budget = self.token_budget
-        for seq in running:
+        # Indexed: preemption pops from behind `i`, which this loop hasn't reached yet.
+        i = 0
+        while i < len(running):
+            seq = running[i]
             if seq.status != "PREFILLING" or budget == 0:
+                i += 1
                 continue
             chunk = min(seq.num_tokens - seq.prefill_progress, budget, self.max_prefill_chunk)
-            if not allocator.allocate(seq, chunk):
+            preempted_before = len(plan.preempted)
+            if not _preempt_prefills_until_allocated(
+                seq, chunk, i, running, waiting, allocator, plan
+            ):
                 return 0
             plan.add(seq, n_tokens=chunk, is_prefill_chunk=True)
-            budget -= chunk
+            budget = 0 if len(plan.preempted) > preempted_before else budget - chunk
             _advance_prefill(seq, chunk)
+            i += 1
         return budget
 
     def _plan_admissions(
@@ -212,11 +231,38 @@ def _preempt_until_allocated(
     False if `seq` itself, as the tail, was preempted."""
     while not allocator.allocate(seq, new_tokens=1):
         victim = running.pop()
-        allocator.free(victim.block_table)
-        victim.prefill_progress = 0
-        victim.status = "WAITING"
-        waiting.appendleft(victim)
-        plan.preempted.append(victim.seq_id)
+        _preempt(victim, waiting, allocator, plan)
         if victim is seq:
             return False
     return True
+
+
+def _preempt_prefills_until_allocated(
+    seq: Sequence, chunk: int, index: int, running: list[Sequence], waiting: deque[Sequence],
+    allocator: KVAllocator, plan: BatchPlan,
+) -> bool:
+    """Preempts the latest-admitted PREFILLING sequence behind `running[index]` (`seq`)
+    until `chunk` fits. False once none is left -- which can spend a victim's progress
+    without `seq` ending up allocated, if any sequence this pass won't touch (a planned
+    decoder, most often, wherever it sits in `running`) holds blocks; rare, and wasted
+    recompute rather than a correctness problem, since the victim still re-prefills
+    correctly next step."""
+    while not allocator.allocate(seq, chunk):
+        victim_index = next(
+            (j for j in range(len(running) - 1, index, -1) if running[j].status == "PREFILLING"),
+            None,
+        )
+        if victim_index is None:
+            return False
+        _preempt(running.pop(victim_index), waiting, allocator, plan)
+    return True
+
+
+def _preempt(
+    victim: Sequence, waiting: deque[Sequence], allocator: KVAllocator, plan: BatchPlan
+) -> None:
+    allocator.free(victim.block_table)
+    victim.prefill_progress = 0
+    victim.status = "WAITING"
+    waiting.appendleft(victim)
+    plan.preempted.append(victim.seq_id)

@@ -256,8 +256,8 @@ class InferenceEngine:
                     in_flight = (plan, {seq.seq_id: seq for seq in self.running})
                     self._plan_queue.put(in_flight)
                 else:
-                    # Nothing runnable until a request arrives: an empty plan leaves nothing
-                    # running, so no block or budget can come free on its own.
+                    # Nothing runnable until a request arrives: the scheduler plans something
+                    # whenever `running` is non-empty, so an empty plan leaves nothing running.
                     self._admit_ingress(self.ingress.get())
 
     def _apply(

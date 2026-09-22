@@ -16,7 +16,7 @@ from llm_serving_engine.scheduling.scheduler import (
     ContinuousBatchedScheduler,
     StaticBatchedScheduler,
 )
-from tests.factories import decoding_sequence, make_sequence
+from tests.factories import decoding_sequence, make_sequence, prefilling_sequence
 
 SCHEDULER_CLASSES = [ContinuousBatchedScheduler, StaticBatchedScheduler]
 
@@ -98,6 +98,103 @@ def test_prefill_chunk_without_free_blocks_waits_without_losing_progress(schedul
     assert len(plan) == 0
     assert seq.prefill_progress == 4
     assert seq.block_table.num_tokens == 4
+
+
+@pytest.mark.parametrize("scheduler_cls", SCHEDULER_CLASSES)
+def test_prefills_that_together_exceed_the_pool_do_not_stall_each_other(scheduler_cls):
+    alloc = BlockAllocator(num_blocks=4, block_size=4)
+    oldest = prefilling_sequence(alloc, seq_id=1, prompt_len=12, progress=8)
+    latest = prefilling_sequence(alloc, seq_id=2, prompt_len=12, progress=8)
+    running, waiting = [oldest, latest], deque()
+
+    plan = scheduler_cls().scheduler_step(running, waiting, alloc)
+
+    assert [e.seq_id for e in plan] == [oldest.seq_id]
+    assert oldest.status == "DECODING"
+    assert plan.preempted == [latest.seq_id]
+    assert running == [oldest]
+    assert list(waiting) == [latest]
+
+
+def test_a_preempted_prefill_frees_its_blocks_and_restarts_from_zero():
+    alloc = BlockAllocator(num_blocks=4, block_size=4)
+    oldest = prefilling_sequence(alloc, seq_id=1, prompt_len=12, progress=8)
+    latest = prefilling_sequence(alloc, seq_id=2, prompt_len=12, progress=8)
+
+    ContinuousBatchedScheduler().scheduler_step([oldest, latest], deque(), alloc)
+
+    assert latest.status == "WAITING"
+    assert latest.prefill_progress == 0
+    assert latest.block_table.physical_blocks == []
+    assert latest.block_table.num_tokens == 0
+
+
+def test_a_preempted_prefills_progress_is_not_recovered_in_the_same_step():
+    """A preemption zeroes the step's remaining budget even on success: without that, the
+    victim could be re-admitted onto the very blocks it just freed, in the same step whose
+    `plan.preempted` reports it lost its progress."""
+    scheduler = ContinuousBatchedScheduler(token_budget=8)  # chunks of at most 4
+    alloc = BlockAllocator(num_blocks=11, block_size=4)
+    oldest = prefilling_sequence(alloc, seq_id=1, prompt_len=40, progress=8)
+    latest = prefilling_sequence(alloc, seq_id=2, prompt_len=20, progress=16)
+    alloc.allocate(make_sequence(seq_id=99), 20)  # holds the other 5 blocks
+    running, waiting = [oldest, latest], deque()
+
+    plan = scheduler.scheduler_step(running, waiting, alloc)
+
+    assert [e.seq_id for e in plan] == [oldest.seq_id]
+    assert plan.preempted == [latest.seq_id]
+    assert list(waiting) == [latest]
+    assert latest.prefill_progress == 0
+
+
+def test_a_stalled_prefill_waits_for_decoders_instead_of_preempting_them():
+    """Also the only test where the PREFILLING-only victim filter matters: without it, this
+    would preempt the decoder, which already has a plan entry from step 1 -- the engine
+    would then run that entry against a sequence dropped from `running`."""
+    alloc = BlockAllocator(num_blocks=3, block_size=4)
+    prefill = prefilling_sequence(alloc, seq_id=1, prompt_len=12, progress=8)
+    decoder = decoding_sequence(alloc, seq_id=2, prompt_len=3)
+    running, waiting = [prefill, decoder], deque()
+
+    plan = ContinuousBatchedScheduler().scheduler_step(running, waiting, alloc)
+
+    assert [e.seq_id for e in plan] == [decoder.seq_id]
+    assert plan.preempted == []
+    assert running == [prefill, decoder]
+
+
+def test_a_stalled_prefill_preempts_the_latest_prefill_behind_it_first():
+    alloc = BlockAllocator(num_blocks=4, block_size=4)
+    first = prefilling_sequence(alloc, seq_id=1, prompt_len=12, progress=4)
+    second = prefilling_sequence(alloc, seq_id=2, prompt_len=12, progress=4)
+    third = prefilling_sequence(alloc, seq_id=3, prompt_len=12, progress=8)
+    running, waiting = [first, second, third], deque()
+
+    plan = ContinuousBatchedScheduler().scheduler_step(running, waiting, alloc)
+
+    assert [e.seq_id for e in plan] == [first.seq_id]
+    assert plan.preempted == [third.seq_id]
+    assert running == [first, second]
+    assert list(waiting) == [third]
+
+
+def test_running_sequences_always_yield_a_plan_until_fully_drained():
+    alloc = BlockAllocator(num_blocks=6, block_size=4)
+    running = [prefilling_sequence(alloc, i, prompt_len=16, progress=8) for i in (1, 2, 3)]
+    waiting = deque()
+    scheduler = ContinuousBatchedScheduler()
+
+    for _ in range(40):
+        plan = scheduler.scheduler_step(running, waiting, alloc)
+        assert running == [] or len(plan) > 0
+        for seq in list(running):
+            if seq.status == "DECODING":
+                alloc.free(seq.block_table)
+                running.remove(seq)
+        if not running and not waiting:
+            break
+    assert not running and not waiting, "never drained: a live-lock hid behind a non-empty plan"
 
 
 def test_a_blocked_prefill_continuation_stops_admission_behind_it():

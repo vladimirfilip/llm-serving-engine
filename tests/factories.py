@@ -35,6 +35,18 @@ def decoding_sequence(allocator: KVAllocator, seq_id: int, prompt_len: int) -> S
     return seq
 
 
+def prefilling_sequence(
+    allocator: KVAllocator, seq_id: int, prompt_len: int, progress: int
+) -> Sequence:
+    """A sequence mid-prefill, holding blocks for the tokens it has already chunked."""
+    seq = make_sequence(
+        seq_id=seq_id, prompt_tokens=[0] * prompt_len, status="PREFILLING",
+        prefill_progress=progress,
+    )
+    assert allocator.allocate(seq, progress)
+    return seq
+
+
 def admit(seq: Sequence, n_tokens: int) -> BatchEntry:
     """scheduler_step's bookkeeping for one prefill chunk of `seq`."""
     seq.prefill_progress += n_tokens
