@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 
 from llm_serving_engine.config import EngineConfig, KVCacheConfig, ModelConfig, ServerConfig
@@ -79,6 +80,12 @@ class FakeTokenizer:
     def encode_prompt(self, text: str) -> list[int]:
         return [ord(c) for c in text]
 
+    def decode_incremental(self, seq_id: int, generated_tokens: list[int]) -> str:
+        return f"<{generated_tokens[-1]}>"
+
+    def forget(self, seq_id: int) -> None:
+        pass
+
 
 class FakeModelRunner:
     """No weights: every sequence that owes a token gets TOKEN, finishing at max_tokens."""
@@ -91,11 +98,13 @@ class FakeModelRunner:
         self.freed: list[int] = []
         self.fail_next_forward = False
         self.device_lost = False
+        self.forward_calls = 0
 
     def device_usable(self):
         return not self.device_lost
 
     def forward(self, plan, seqs):
+        self.forward_calls += 1
         if self.fail_next_forward:
             self.fail_next_forward = False
             raise RuntimeError("injected forward failure")
@@ -125,6 +134,19 @@ class FakeModelRunner:
                 "cuda_graph_pool": 4, "other": 1}
 
 
+class GatedModelRunner(FakeModelRunner):
+    """Holds every forward pass until `gate` is set, so a test can drive the engine to an
+    exact point mid-iteration."""
+
+    def __init__(self, gate: threading.Event):
+        super().__init__()
+        self.gate = gate
+
+    def forward(self, plan, seqs):
+        self.gate.wait()
+        return super().forward(plan, seqs)
+
+
 async def read_stream(q: asyncio.Queue) -> list:
     items = []
     while not items or items[-1] not in (DONE, ABORTED):
@@ -137,3 +159,7 @@ def wait_until(condition, timeout: float = 5) -> None:
     while not condition():
         assert time.monotonic() < deadline, "condition never held"
         time.sleep(0.005)
+
+
+def seq_ids(seqs) -> set[int]:
+    return {seq.seq_id for seq in seqs}

@@ -1,10 +1,11 @@
 """Wires the IO thread to the scheduler and GPU-worker threads.
 
-The IO thread (asyncio) owns `submit`. The scheduler thread drains `ingress`, runs
-`scheduler_step` and applies each iteration's results. The GPU worker thread runs
-`model_runner.forward` on each plan. Every hop is a `queue.SimpleQueue`: a blocked `get`
-releases the GIL and returns as soon as the other side puts, so no thread polls, and
-`stop` puts None on each queue to wake whichever thread is waiting.
+The IO thread (asyncio) owns `submit` and `cancel`. The scheduler thread drains `ingress`
+(requests and cancellations both, in the order they arrived) and applies each iteration's
+results. The GPU worker thread runs `model_runner.forward` on each plan. Every hop is a
+`queue.SimpleQueue`: a blocked `get` releases the GIL and returns as soon as the other side
+puts, so no thread polls, and `stop` puts None on `ingress` and `_plan_queue` to wake
+whichever thread is waiting on each.
 """
 
 from __future__ import annotations
@@ -15,7 +16,9 @@ import queue
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 
@@ -62,12 +65,22 @@ class IngressRequest:
 
 
 @dataclass(slots=True)
+class CancelRequest:
+    """Crosses `ingress` behind whatever `IngressRequest` admits the same seq_id, so a
+    cancellation can never overtake -- and silently miss -- the admission it targets."""
+
+    seq_id: int
+
+
+@dataclass(slots=True)
 class Submission:
     seq_id: int
     output_queue: asyncio.Queue
     prompt_len: int
     tokenizer: TokenizerWrapper  # the tokenizer that encoded the prompt decodes its tokens
     logprobs: list[float] | None = None  # grows one entry per token before that token is queued
+    # Ends this request if its stream stops reading before DONE or ABORTED.
+    cancel: Callable[[], None] = lambda: None
 
 
 class InferenceEngine:
@@ -107,7 +120,7 @@ class InferenceEngine:
             if graphs:
                 model_runner.capture_decode_graphs(decode_buckets)
                 model_runner.capture_piecewise_graphs(piecewise_buckets)
-        self.ingress: queue.SimpleQueue[IngressRequest | None] = queue.SimpleQueue()
+        self.ingress: queue.SimpleQueue[IngressRequest | CancelRequest | None] = queue.SimpleQueue()
         self.waiting: deque[Sequence] = deque()
         self.running: list[Sequence] = []
         self._plan_queue: queue.SimpleQueue[tuple[BatchPlan, dict[int, Sequence]] | None] = (
@@ -160,8 +173,16 @@ class InferenceEngine:
                 )
             )
         return Submission(
-            seq_id, output_queue, len(prompt_tokens), self.tokenizer, token_logprobs
+            seq_id, output_queue, len(prompt_tokens), self.tokenizer, token_logprobs,
+            cancel=partial(self.cancel, seq_id),
         )
+
+    def cancel(self, seq_id: int) -> None:
+        """Any thread, even after `close_ingress`: ends `seq_id`'s stream and frees its
+        blocks once the scheduler thread next drains `ingress`. Queued behind whatever
+        `IngressRequest` admitted `seq_id`, so it never overtakes -- and never misses -- a
+        request still waiting to be admitted. A no-op once `seq_id` has already ended."""
+        self.ingress.put(CancelRequest(seq_id))
 
     def close_ingress(self) -> None:
         with self._ingress_lock:
@@ -258,7 +279,7 @@ class InferenceEngine:
                 else:
                     # Nothing runnable until a request arrives: the scheduler plans something
                     # whenever `running` is non-empty, so an empty plan leaves nothing running.
-                    self._admit_ingress(self.ingress.get())
+                    self._process_ingress(self.ingress.get())
 
     def _apply(
         self, outcome: IterationResults | Exception, plan: BatchPlan, seqs: dict[int, Sequence]
@@ -290,13 +311,34 @@ class InferenceEngine:
     def _drain_ingress(self) -> None:
         while True:
             try:
-                self._admit_ingress(self.ingress.get_nowait())
+                self._process_ingress(self.ingress.get_nowait())
             except queue.Empty:
                 return
 
-    def _admit_ingress(self, req: IngressRequest | None) -> None:
-        if req is not None:
-            self.waiting.append(sequence_from_ingress(req))
+    def _process_ingress(self, item: IngressRequest | CancelRequest | None) -> None:
+        if isinstance(item, IngressRequest):
+            self.waiting.append(sequence_from_ingress(item))
+        elif isinstance(item, CancelRequest):
+            self._cancel(item.seq_id)
+
+    def _cancel(self, seq_id: int) -> None:
+        """A no-op once `seq_id` has already ended, since `cancel` may reach here after
+        the scheduler thread has already applied its DONE or aborted it some other way."""
+        seq = self._find_unfinished(seq_id)
+        if seq is None:
+            return
+        if seq in self.waiting:
+            self.waiting.remove(seq)
+        self._abort([seq])
+
+    def _find_unfinished(self, seq_id: int) -> Sequence | None:
+        for seq in self.running:
+            if seq.seq_id == seq_id:
+                return seq
+        for seq in self.waiting:
+            if seq.seq_id == seq_id:
+                return seq
+        return None
 
     def _gpu_worker_loop(self) -> None:
         while (item := self._plan_queue.get()) is not None:

@@ -23,15 +23,14 @@ from llm_serving_engine.scheduling.dispatch import (
     output_channels,
 )
 from llm_serving_engine.server import EngineHandle, create_app
-from tests.factories import TOKEN, FakeModelRunner, FakeTokenizer, make_config, read_stream
-
-
-class FakeStreamTokenizer:
-    def decode_incremental(self, seq_id: int, generated_tokens: list[int]) -> str:
-        return f"<{generated_tokens[-1]}>"
-
-    def forget(self, seq_id: int) -> None:
-        pass
+from tests.factories import (
+    TOKEN,
+    FakeTokenizer,
+    GatedModelRunner,
+    make_config,
+    read_stream,
+    wait_until,
+)
 
 
 class FakeEngine:
@@ -55,7 +54,7 @@ class FakeEngine:
         self.submitted.append((prompt, sampling_params))
         seq_id, q = new_output_channel(maxsize=64)
         self.on_submit(q)
-        return Submission(seq_id, q, len(prompt.split()), FakeStreamTokenizer())
+        return Submission(seq_id, q, len(prompt.split()), FakeTokenizer())
 
 
 def put_all(*items):
@@ -153,16 +152,35 @@ async def test_a_client_that_disconnects_mid_stream_releases_its_channel():
     assert output_channels == {}
 
 
-class GatedModelRunner(FakeModelRunner):
-    """Holds every forward pass until `gate` is set."""
+@pytest.mark.asyncio
+async def test_a_client_that_disconnects_mid_stream_cancels_the_sequence():
+    """Beyond releasing the channel (the FakeEngine test above), a disconnect must reach
+    the engine: otherwise the sequence keeps generating for max_tokens for no one. The gate
+    stays closed for the whole disconnect, so the cancellation is already queued, behind
+    the request's own admission, before the gated iteration -- the only one that can ever
+    run -- is allowed to proceed; forward_calls pins that nothing further was planned."""
+    gate = threading.Event()
+    runner = GatedModelRunner(gate)
+    engine = InferenceEngine(make_config(), FakeTokenizer(), runner)
+    engine.bind_loop(asyncio.get_running_loop())
+    engine.start()
+    app = create_app(engine)
 
-    def __init__(self, gate: threading.Event):
-        super().__init__()
-        self.gate = gate
-
-    def forward(self, plan, seqs):
-        self.gate.wait()
-        return super().forward(plan, seqs)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    client.post("/v1/generate", json={"prompt": "hello", "max_tokens": 1000}),
+                    0.2,
+                )
+        gate.set()  # lets the in-flight iteration return so cancellation can be drained
+        await asyncio.to_thread(wait_until, lambda: engine.is_idle)
+    finally:
+        gate.set()
+        engine.stop()
+    assert output_channels == {}
+    assert runner.forward_calls < 10  # would be 1000 forward calls had cancellation missed
 
 
 @pytest.fixture

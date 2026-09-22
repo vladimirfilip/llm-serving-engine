@@ -1,4 +1,5 @@
 import asyncio
+import threading
 
 import pytest
 
@@ -22,8 +23,10 @@ from tests.factories import (
     TOKEN,
     FakeModelRunner,
     FakeTokenizer,
+    GatedModelRunner,
     make_config,
     read_stream,
+    seq_ids,
     wait_until,
 )
 
@@ -184,6 +187,75 @@ async def test_a_request_the_kv_pool_can_never_hold_is_aborted():
         submission = engine.submit("too long", SamplingParams())
         assert await read_stream(submission.output_queue) == [ABORTED]
         await asyncio.to_thread(wait_until, lambda: engine.is_idle)
+    finally:
+        engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_cancel_ends_a_running_sequence_and_frees_its_blocks():
+    gate = threading.Event()
+    runner = GatedModelRunner(gate)
+    engine = make_engine(model_runner=runner)
+    engine.bind_loop(asyncio.get_running_loop())
+    engine.start()
+    try:
+        submission = engine.submit("hi", SamplingParams(max_tokens=256))
+        await asyncio.to_thread(wait_until, lambda: submission.seq_id in seq_ids(engine.running))
+        engine.cancel(submission.seq_id)
+        gate.set()
+        # The iteration already in flight when cancel arrived may still deliver its
+        # token; cancellation only stops the sequence from being planned again.
+        stream = await read_stream(submission.output_queue)
+        assert stream[-1] == ABORTED
+        assert len(stream) < 256
+        await asyncio.to_thread(wait_until, lambda: engine.is_idle)
+    finally:
+        gate.set()
+        engine.stop()
+    assert engine.kv_utilization == 0.0
+    assert submission.seq_id in engine.model_runner.freed
+
+
+@pytest.mark.asyncio
+async def test_cancel_drops_a_waiting_sequence_before_it_ever_runs():
+    engine = make_engine(make_config(scheduler="static", static_batch_size=1))
+    engine.bind_loop(asyncio.get_running_loop())
+    engine.start()
+    try:
+        # A static batch of 1 admits blocking alone; queued stays behind it in `waiting`
+        # until it finishes. Its huge max_tokens never binds first: the KV pool exhausts
+        # and rejects it (`can_ever_fit` on a sequence this long) long before that.
+        blocking = engine.submit("hi", SamplingParams(max_tokens=10**9))
+        await asyncio.to_thread(wait_until, lambda: blocking.seq_id in seq_ids(engine.running))
+        queued = engine.submit("hi", SamplingParams(max_tokens=256))
+        await asyncio.to_thread(wait_until, lambda: queued.seq_id in seq_ids(engine.waiting))
+
+        engine.cancel(queued.seq_id)
+
+        assert await read_stream(queued.output_queue) == [ABORTED]
+        assert queued.seq_id not in seq_ids(engine.running)
+        assert queued.seq_id not in seq_ids(engine.waiting)
+        assert engine.healthy
+    finally:
+        engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_cancel_of_an_already_finished_sequence_is_a_no_op():
+    engine = make_engine()
+    engine.bind_loop(asyncio.get_running_loop())
+    engine.start()
+    try:
+        submission = engine.submit("hi", SamplingParams(max_tokens=1))
+        assert await read_stream(submission.output_queue) == [TOKEN, DONE]
+        await asyncio.to_thread(wait_until, lambda: engine.is_idle)
+
+        engine.cancel(submission.seq_id)
+        await asyncio.to_thread(wait_until, lambda: engine.ingress.empty())
+
+        assert engine.is_idle
+        assert engine.healthy
+        assert submission.output_queue.empty()  # no second ABORTED behind the DONE already read
     finally:
         engine.stop()
 

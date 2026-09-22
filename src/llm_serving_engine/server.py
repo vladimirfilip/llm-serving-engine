@@ -228,10 +228,12 @@ def create_app(engine: InferenceEngine | EngineHandle) -> FastAPI:
         async def stream() -> AsyncIterator[str]:
             seq_id, tokenizer = submission.seq_id, submission.tokenizer
             generated: list[int] = []
+            ended = False
             try:
                 while True:
                     item = await submission.output_queue.get()
                     if item is DONE:
+                        ended = True
                         yield _format_sse(
                             {
                                 "done": True,
@@ -241,6 +243,7 @@ def create_app(engine: InferenceEngine | EngineHandle) -> FastAPI:
                         )
                         break
                     if item is ABORTED:
+                        ended = True
                         yield _format_sse({"error": "request aborted by the engine"})
                         break
                     generated.append(item)
@@ -248,6 +251,10 @@ def create_app(engine: InferenceEngine | EngineHandle) -> FastAPI:
                     # timing token events measure every token.
                     yield _format_sse({"token": tokenizer.decode_incremental(seq_id, generated)})
             finally:
+                # Reached without DONE or ABORTED only when the client stopped reading
+                # first: end its sequence so it doesn't run to max_tokens for no one.
+                if not ended:
+                    submission.cancel()
                 output_channels.pop(seq_id, None)
                 tokenizer.forget(seq_id)
 

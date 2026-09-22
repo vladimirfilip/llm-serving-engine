@@ -87,8 +87,8 @@ def cut_at_stop(text: str, stops: list[str]) -> tuple[str, bool]:
 
 async def collect_tokens(submission: Submission, stops: list[str]) -> tuple[list[int], bool]:
     """Every token of a non-streamed request up to its stop sequence, and whether it finished
-    rather than aborted. The engine has no cancel, so a stopped request's remaining tokens are
-    generated and dropped."""
+    rather than aborted. This wrapper doesn't call `submission.cancel` on a stop sequence, so
+    the request keeps generating past it and its remaining tokens are dropped here."""
     seq_id = submission.seq_id
     generated: list[int] = []
     try:
