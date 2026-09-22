@@ -330,3 +330,260 @@ def paged_attention_forward(
         raise _oom_hint(e, D, q.dtype, BLOCK_M, BLOCK_N) from None
 
     return o
+
+
+# `paged_attention_decode_forward` is `paged_attention_forward`'s decode-only sibling: every
+# entry's query is exactly one row (q_len 0 or 1 -- 0 only for a graph bucket's padding), so
+# batch 1 no longer means "one program per head": a query offset's whole context splits across
+# N_SPLITS programs per head, each an independent online-softmax pass over its slice, combined
+# by a second kernel. At batch 1 that turns a 24-program launch (one per head, one query row
+# each) into N_SPLITS times as many, on a GPU with far more SMs than heads.
+@triton.jit
+def paged_attention_decode_splitk(
+    Q, K_POOL, V_POOL,
+    PARTIAL_ACC, PARTIAL_M, PARTIAL_L,
+    BLOCK_TABLE, CONTEXT_LEN, Q_START, Q_LEN,
+    stride_qh, stride_qm, stride_qd,
+    stride_kb, stride_ks, stride_kh, stride_kd,
+    stride_vb, stride_vs, stride_vh, stride_vd,
+    stride_pa_s, stride_pa_e, stride_pa_h,
+    stride_pml_s, stride_pml_e, stride_pml_h,
+    stride_bt_row,
+    H, D,
+    BLOCK_SIZE_KV,
+    softmax_scale,
+    N_GROUPS: tl.constexpr,
+    N_SPLITS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """One program per (split, entry, query head): partial (acc, m, l) over context
+    slice [split * ceil(context_len / N_SPLITS), ...) of that entry's causal context.
+    A padding row (Q_LEN 0) or a split past its entry's context writes the neutral
+    partial (m=-inf, l=0), which contributes nothing once combined."""
+    split_id = tl.program_id(0)
+    entry_head = tl.program_id(1)
+    entry_idx = entry_head // H
+    head_idx = entry_head % H
+    kv_head_idx = head_idx // N_GROUPS
+
+    pa_offset = split_id * stride_pa_s + entry_idx * stride_pa_e + head_idx * stride_pa_h
+    pml_offset = split_id * stride_pml_s + entry_idx * stride_pml_e + head_idx * stride_pml_h
+    offs_d = tl.arange(0, BLOCK_D)
+    d_mask = offs_d < D
+
+    q_len = tl.load(Q_LEN + entry_idx)
+    if q_len == 0:
+        # A padding row: combine returns on Q_LEN before reading any of its partials, so
+        # this store only keeps every slot of the workspace uniformly written.
+        tl.store(PARTIAL_ACC + pa_offset + offs_d, 0.0, mask=d_mask)
+        tl.store(PARTIAL_M + pml_offset, float("-inf"))
+        tl.store(PARTIAL_L + pml_offset, 0.0)
+        return
+
+    context_len = tl.load(CONTEXT_LEN + entry_idx)
+    chunk = tl.cdiv(context_len, N_SPLITS)
+    start_n = split_id * chunk
+    end_n = tl.minimum(start_n + chunk, context_len)
+    if start_n >= end_n:
+        # A split past this real row's context: rescale = exp(-inf - global_max) = 0 in
+        # the combine kernel, so this acc is never actually weighted in -- but combine
+        # unconditionally reads it (0 * uninitialized memory is not always 0), so it must
+        # hold a finite value, not whatever the allocator gave it.
+        tl.store(PARTIAL_ACC + pa_offset + offs_d, 0.0, mask=d_mask)
+        tl.store(PARTIAL_M + pml_offset, float("-inf"))
+        tl.store(PARTIAL_L + pml_offset, 0.0)
+        return
+
+    q_start = tl.load(Q_START + entry_idx)
+    q_ptrs = Q + head_idx * stride_qh + q_start * stride_qm + offs_d * stride_qd
+    q = tl.load(q_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+
+    running_max = float("-inf")
+    running_denom = 0.0
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+    for start in range(0, BLOCK_N * tl.cdiv(chunk, BLOCK_N), BLOCK_N):
+        offs_n = start_n + start + tl.arange(0, BLOCK_N)
+        n_mask = offs_n < end_n
+
+        block_in_table = offs_n // BLOCK_SIZE_KV
+        within_block = offs_n % BLOCK_SIZE_KV
+        block_id = tl.load(
+            BLOCK_TABLE + entry_idx * stride_bt_row + block_in_table, mask=n_mask, other=0
+        )
+
+        k_ptrs = (K_POOL + block_id[:, None] * stride_kb + within_block[:, None] * stride_ks
+                  + kv_head_idx * stride_kh + offs_d[None, :] * stride_kd)
+        k = tl.load(k_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
+
+        # One query row: an elementwise product and a reduction, not tl.dot -- a single
+        # row gets no tensor-core benefit and tl.dot needs a taller tile than M=1 gives it.
+        s = tl.sum(q[None, :] * k.to(tl.float32), axis=1) * softmax_scale
+        s = tl.where(n_mask, s, float("-inf"))
+
+        tile_max = tl.max(s, axis=0)
+        new_max = tl.maximum(running_max, tile_max)
+        alpha = tl.exp(running_max - new_max)
+        p = tl.exp(s - new_max)
+
+        v_ptrs = (V_POOL + block_id[:, None] * stride_vb + within_block[:, None] * stride_vs
+                  + kv_head_idx * stride_vh + offs_d[None, :] * stride_vd)
+        v = tl.load(v_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
+
+        running_denom = alpha * running_denom + tl.sum(p, axis=0)
+        acc = acc * alpha + tl.sum(p[:, None] * v.to(tl.float32), axis=0)
+        running_max = new_max
+
+    tl.store(PARTIAL_ACC + pa_offset + offs_d, acc, mask=d_mask)
+    tl.store(PARTIAL_M + pml_offset, running_max)
+    tl.store(PARTIAL_L + pml_offset, running_denom)
+
+
+@triton.jit
+def paged_attention_decode_combine(
+    PARTIAL_ACC, PARTIAL_M, PARTIAL_L, O,
+    Q_START, Q_LEN,
+    stride_pa_s, stride_pa_e, stride_pa_h,
+    stride_pml_s, stride_pml_e, stride_pml_h,
+    stride_oh, stride_om, stride_od,
+    H, D,
+    N_SPLITS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """One program per (entry, query head): rescales each split's partial softmax onto
+    their shared true max and sums them, the same combine step online softmax runs
+    between tiles, just across kernel launches instead of within one."""
+    entry_head = tl.program_id(0)
+    entry_idx = entry_head // H
+    head_idx = entry_head % H
+    offs_d = tl.arange(0, BLOCK_D)
+    d_mask = offs_d < D
+
+    q_len = tl.load(Q_LEN + entry_idx)
+    if q_len == 0:
+        return  # padding row: its output is never read downstream, so there's nothing to write
+
+    q_start = tl.load(Q_START + entry_idx)
+    o_ptrs = O + head_idx * stride_oh + q_start * stride_om + offs_d * stride_od
+
+    pml_base = entry_idx * stride_pml_e + head_idx * stride_pml_h
+    global_max = float("-inf")
+    for s in range(N_SPLITS):
+        m = tl.load(PARTIAL_M + s * stride_pml_s + pml_base)
+        global_max = tl.maximum(global_max, m)
+
+    pa_base = entry_idx * stride_pa_e + head_idx * stride_pa_h
+    numer = tl.zeros([BLOCK_D], dtype=tl.float32)
+    denom = 0.0
+    for s in range(N_SPLITS):
+        m = tl.load(PARTIAL_M + s * stride_pml_s + pml_base)
+        length = tl.load(PARTIAL_L + s * stride_pml_s + pml_base)
+        rescale = tl.exp(m - global_max)
+        acc = tl.load(PARTIAL_ACC + s * stride_pa_s + pa_base + offs_d, mask=d_mask, other=0.0)
+        numer += rescale * acc
+        denom += rescale * length
+
+    tl.store(o_ptrs, numer / denom, mask=d_mask)
+
+
+def paged_attention_decode_forward(
+    q: torch.Tensor, k_pool: torch.Tensor, v_pool: torch.Tensor,
+    block_table: torch.Tensor, context_len: torch.Tensor,
+    q_start: torch.Tensor, q_len: torch.Tensor, block_size: int,
+    n_splits: int,
+    workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Split-K paged decode attention, for a BatchPlan where every entry's query is one
+    row: split each entry's context across `n_splits` programs per head, then combine
+    their partial softmaxes. `workspace` is `(partial_acc, partial_m, partial_l)`,
+    shaped for exactly this call's `q.shape[0]` (heads) and `block_table.shape[0]`
+    (entries) -- pass a graph's own pre-allocated one when replaying this call inside a
+    CUDA graph, so a captured decode iteration allocates nothing per layer or per
+    replay. Omit it for an eager call, which allocates its own each time.
+
+    q: (H, total_tokens, D). k_pool/v_pool: (num_blocks, block_size, H_KV, D).
+    block_table/context_len/q_start/q_len: one row per batch entry.
+    """
+    H, _total_tokens, D = q.shape
+    H_KV = k_pool.shape[2]
+    num_entries = block_table.shape[0]
+    assert q.is_cuda and k_pool.is_cuda and v_pool.is_cuda, "Q, K, V not all CUDA tensors"
+    assert q.dtype == k_pool.dtype == v_pool.dtype, "Q, K, V must share a dtype"
+    assert H % H_KV == 0, f"query heads ({H}) must be a multiple of KV heads ({H_KV})"
+
+    BLOCK_D = triton.next_power_of_2(D)
+    BLOCK_N = 64
+
+    if workspace is None:
+        partial_acc = torch.empty(
+            (n_splits, num_entries, H, D), dtype=torch.float32, device=q.device
+        )
+        partial_m = torch.empty((n_splits, num_entries, H), dtype=torch.float32, device=q.device)
+        partial_l = torch.empty((n_splits, num_entries, H), dtype=torch.float32, device=q.device)
+    else:
+        partial_acc, partial_m, partial_l = workspace
+
+    o = torch.empty_like(q)
+
+    paged_attention_decode_splitk[(n_splits, num_entries * H)](
+        q, k_pool, v_pool,
+        partial_acc, partial_m, partial_l,
+        block_table, context_len, q_start, q_len,
+        q.stride(0), q.stride(1), q.stride(2),
+        k_pool.stride(0), k_pool.stride(1), k_pool.stride(2), k_pool.stride(3),
+        v_pool.stride(0), v_pool.stride(1), v_pool.stride(2), v_pool.stride(3),
+        partial_acc.stride(0), partial_acc.stride(1), partial_acc.stride(2),
+        partial_m.stride(0), partial_m.stride(1), partial_m.stride(2),
+        block_table.stride(0),
+        H, D,
+        block_size,
+        1.0 / math.sqrt(D),
+        N_GROUPS=H // H_KV,
+        N_SPLITS=n_splits,
+        BLOCK_N=BLOCK_N,
+        BLOCK_D=BLOCK_D,
+    )
+    paged_attention_decode_combine[(num_entries * H,)](
+        partial_acc, partial_m, partial_l, o,
+        q_start, q_len,
+        partial_acc.stride(0), partial_acc.stride(1), partial_acc.stride(2),
+        partial_m.stride(0), partial_m.stride(1), partial_m.stride(2),
+        o.stride(0), o.stride(1), o.stride(2),
+        H, D,
+        N_SPLITS=n_splits,
+        BLOCK_D=BLOCK_D,
+    )
+    return o
+
+
+def decode_workspace(
+    n_splits: int, num_entries: int, n_heads: int, head_dim: int, device: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """A `paged_attention_decode_forward` workspace sized for one bucket, to allocate
+    once before a CUDA graph captures replaying against it. `partial_acc`'s last
+    dimension (head_dim) is addressed as offsets, not a stride, so it must stay
+    contiguous -- true of a fresh `torch.empty` and never violated by a reshape or
+    slice elsewhere in this module. `partial_m` and `partial_l` share one shape, so
+    the kernels address both through `partial_m`'s strides."""
+    return (
+        torch.empty(
+            (n_splits, num_entries, n_heads, head_dim), dtype=torch.float32, device=device
+        ),
+        torch.empty((n_splits, num_entries, n_heads), dtype=torch.float32, device=device),
+        torch.empty((n_splits, num_entries, n_heads), dtype=torch.float32, device=device),
+    )
+
+
+# Programs a decode iteration aims for, batch * n_heads * n_splits: several times a
+# modern GPU's SM count, so irregular split lengths still leave enough scheduling slack
+# to keep every SM busy. Well past this many running sequences, the plain per-head grid
+# (batch * n_heads programs, no splitting) already covers the GPU on its own.
+DECODE_SPLIT_TARGET_PROGRAMS = 512
+
+
+def decode_splits(batch_size: int) -> int:
+    """Split count for a decode iteration of `batch_size` running sequences: enough that
+    `batch_size * n_heads * n_splits` can fill the GPU's SMs, capped at 16 so a short
+    context isn't cut into far more pieces than it has keys to spread across."""
+    return max(1, min(DECODE_SPLIT_TARGET_PROGRAMS // max(batch_size, 1), 16))

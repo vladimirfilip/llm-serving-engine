@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ..kernels.flash_attention import decode_splits, decode_workspace
 from ..observability.nvtx import nvtx_range
 from .paged_batch import PagedBatch, pinned
 
@@ -46,6 +47,12 @@ class DecodeGraph:
     q_start: torch.Tensor  # (bucket,) int32 arange: each row packs one token, at flat position i
     block_table: torch.Tensor  # (bucket, num_blocks) int32
     logits: torch.Tensor  # (bucket, vocab_size), written by the captured region
+    # Split-K scratch for this bucket's decode attention, one (n_splits, bucket, n_heads, ...)
+    # workspace shared by every layer and every replay: allocated once here, ahead of every
+    # capture, rather than fresh per layer per bucket, which would grow the shared graph pool
+    # by n_layers * n_buckets allocations for no benefit, since every layer fully overwrites
+    # its slots before the next reads them.
+    decode_workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     graph: torch.cuda.CUDAGraph = field(default_factory=torch.cuda.CUDAGraph)
     # Per row: the seq_id whose block ids that block_table row holds, and how many of them.
     # Block tables only grow until the sequence is freed, so a row still holding the same
@@ -63,6 +70,7 @@ class DecodeGraph:
             max_q_len=1,
             dest_block_id=self.index_rows[2],
             dest_within=self.index_rows[3],
+            decode_workspace=self.decode_workspace,
         )
 
 
@@ -145,6 +153,7 @@ class DecodeGraphRunner:
     def _alloc(self, bucket: int, num_blocks: int) -> DecodeGraph:
         runner = self._runner
         d = runner.device
+        n_splits = decode_splits(bucket)
         return DecodeGraph(
             index_rows=torch.zeros(4, bucket, dtype=torch.int64, device=d),
             length_rows=torch.zeros(3, bucket, dtype=torch.int32, device=d),
@@ -152,6 +161,9 @@ class DecodeGraphRunner:
             block_table=torch.zeros(bucket, num_blocks, dtype=torch.int32, device=d),
             logits=torch.zeros(
                 bucket, runner.model.config.vocab_size, dtype=runner.model.dtype, device=d
+            ),
+            decode_workspace=decode_workspace(
+                n_splits, bucket, runner.n_heads, runner.head_dim, d
             ),
             row_seq_ids=[None] * bucket,
             row_blocks_written=[0] * bucket,

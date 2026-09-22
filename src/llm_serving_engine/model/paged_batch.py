@@ -20,6 +20,10 @@ class PagedBatch:
     max_q_len: int
     dest_block_id: torch.Tensor  # (total_tokens,) int64, physical block per new K/V row
     dest_within: torch.Tensor  # (total_tokens,) int64, offset within that block
+    # A DecodeGraph's split-K scratch, reused across this iteration's layers and every
+    # replay, so a captured decode iteration allocates nothing per layer or per replay.
+    # None for prefill, mixed batches, and eager decode, which allocate their own.
+    decode_workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
 
 @dataclass(slots=True)

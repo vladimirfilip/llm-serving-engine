@@ -139,7 +139,8 @@ unchanged unless stated.
   to go quiet, and is recorded in `checks.json`.
 - **`max_num_seqs` and grid lengths.** Lengths above `max_model_len` are `not run`, not `failed`.
 - **Long prompts in correctness generation run one at a time.** Each 16000-token prompt is more
-  than half the ~26k-token KV pool, and two admitted together deadlock the engine (see below).
+  than half the ~26k-token KV pool; this predates the scheduler fix below and hasn't been
+  re-measured for concurrent admission since.
 - **Quick ablation** uses 1 capacity repeat and 2 batch-1 repeats.
 - **Precision variants and soak** run on ours only; the soak windows are fractions of the run so
   the 10-60 min / 60 min-end comparison holds at any duration.
@@ -151,13 +152,23 @@ set. `bench/tests/test_all_mock.py` runs `bench all --engines mock --quick` end 
 minutes) with synthetic data. The mock engine (`engines/mock_server.py`) and null server
 (`engines/null_server.py`) exist only to test the harness.
 
-## Findings about the engine
+## Fixed engine issues
 
-- **Scheduler deadlock with prompts larger than half the KV pool.** With `max_model_len` 16384 and
-  a ~26k-token pool, two 16000-token prompts that start prefilling together each hold part of the
-  pool and neither can finish. The scheduler preempts only to make room for a *decoding* sequence,
-  never a prefilling one, so both stay forever (the engine reports running 2, waiting 16, KV 94%,
-  GPU idle) and a client that gives up does not free them. The memory suite's overload test
-  classifies this as `hang`; the harness does not work around it except for correctness generation.
-- **Decode attention is far from bandwidth-bound**: about 31 GB/s (5% of the 637 GB/s read
-  bandwidth) at batch 1, from a grid of one program per head.
+- **Scheduler deadlock with prompts larger than half the KV pool**, now fixed. With
+  `max_model_len` 16384 and a ~26k-token pool, two 16000-token prompts that started prefilling
+  together each held part of the pool and neither could finish: the scheduler preempted only to
+  make room for a *decoding* sequence, never a prefilling one, so both stayed forever (running 2,
+  waiting 16, KV 94%, GPU idle). A stalled prefill chunk now preempts the PREFILLING sequences
+  admitted after it, one at a time, until it fits.
+- **A client that gave up did not free its sequence**, now fixed. The server popped its stream's
+  output channel on disconnect but never told the engine to stop generating for it, so an
+  abandoned request ran to `max_tokens` for no one -- and, combined with the deadlock above, is
+  what made a stuck sequence permanent. `InferenceEngine.cancel` ends it instead.
+- **Decode attention was far from bandwidth-bound**: about 31 GB/s (5% of the 637 GB/s read
+  bandwidth) at batch 1, from a grid of one program per head -- a program per query row leaves
+  most of the GPU's SMs idle when the query is one row. Split-K decode attention partitions each
+  sequence's context across many programs per head instead of one, then combines their partial
+  softmaxes; on this GPU it now reaches 85-370 GB/s (13-58% of read bandwidth) depending on batch
+  and context length. Those are eager-call numbers, `bench`'s own way of timing one kernel; the
+  engine's decode path runs this inside a CUDA graph, where the extra kernel launch this fix adds
+  costs nothing per iteration (it's baked into the capture), so the graphed win is larger still.

@@ -23,7 +23,12 @@ from transformers import AutoModelForCausalLM
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
 from ..config import ModelConfig
-from ..kernels.flash_attention import flash_attention_forward, paged_attention_forward
+from ..kernels.flash_attention import (
+    decode_splits,
+    flash_attention_forward,
+    paged_attention_decode_forward,
+    paged_attention_forward,
+)
 from ..observability.nvtx import nvtx_range
 from ..scheduling.batch_plan import BatchEntry, BatchPlan
 from ..scheduling.sequence import Sequence
@@ -422,7 +427,27 @@ class ModelRunner:
         return q[0]
 
     def attend_paged(self, q: torch.Tensor, layer_idx: int, paging: PagedBatch) -> torch.Tensor:
-        """(n_heads, total_tokens, head_dim) q -> attention output of the same shape."""
+        """(n_heads, total_tokens, head_dim) q -> attention output of the same shape.
+
+        A batch where every entry's query is one row (decode, or a length-1 prefill
+        chunk swept up with it) has no query-length tiling to do, so it runs the
+        split-K decode kernel instead: one query row per head gets no benefit from
+        `paged_attention_2`'s tile, and splitting its context across more programs
+        keeps far more of the GPU's SMs busy at once.
+        """
+        if paging.max_q_len == 1:
+            # A graph's workspace is sized for the split count its bucket was captured
+            # with; an eager call has none yet, so it picks one fresh.
+            n_splits = (
+                paging.decode_workspace[1].shape[0]
+                if paging.decode_workspace is not None
+                else decode_splits(paging.block_table.shape[0])
+            )
+            return paged_attention_decode_forward(
+                q, self._k_pool[layer_idx], self._v_pool[layer_idx], paging.block_table,
+                paging.context_len, paging.q_start, paging.q_len, self._block_size, n_splits,
+                workspace=paging.decode_workspace,
+            )
         return paged_attention_forward(
             q, self._k_pool[layer_idx], self._v_pool[layer_idx], paging.block_table,
             paging.context_len, paging.query_offset, paging.q_start, paging.q_len,

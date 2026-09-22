@@ -10,8 +10,9 @@ from typing import Callable
 import torch
 
 from llm_serving_engine.kernels.flash_attention import (
+    decode_splits,
     flash_attention_forward,
-    paged_attention_forward,
+    paged_attention_decode_forward,
 )
 
 from ..modelspec import ModelSpec
@@ -46,14 +47,15 @@ def paged_decode(batch: int, ctx: int, spec: ModelSpec) -> tuple[Callable, torch
     k_pool, v_pool = pool(k), pool(v)
     table = torch.arange(batch * blocks, dtype=torch.int32, device=DEVICE).view(batch, blocks)
     context_len = torch.full((batch,), ctx, dtype=torch.int32, device=DEVICE)
-    query_offset = torch.full((batch,), ctx - 1, dtype=torch.int32, device=DEVICE)
     q_start = torch.arange(batch, dtype=torch.int32, device=DEVICE)
     q_len = torch.ones(batch, dtype=torch.int32, device=DEVICE)
     q_heads_first = q.transpose(0, 1).contiguous()  # (n_heads, batch, head_dim)
 
+    n_splits = decode_splits(batch)
+
     def call() -> torch.Tensor:
-        return paged_attention_forward(q_heads_first, k_pool, v_pool, table, context_len,
-                                       query_offset, q_start, q_len, BLOCK_SIZE, 1)
+        return paged_attention_decode_forward(q_heads_first, k_pool, v_pool, table, context_len,
+                                              q_start, q_len, BLOCK_SIZE, n_splits)
 
     return call, q, k, v
 
