@@ -172,3 +172,7 @@ minutes) with synthetic data. The mock engine (`engines/mock_server.py`) and nul
   and context length. Those are eager-call numbers, `bench`'s own way of timing one kernel; the
   engine's decode path runs this inside a CUDA graph, where the extra kernel launch this fix adds
   costs nothing per iteration (it's baked into the capture), so the graphed win is larger still.
+  Also tried and reverted: GQA packing (one program per KV head covering every query head that
+  shares it, so K/V is read once per split instead of once per query head) measured 13-78 GB/s on
+  this GPU against split-K-alone's 85-370 -- decode here is bound by parallelism and per-program
+  occupancy, not by redundant K/V reads, so the per-query-head grid stands.
